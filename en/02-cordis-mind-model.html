@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 2 · The Cordis Mental Model — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 2 · The Cordis Mental Model</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/02-cordis-mind-model.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="2">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 2 · Part I · Landscape and Mental Models</div>
+    <h1>The Cordis Mental Model: Context, Plugins, Services, Events</h1>
+    <p class="lede">
+      Chapter 1 described dsh as a plugin tree. This chapter covers what that tree grows in: the
+      Cordis plugin framework. Context, plugins, services, events, effects — master these five
+      concepts and you can read the code in any later chapter directly. This is the most
+      important foundation chapter in the book; it deserves a slow read.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State where Cordis sits inside dsh and what 「everything is a plugin, no privileged core」 implies</li>
+      <li>Explain Context (ctx) as the service registry and find services by key (e.g. <code>ctx.tools</code>)</li>
+      <li>Read both plugin forms — function plugins and <code>Service</code> subclasses — and how <code>inject</code> expresses load order</li>
+      <li>Explain 「registrations are effects」: why every contribution goes through <code>ctx.effect()</code> / <code>ctx.on()</code>, and how unload reverses them automatically</li>
+      <li>Distinguish the four event dispatch modes and state waterfall's <code>next()</code> semantics and short-circuit consequences precisely</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-what-is-cordis">2.1 Cordis: the foundation dsh stands on</h2>
+
+  <p>
+    dsh did not invent a plugin system from scratch. It stands on <strong>Cordis</strong> — an
+    open-source plugin framework whose design is written up in the paper A Programming Paradigm
+    for Spatiotemporal Composability (reading it now is optional). You can think of Cordis as
+    dsh's stand-in for an OS kernel: it does not manage processes or memory; it manages how
+    plugins <strong>mount, find each other, communicate, and retire</strong>.
+  </p>
+
+  <p>One fact that matters for this book: Cordis's source is not in node_modules; it lives in the repository's <code>vendor/</code> directory.</p>
+
+  <ul>
+    <li><code>vendor/</code> is a <strong>pinned copy of the upstream source</strong>: each entry records its upstream commit; it can be audited and patched, its version is pinned, and it never drifts with whatever npm serves.</li>
+    <li>Every vendored package is rescoped to <code>@deepseek-ai/</code>: <code>cordis</code> →
+      <code>@deepseek-ai/cordis</code>. Publishing dsh thereby publishes this framework layer too, without squatting the upstream package names on npm.</li>
+    <li>Every harness package declares <code>@deepseek-ai/cordis</code> as a <strong>peerDependency</strong>:
+      the whole tree shares one Cordis instance.</li>
+    <li>To update vendored code, follow the sync procedure documented in <code>vendor/README.md</code> and re-apply (or retire) the logged local modifications.</li>
+  </ul>
+
+  <p>
+    On this foundation dsh establishes one constitution that runs through the whole repository:
+    <strong>everything is a plugin</strong>. Model adapters are plugins, the tool registry is a
+    plugin, the session log is a plugin, even the agent loop itself is a plugin — all replaceable
+    at the configuration layer. That means <strong>there is no privileged core to patch</strong>:
+    you extend dsh not by forking core code but by mounting your plugin next to the others.
+    How to mount is Chapter 3's topic; this chapter first covers how plugins coexist once mounted.
+  </p>
+
+  <h2 id="sec-context">2.2 Context: a shared service registry</h2>
+
+  <p>
+    When Cordis mounts a plugin, the plugin receives a <code>ctx</code> (a <code>Context</code>
+    instance). Think of it as a shared registry: <strong>Context is the store of services</strong>.
+    A service occupies a stable key in the registry, and other plugins consume it by key instead
+    of importing a concrete implementation class.
+  </p>
+
+  <p>You have already seen several keys (that column in Chapter 1's table):</p>
+
+  <ul>
+    <li><code>ctx.tools</code> — tool registry and execution pipeline (core/tools)</li>
+    <li><code>ctx.sessions</code> — session event log (core/session)</li>
+    <li><code>ctx.systemPrompt</code> — prompt assembly (core/system-prompt)</li>
+    <li><code>ctx.llm</code> — model adapter interface (llm/llm)</li>
+    <li><code>ctx.agents</code> / <code>ctx.agentLoop</code> — live agent registry / default loop</li>
+  </ul>
+
+  <p>
+    Find-services-by-key yields a key property: <strong>interface and implementation are
+    separate</strong>. A caller (say the bash tool) depends only on the name <code>ctx.shell</code>
+    and its TypeScript type; whether a local or a sandbox implementation sits behind it is decided
+    by configuration. Swapping implementations touches not one line of caller code — this is the
+    mechanism that makes Chapter 1's 「everything is replaceable」 real.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Context service registry diagram">
+      <rect x="230" y="130" width="220" height="70" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="3"/>
+      <text x="340" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="15" font-weight="700">ctx (Context)</text>
+      <text x="340" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Service registry: one key, one service</text>
+
+      <rect x="40" y="30" width="150" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="115" y="55" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.tools</text>
+      <line x1="150" y1="70" x2="270" y2="130" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="265" y="20" width="150" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="340" y="45" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.llm</text>
+      <line x1="340" y1="60" x2="340" y2="130" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="490" y="30" width="150" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="565" y="55" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.sessions</text>
+      <line x1="530" y1="70" x2="410" y2="130" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="40" y="200" width="160" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="120" y="225" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.systemPrompt</text>
+      <line x1="200" y1="210" x2="230" y2="195" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="480" y="200" width="160" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="560" y="225" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.agents</text>
+      <line x1="480" y1="210" x2="450" y2="195" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="230" y="270" width="220" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="340" y="289" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Plugin: tool-bash</text>
+      <text x="340" y="306" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Consumes ctx.tools, ctx.shell by key — never imports an implementation class</text>
+      <line x1="290" y1="270" x2="300" y2="200" style="stroke:var(--pass)" stroke-width="1.5"/>
+      <line x1="390" y1="270" x2="380" y2="200" style="stroke:var(--pass)" stroke-width="1.5"/>
+    </svg>
+    <figcaption>Context is the shared service registry: services register under keys, plugins consume by key, and interface and implementation stay separate.</figcaption>
+  </figure>
+
+  <p>
+    What does a service look like in code? It is a subclass of Cordis <code>Service</code> that
+    reports its key to Cordis at construction. Real code — the tool registry (excerpted from
+    <code>packages/core/tools/src/index.ts</code>):
+  </p>
+
+  <pre><code><span class="code-comment">// packages/core/tools/src/index.ts (excerpt, simplified)</span>
+<span class="code-key">export class</span> <span class="code-fn">ToolRuntime</span> <span class="code-key">extends</span> Service {
+  <span class="code-key">static</span> inject = [<span class="code-str">'systemPrompt'</span>]   <span class="code-comment">// I need the systemPrompt service to activate</span>
+
+  <span class="code-fn">constructor</span>(ctx: Context, config: Config = {}) {
+    <span class="code-key">super</span>(ctx, <span class="code-str">'tools'</span>)              <span class="code-comment">// &lt;-- the key it occupies on ctx</span>
+    …
+  }
+}</code></pre>
+
+  <p>
+    The second argument of <code>super(ctx, 'tools')</code> is the most important string in this
+    world: it determines that <code>ctx.tools</code> is exactly the instance other plugins retrieve.
+  </p>
+
+  <p>
+    So where does the TypeScript type of <code>ctx.tools</code> come from? Not from a hand-maintained
+    central registry — it uses <strong>declaration merging</strong>: the tools package merges a
+    member into Cordis's <code>Context</code> interface in its own file:
+  </p>
+
+  <pre><code><span class="code-comment">// packages/core/tools/src/index.ts (excerpt)</span>
+<span class="code-key">declare module</span> <span class="code-str">'@deepseek-ai/cordis'</span> {
+  <span class="code-key">interface</span> Context {
+    tools: ToolRuntime      <span class="code-comment">// ctx.tools is typed from here on</span>
+  }
+}</code></pre>
+
+  <p>
+    Every service package contributes its key this way; the merged <code>Context</code> interface
+    is the menu of the whole registry. Event types extend through the same mechanism (see 2.5).
+  </p>
+
+  <div class="box key">
+    <div class="box-title">Service Definition: the name for interface/implementation separation</div>
+    <p>
+      From here on, this book calls the code that declares what interface a key should carry a
+      <strong>Service Definition</strong>, and the plugin that actually implements that interface a
+      Service Provider. dsh's rule in one sentence: <strong>extension plugins depend on Service
+      Definitions, never on concrete Providers</strong>. That is why <code>dsh-agent-loop</code>
+      can be replaced wholesale while UI and tool plugins come out unharmed.
+    </p>
+  </div>
+
+  <h2 id="sec-plugin-shapes">2.3 What a plugin looks like: a function, or a Service subclass</h2>
+
+  <p>Cordis plugins come in exactly two forms, and dsh uses both.</p>
+
+  <p><strong>Form one: the function plugin</strong>. A module with the three-part set of <code>name</code>,
+    <code>inject</code>, <code>apply</code>. Real example — the bash tool
+    (<code>packages/shell/tool-bash/src/index.ts</code>):</p>
+
+  <pre><code><span class="code-comment">// packages/shell/tool-bash/src/index.ts (excerpt)</span>
+<span class="code-key">export const</span> name = <span class="code-str">'tool-bash'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'tools'</span>, <span class="code-str">'shell'</span>, <span class="code-str">'systemPrompt'</span>, <span class="code-str">'shellEnv'</span>]
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx: Context, config: Config = {}): <span class="code-key">void</span> {
+  <span class="code-comment">// register the bash tool on ctx.tools; call ctx.shell to run commands</span>
+}</code></pre>
+
+  <p>
+    <code>apply(ctx)</code> is called when the plugin mounts; <code>ctx</code> is its entry ticket.
+    It suits plugins that register things on other plugins' services — most capability plugins in
+    dsh are this form.
+  </p>
+
+  <p><strong>Form two: the Service subclass plugin</strong>. Like <code>ToolRuntime</code> above, it extends
+    <code>Service</code>, and Cordis hangs its lifecycle (construct, start, deactivate) on the
+    current context. It suits plugins that are themselves a service and need to occupy a key in
+    the registry.</p>
+
+  <p>The field both forms share is <code>inject</code>:</p>
+
+  <div class="box note">
+    <div class="box-title">inject: load order expressed as service requirements</div>
+    <p>
+      <code>inject</code> declares 「I need these services」. Cordis activates the plugin only once
+      they all exist. Load order therefore no longer relies on manual sorting; it emerges from
+      dependencies: <code>tool-bash</code> declares it needs <code>tools</code> and
+      <code>shell</code>, so no matter which of the two lines comes first in the configuration, it
+      never starts while a service is absent. Who waits for whom is decided by the code itself.
+    </p>
+  </div>
+
+  <p>
+    Look back at Chapter 1's core table and you can now read a second layer of meaning:
+    <code>core/agent-loop</code> depends on the interface declared by <code>ctx.agents</code>, yet
+    it is only a plugin — remove it from the configuration, substitute a loop you wrote yourself,
+    and every other plugin works as before. 「Everything is a plugin」 is not a slogan; it is a
+    fact held up by <code>inject</code>.
+  </p>
+
+  <h2 id="sec-effects">2.4 Registrations are effects: every contribution can retire</h2>
+
+  <p>
+    What a plugin does in <code>apply</code> (or its constructor) is collectively a
+    「contribution」: register a tool, add a prompt section, subscribe to an event, install a model
+    adapter. dsh's iron rule is <strong>registrations are effects</strong> — every contribution
+    must go through <code>ctx.effect()</code> or <code>ctx.on()</code> and take the
+    <strong>disposer</strong>.
+  </p>
+
+  <ul>
+    <li><code>ctx.effect(setup)</code> takes a generator function in which you <code>yield</code> cleanup actions;
+      it returns a disposer whose call undoes the whole set of registrations.</li>
+    <li><code>ctx.on(event, listener)</code> subscribes to an event; its return value is the unsubscribe function.</li>
+    <li>Registry-style APIs (such as registering a tool on <code>ctx.tools</code>) also return disposers —
+      「the return value of register is the unregister function」 is the universal convention.</li>
+  </ul>
+
+  <p>
+    Real code (simplified from <code>ToolRuntime.presentAs</code>, <code>packages/core/tools/src/index.ts</code>):
+  </p>
+
+  <pre><code><span class="code-key">const</span> dispose = ctx.<span class="code-fn">effect</span>(<span class="code-key">function*</span> () {
+  <span class="code-key">yield</span> this.layers.<span class="code-fn">effect</span>(ctx, layer =&gt; {
+    layer.mode = mode
+    <span class="code-key">return</span> () =&gt; { layer.mode = <span class="code-key">undefined</span> }   <span class="code-comment">// cleanup: restore</span>
+  })
+  <span class="code-key">yield</span> ctx.systemPrompt.<span class="code-fn">section</span>(this.<span class="code-fn">sdkSection</span>()) <span class="code-comment">// the return value is likewise a disposal function</span>
+})
+<span class="code-comment">// one dispose() call undoes both, in reverse order</span></code></pre>
+
+  <p>Why elevate 「registration」 to an 「effect」? For <strong>reversibility</strong>:</p>
+
+  <ul>
+    <li>When a plugin <strong>unloads</strong>, all its registrations retire automatically and in order — the tree stays consistent at all times;</li>
+    <li>Hot reload (HMR) relies on it: swapping a plugin version = unload old, mount new, without restarting the process;</li>
+    <li>Testing relies on it: each case mounts its own small tree and tears it down at the end, with no cross-contamination.</li>
+  </ul>
+
+  <p>
+    The converse matters just as much: mutating global state directly, bypassing
+    <code>ctx.effect()</code>, leaves dirt on the tree that nobody cleans at unload. dsh code
+    review treats that as a defect, not a style issue. If unload order matters, put the related
+    steps into the <strong>same</strong> effect so cleanup unwinds in reverse order of your yields.
+  </p>
+
+  <h2 id="sec-events">2.5 Events: how plugins talk to each other</h2>
+
+  <p>
+    Service methods suit direct commands: <code>ctx.shell.run(...)</code> just runs a command. But
+    often what you need is to <strong>observe or intercept</strong> — a tool is about to execute
+    and you want to inspect it, modify it, even veto it. That is the territory of events:
+    subscribe with <code>ctx.on()</code>, dispatch in four ways.
+  </p>
+
+  <p>The four dispatch modes are the key to dsh's event system (from <code>docs/cordis-primer.md</code>):</p>
+
+  <table>
+    <thead>
+      <tr><th>Mode</th><th>Waits for listeners?</th><th>Order</th><th>Return value?</th><th>Typical use</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>emit</code></td><td>No</td><td>Registration order</td><td>None</td><td>Pure observation: a tool finished, a registry changed</td></tr>
+      <tr><td><code>waterfall</code></td><td>No</td><td>Registration order</td><td><strong>Yes</strong></td><td>Wrapping and interception: rewrite a request, veto a call (the onion model)</td></tr>
+      <tr><td><code>parallel</code></td><td>Yes</td><td>Parallel</td><td>None</td><td>Fan-out notification: broadcast to mutually independent observers</td></tr>
+      <tr><td><code>serial</code></td><td>Yes</td><td>Registration order</td><td>Yes</td><td>Ordered processing that also needs results</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Two things to note. First, <strong>the dispatch mode is part of the event's public
+    contract</strong>: one event is dispatched only by the mode that belongs to it; dsh requires a
+    new event's JSDoc to carry <code>@mode</code>, and the generated catalog cross-checks
+    declarations against dispatch sites. Second, the types behind event names also come from
+    <strong>declaration merging</strong> — the same move as with the <code>Context</code> interface,
+    except this time the merged interface is <code>Events</code>:
+  </p>
+
+  <pre><code><span class="code-comment">// packages/core/tools/src/index.ts (excerpt, simplified)</span>
+<span class="code-key">declare module</span> <span class="code-str">'@deepseek-ai/cordis'</span> {
+  <span class="code-key">interface</span> Events {
+    <span class="code-comment">/** Allow, deny, or ask before dispatch. …
+     *  @mode waterfall */</span>
+    <span class="code-str">'tools/pre-execute'</span>(exec: ToolExecution,
+                      next: () =&gt; <span class="code-key">Promise</span>&lt;PreToolDecision&gt;): <span class="code-key">Promise</span>&lt;PreToolDecision&gt;
+    <span class="code-comment">/** Observe the frozen final outcome. …
+     *  @mode emit */</span>
+    <span class="code-str">'tools/result'</span>(exec: <span class="code-key">readonly</span> ToolExecution,
+                  result: <span class="code-key">readonly</span> ToolExecutionResult): <span class="code-key">undefined</span>
+  }
+}</code></pre>
+
+  <p>
+    Three lessons from this real declaration: <code>tools/pre-execute</code> is a waterfall (has
+    <code>next</code>, has a return value), used for allow / deny / ask-the-human decisions;
+    <code>tools/result</code> is an emit (no return value), used to observe the final outcome;
+    each event's JSDoc states its contract, and <code>@mode</code> lets tooling verify it
+    mechanically.
+  </p>
+
+  <h2 id="sec-waterfall">2.6 waterfall: onion, wrapping, and short-circuits</h2>
+
+  <p>
+    The one mode worth mastering is <code>ctx.waterfall()</code> — all of dsh's interception layers
+    are built on it: <code>agent/pre-step</code>, <code>agent/request</code>, <code>llm/stream</code>,
+    <code>tools/pre-execute</code>, <code>tools/execute</code>, <code>tools/post-execute</code> are
+    all waterfalls (for contrast: <code>agent/turn-stopping</code> is serial and has no
+    <code>next</code>).
+  </p>
+
+  <p>The semantics in one sentence: <strong>waterfall is around middleware</strong>. A listener receives <code>(…args, next)</code>:</p>
+
+  <ul>
+    <li>Call <code>next()</code>: hand the (possibly rewritten) request to the next layer; <code>next()</code>'s <strong>return value</strong> is that layer's result;</li>
+    <li><strong>Return without calling <code>next()</code></strong>: the whole chain <strong>short-circuits</strong> here — later listeners and the real execution never happen, and your return value becomes the final result.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="waterfall onion model vs short-circuit">
+      <text x="170" y="24" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">Every layer calls next(): passes through normally</text>
+      <rect x="40" y="40" width="260" height="250" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="62" y="66" style="fill:var(--fg)" font-size="12" font-weight="700">Listener A</text>
+      <rect x="70" y="80" width="200" height="190" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="92" y="106" style="fill:var(--fg)" font-size="12" font-weight="700">Listener B</text>
+      <rect x="100" y="120" width="140" height="130" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="122" y="146" style="fill:var(--fg)" font-size="12" font-weight="700">Listener C</text>
+      <rect x="130" y="160" width="80" height="60" rx="8" style="fill:var(--accent);fill-opacity:0.18;stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="170" y="188" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">Real execution</text>
+      <text x="170" y="204" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">(e.g. an LLM request)</text>
+      <text x="170" y="316" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Request passes down, result returns up: every layer can rewrite, time, allow</text>
+
+      <text x="500" y="24" text-anchor="middle" style="fill:var(--fail)" font-size="13" font-weight="700">B skips next(): short-circuits here</text>
+      <rect x="370" y="40" width="260" height="250" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="392" y="66" style="fill:var(--fg)" font-size="12" font-weight="700">Listener A</text>
+      <rect x="400" y="80" width="200" height="190" rx="8" style="fill:var(--surface-2);stroke:var(--fail)" stroke-width="2.5"/>
+      <text x="422" y="106" style="fill:var(--fail)" font-size="12" font-weight="700">Listener B</text>
+      <text x="500" y="126" text-anchor="middle" style="fill:var(--fail)" font-size="10">returns directly, never calls next()</text>
+      <rect x="430" y="140" width="140" height="80" rx="8" style="fill:none;stroke:var(--fg-dim);stroke-dasharray:5 4" stroke-width="1.5"/>
+      <text x="500" y="168" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-weight="700">Listener C</text>
+      <text x="500" y="186" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">never happens</text>
+      <rect x="460" y="230" width="80" height="34" rx="8" style="fill:none;stroke:var(--fg-dim);stroke-dasharray:5 4" stroke-width="1.5"/>
+      <text x="500" y="251" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Real execution</text>
+      <text x="500" y="316" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">B's return value becomes the final result; the chain stops here</text>
+    </svg>
+    <figcaption>waterfall's onion model. Left: every layer calls next(); the request passes down layer by layer and the result returns up. Right: B does not call next(), so C and the real execution are skipped — the chain short-circuits at B.</figcaption>
+  </figure>
+
+  <p>Both endings in pseudocode:</p>
+
+  <pre><code><span class="code-comment">// cooperative listener: modify, then pass through</span>
+ctx.<span class="code-fn">on</span>(<span class="code-str">'tools/execute'</span>, <span class="code-key">async</span> (exec, next) =&gt; {
+  exec.timeoutMs = 30_000                    <span class="code-comment">// wrap: rewrite the shared request</span>
+  <span class="code-key">return await</span> <span class="code-fn">next</span>()                        <span class="code-comment">// must delegate; the result returns through this layer</span>
+})
+
+<span class="code-comment">// decision-owning listener: I own this decision; stop here</span>
+ctx.<span class="code-fn">on</span>(<span class="code-str">'tools/pre-execute'</span>, <span class="code-key">async</span> (exec, next) =&gt; {
+  <span class="code-key">if</span> (exec.name === <span class="code-str">'bash'</span> &amp;&amp; isDangerous(exec.args)) {
+    <span class="code-key">return</span> { kind: <span class="code-str">'deny'</span> }               <span class="code-comment">// no next() call: short-circuit is the veto</span>
+  }
+  <span class="code-key">return await</span> <span class="code-fn">next</span>()                        <span class="code-comment">// allow everything else</span>
+})</code></pre>
+
+  <p>When is a short-circuit <strong>correct</strong> and when is it an <strong>incident</strong>? The criterion in one line:</p>
+
+  <ul>
+    <li><strong>In a single-decision event, short-circuiting is design</strong>. When a policy listener owns the decision (deny a dangerous command), not calling <code>next()</code> is precisely how it expresses that.</li>
+    <li><strong>Listeners that only annotate or observe must call <code>next()</code></strong>. A wrapping layer that forgets <code>next()</code> is not 「skipping itself」 — it is choking off everyone after it: later listeners and the real execution all vanish silently, the incident mode dsh's documentation stresses again and again.</li>
+    <li>Two more details: the result travels back through <code>next()</code>'s return value, and a listener may also replace the downstream result wholesale, in which case downstream sees the replaced value. <code>prepend: true</code> is used only when that listener must run before ordinary registrations.</li>
+  </ul>
+
+  <div class="demo" data-demo="waterfallChain">
+    <div class="demo-title">Try it — what happens when waterfall forgets next()</div>
+    <p>Three listeners wrap one model request in sequence:</p>
+    <label><input type="checkbox"> Make listener B skip next()</label>
+    <button data-run>Run request</button>
+    <div class="demo-output empty">Click to run.</div>
+  </div>
+
+  <h2 id="sec-event-domains">2.7 Three event domains: the forest first</h2>
+
+  <p>
+    dsh's events split into three domains by who owns the fact. For now you only need the three
+    names and the intuition for choosing; each domain gets full chapters later: session events in
+    Chapter 4, agent events in Chapters 6/7, capability events in Chapters 8/11.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Event domain</th><th>Examples</th><th>Essence</th><th>When to choose it</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>session events</strong></td>
+        <td><code>user/message</code>, <code>assistant/message</code>, <code>tool/call</code>, <code>turn/*</code></td>
+        <td>Persistent facts, appended to the session log and broadcast via <code>session/event</code></td>
+        <td>The fact must <strong>survive a restart</strong> and be replayable</td>
+      </tr>
+      <tr>
+        <td><strong>agent events</strong></td>
+        <td><code>agent/pre-step</code>, <code>agent/request</code>, <code>agent/turn-stopping</code></td>
+        <td>Carries a live <code>Agent</code>: inbox, steps, state, requests, validation, continuation</td>
+        <td>You want to observe or intercept <strong>work in progress</strong></td>
+      </tr>
+      <tr>
+        <td><strong>capability events</strong></td>
+        <td><code>tools/*</code>, <code>fs/*</code>, <code>telemetry/*</code></td>
+        <td>Policy and adapter hooks on a capability seam</td>
+        <td>You want to add <strong>policy</strong> to one capability without touching the agent loop</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The intuition: the fact must be recorded → session; watching running work → agent; adding
+    policy to a capability → capability. dsh's architecture doc says events are the extension
+    points and choosing the right domain is the first decision of most changes — you will feel
+    that repeatedly when practicing in Chapter 24.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">One more rule: model-visible ⟺ logged</div>
+    <p>
+      dsh has one more iron rule tied to the event domains; remember the conclusion now (Chapter 4
+      expands it): whatever reaches a model request must be reconstructable from the session log.
+      Adding a new model-visible input requires adding a session event — what the model sees and
+      what the log records always correspond one to one.
+    </p>
+  </div>
+
+  <h2 id="sec-recap">2.8 Chapter recap</h2>
+
+  <ul>
+    <li>Cordis is the plugin framework dsh stands on, vendored in <code>vendor/</code> (a pinned upstream source copy, rescoped to <code>@deepseek-ai/cordis</code>, a peerDependency of every harness package); updates go through the procedure in <code>vendor/README.md</code>.</li>
+    <li><strong>Everything is a plugin</strong>: model adapters, the tool registry, the session log, and the agent loop itself are all plugins, all replaceable at the configuration layer; there is no privileged core to patch.</li>
+    <li><strong>Context is the service registry</strong>: services register under keys (<code>ctx.tools</code>, <code>ctx.llm</code>, <code>ctx.sessions</code>…), plugins consume by key; services are <code>Service</code> subclasses, interface (Service Definition) and implementation are separate; types come from declaration merging.</li>
+    <li>Plugins come in two forms: function plugins (<code>name</code> + <code>inject</code> + <code>apply</code>) or <code>Service</code> subclasses; <code>inject</code> declares service dependencies, and load order is expressed by dependencies.</li>
+    <li><strong>Registrations are effects</strong>: every contribution goes through <code>ctx.effect()</code> / <code>ctx.on()</code>, registration returns a disposer, and a plugin's registrations retire automatically and in order at unload.</li>
+    <li>Events have four dispatch modes (emit / waterfall / parallel / serial); the mode is part of the event's contract (<code>@mode</code> annotation); <strong>waterfall listeners must call <code>next()</code></strong> — not calling short-circuits the whole chain. In single-decision events the short-circuit is design; an observing listener forgetting to call it is an incident.</li>
+    <li>Three event domains: session (persistent facts), agent (work in progress), capability (policy over a capability).</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Importing a service's implementation class to use it — fetch it from <code>ctx</code> by key; depend on the Service Definition, not the Provider.</li>
+      <li>A waterfall listener forgetting <code>next()</code> — that is not skipping itself, it is choking off every later layer and the real execution.</li>
+      <li>Expecting emit events to return a value — emit only observes, no return value; for wrapping and interception use waterfall.</li>
+      <li>Treating <code>ctx.effect()</code> as an optional style preference — bypassing it and mutating global state leaves dirt nobody cleans at unload; that is a defect.</li>
+      <li>Reaching to modify <code>agent-loop</code> to change behavior — first find the right domain's event and hook it; changing the loop itself requires updating the architecture docs and is the last resort.</li>
+      <li>Believing <code>vendor/</code> is an ordinary npm-installed dependency — it is a pinned source copy with its own sync procedure and local-modification log.</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="2">
+    <h2>Chapter 2 Test</h2>
+
+    <div class="q" data-id="2-1" data-type="mcq" data-correct='["d"]'
+         data-answer="D — All of the above are plugins: dsh has no non-plugin privileged part."
+         data-rationale="D is correct: everything is a plugin — model adapters, the session log, and the agent loop are all plugins, all replaceable at the configuration layer; there is no privileged core to patch. Choosing A, B, or C alone is incomplete and treats one plugin as the exception."
+         data-review="sec-what-is-cordis">
+      <div class="prompt"><span class="qnum">Q1.</span> In dsh, which of the following is <strong>not</strong> a plugin?</div>
+      <label class="opt"><input type="radio" name="q-2-1" value="a"> A. The DeepSeek model adapter (llm-deepseek)</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="b"> B. The session log (core/session)</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="c"> C. The agent loop itself (core/agent-loop)</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="d"> D. All of the above are plugins — no exceptions and no privileged core</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B — vendor/ is a pinned copy of the upstream Cordis source, rescoped to @deepseek-ai/cordis, a peerDependency of every harness package."
+         data-rationale="B is correct. A is wrong: it is not an ordinary npm dependency but an auditable, patchable, version-pinned source copy. C is wrong: Cordis is the upstream framework; dsh assembles on top of it. D is wrong: it genuinely participates in builds and releases — publishing dsh publishes this framework layer along with it."
+         data-review="sec-what-is-cordis">
+      <div class="prompt"><span class="qnum">Q2.</span> What is the Cordis inside the <code>vendor/</code> directory?</div>
+      <label class="opt"><input type="radio" name="q-2-2" value="a"> A. An ordinary third-party dependency installed from npm</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="b"> B. A pinned upstream source copy, rescoped to <code>@deepseek-ai/cordis</code>, a peerDependency of the harness packages</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="c"> C. A framework the dsh team wrote from scratch</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="d"> D. Read-only reference code that does not participate in builds</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The service registry: plugins find services by stable ctx keys instead of importing concrete implementations."
+         data-rationale="C is correct — that is Context's defining role. A is wrong: keys on ctx are strongly typed members produced by declaration merging, not a bucket for arbitrary variables. B is wrong: ctx has nothing to do with databases. D is wrong: configuration comes from cordis.yml and patch layers (Chapter 3); ctx is the runtime service directory."
+         data-review="sec-context">
+      <div class="prompt"><span class="qnum">Q3.</span> Which description most accurately captures the role of <code>ctx</code> (Context) in Cordis?</div>
+      <label class="opt"><input type="radio" name="q-2-3" value="a"> A. A global variable bucket where any property can be attached at will</label>
+      <label class="opt"><input type="radio" name="q-2-3" value="b"> B. A database connection pool</label>
+      <label class="opt"><input type="radio" name="q-2-3" value="c"> C. The service registry: plugins find services by stable keys (e.g. <code>ctx.tools</code>) without importing concrete implementations</label>
+      <label class="opt"><input type="radio" name="q-2-3" value="d"> D. An object that holds YAML configuration files</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-4" data-type="fill" data-accepted='["tools","ctx.tools"]'
+         data-answer="tools (i.e. ctx.tools)."
+         data-rationale="The second argument of super(ctx, 'tools') in the constructor is the key the service registers under; through declaration merging it also enters the Context interface and becomes the source of ctx.tools's type."
+         data-review="sec-context">
+      <div class="prompt"><span class="qnum">Q4.</span> Fill in the blank: <code>ToolRuntime</code> calls <code>super(ctx, 'tools')</code> in its constructor; the key it occupies in Context is <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Declares service dependencies: the plugin activates only once they exist, and load order is expressed by dependencies."
+         data-rationale="B is correct: inject makes Cordis wait for the required services, replacing manual startup ordering. A is wrong: npm dependencies are declared in package.json. C is wrong: event subscriptions go through ctx.on. D is wrong: configuration is a separate mechanism (Chapter 3)."
+         data-review="sec-plugin-shapes">
+      <div class="prompt"><span class="qnum">Q5.</span> What does a plugin's <code>inject</code> field do?</div>
+      <label class="opt"><input type="radio" name="q-2-5" value="a"> A. Declare npm dependencies for the package manager to install</label>
+      <label class="opt"><input type="radio" name="q-2-5" value="b"> B. Declare service dependencies: the plugin activates only once these services exist; load order is expressed by requirements</label>
+      <label class="opt"><input type="radio" name="q-2-5" value="c"> C. Declare the list of events to subscribe to</label>
+      <label class="opt"><input type="radio" name="q-2-5" value="d"> D. Declare which configuration fields the plugin accepts</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A, B, and D are correct: ctx.effect returns a disposer, the generator yields cleanup actions, and registrations retire automatically and in order at unload — together that is reversibility. C is wrong: it is a hard rule; bypassing it to mutate global state leaves registrations nobody cleans at unload, a defect rather than a style choice."
+         data-review="sec-effects">
+      <div class="prompt"><span class="qnum">Q6.</span> Which statements about 「registrations are effects」 are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="a"> A. <code>ctx.effect()</code> returns a disposer; calling it undoes the whole set of registrations</label>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="b"> B. Yield cleanup actions in the generator; they run in reverse order at unload</label>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="c"> C. It is only a recommended style; mutating global variables directly is also fine</label>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="d"> D. At unload, the registrations a plugin made through <code>ctx.effect()</code> / <code>ctx.on()</code> retire automatically</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-7" data-type="mcq" data-correct='["c"]'
+         data-answer="C — waterfall: does not wait for listeners, registration order, has a return value."
+         data-rationale="C is correct; only waterfall satisfies all three at once. A is wrong: emit has no return value. B is wrong: parallel runs concurrently with no return value. D is wrong: serial waits for listeners to finish."
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q7.</span> Which dispatch mode 「does not wait for listeners, runs in registration order, and has a return value」?</div>
+      <label class="opt"><input type="radio" name="q-2-7" value="a"> A. <code>emit</code></label>
+      <label class="opt"><input type="radio" name="q-2-7" value="b"> B. <code>parallel</code></label>
+      <label class="opt"><input type="radio" name="q-2-7" value="c"> C. <code>waterfall</code></label>
+      <label class="opt"><input type="radio" name="q-2-7" value="d"> D. <code>serial</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The chain short-circuits at B: neither C nor the real execution happens, and B's return value becomes the final result."
+         data-rationale="B is correct: not calling next() means returning without delegating, and the rest of the chain is skipped. A is wrong: B is not the one skipped — B chokes off everything after it. C is wrong: this is not an error but a silent short-circuit — dangerous precisely because nothing is thrown. D is wrong: waterfall's rules apply identically to every layer; there is no automatic retry."
+         data-review="sec-waterfall">
+      <div class="prompt"><span class="qnum">Q8.</span> Listeners A, B, C register in that order on a model request's waterfall. B receives the request and returns directly without calling <code>next()</code>. What happens?</div>
+      <label class="opt"><input type="radio" name="q-2-8" value="a"> A. B is skipped and C continues</label>
+      <label class="opt"><input type="radio" name="q-2-8" value="b"> B. The chain short-circuits at B: neither C nor the real LLM call happens; B's return value becomes the final result</label>
+      <label class="opt"><input type="radio" name="q-2-8" value="c"> C. Cordis throws and kills the whole process</label>
+      <label class="opt"><input type="radio" name="q-2-8" value="d"> D. The request is retried automatically once</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — In a single-decision event when you own the decision: the denial is your return value, and the short-circuit is design."
+         data-rationale="C is correct: when a policy listener owns the decision (vetoing a dangerous command), not calling next() is exactly the expression of it. A is wrong: observers must call next(), or they choke off every later layer. B is wrong: after wrapping and rewriting, next() is precisely what carries the request down and brings the result back. D is wrong: prepend is only an ordering option, unrelated to calling next()."
+         data-review="sec-waterfall">
+      <div class="prompt"><span class="qnum">Q9.</span> When is it correct for a waterfall listener to <strong>not</strong> call <code>next()</code>?</div>
+      <label class="opt"><input type="radio" name="q-2-9" value="a"> A. When you only want to observe the event and not change the result</label>
+      <label class="opt"><input type="radio" name="q-2-9" value="b"> B. When you want to rewrite the request before passing it down</label>
+      <label class="opt"><input type="radio" name="q-2-9" value="c"> C. In a single-decision event where you own the decision: for example, a policy listener deciding to deny a dangerous command</label>
+      <label class="opt"><input type="radio" name="q-2-9" value="d"> D. When you used prepend: true</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-10" data-type="fill" data-accepted='["declaration merging","declaration merge","声明合并"]'
+         data-answer="declaration merging."
+         data-rationale="Typed events merge members into the Events interface via declare module; Context's service keys use the same mechanism. Each service package contributes its own types, with no central registry."
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q10.</span> Fill in the blank: the types of both typed events and Context service keys are merged and extended through TypeScript's <code>______</code> mechanism.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The event's dispatch mode (emit / waterfall / parallel / serial)."
+         data-rationale="B is correct: @mode is part of the event's public contract, and the generated catalog uses it to cross-check declarations against dispatch sites. A is wrong: run mode is a profile/bundle matter (Chapter 3). C is wrong: scope annotation has its own mechanism (Chapter 6). D is wrong: priority is not what it annotates."
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q11.</span> What does the <code>@mode</code> tag in an event's JSDoc annotate?</div>
+      <label class="opt"><input type="radio" name="q-2-11" value="a"> A. The plugin's run mode (web / headless)</label>
+      <label class="opt"><input type="radio" name="q-2-11" value="b"> B. The event's dispatch mode (emit / waterfall / parallel / serial)</label>
+      <label class="opt"><input type="radio" name="q-2-11" value="c"> C. The event's scope filtering method</label>
+      <label class="opt"><input type="radio" name="q-2-11" value="d"> D. The listener's registration priority</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-12" data-type="mcq" data-correct='["a"]'
+         data-answer="A — A session event: a persistent fact appended to the session log, able to survive a restart."
+         data-rationale="A is correct: cross-restart replayable facts are the definition of session events. B is wrong: agent events target work in progress and do not promise persistence. C is wrong: capability events are policy hooks over capabilities. D is wrong: bypassing the log to write a file directly violates the model-visible ⟺ logged iron rule (Chapter 4)."
+         data-review="sec-event-domains">
+      <div class="prompt"><span class="qnum">Q12.</span> You need to record a fact that must survive a process restart and be replayable afterwards. Which event domain do you use?</div>
+      <label class="opt"><input type="radio" name="q-2-12" value="a"> A. session event</label>
+      <label class="opt"><input type="radio" name="q-2-12" value="b"> B. agent event</label>
+      <label class="opt"><input type="radio" name="q-2-12" value="c"> C. capability event</label>
+      <label class="opt"><input type="radio" name="q-2-12" value="d"> D. No event — just write a file directly</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-13" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Depend on the Service Definition (key + type), not on a concrete Provider."
+         data-rationale="C is correct: extension plugins use services through ctx keys and declaration-merged types, so implementations can be replaced wholesale. A is wrong: importing the Provider class welds the caller to one implementation. B is wrong: copying code is an antipattern. D is wrong: a configuration line selects which Provider registers; it never changes how callers are written (Chapter 3)."
+         data-review="sec-context">
+      <div class="prompt"><span class="qnum">Q13.</span> Your plugin wants to use the shell capability. What is the correct way to depend on it?</div>
+      <label class="opt"><input type="radio" name="q-2-13" value="a"> A. Import shell-local's implementation class and call it directly</label>
+      <label class="opt"><input type="radio" name="q-2-13" value="b"> B. Copy shell-local's code into your own package</label>
+      <label class="opt"><input type="radio" name="q-2-13" value="c"> C. Depend on the Service Definition: declare it in <code>inject</code> and consume via <code>ctx.shell</code></label>
+      <label class="opt"><input type="radio" name="q-2-13" value="d"> D. Hard-code the provider's absolute path in cordis.yml</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-14" data-type="short"
+         data-key-points='["waterfall is around middleware: the listener receives (...args, next)","Calling next() hands the (possibly rewritten) request to the next layer; the value travels back through the return value of next()","Returning without calling next() = short-circuit: later listeners and the real execution never happen, and the return value becomes the final result","In a single-decision event the policy listener owns the decision; the short-circuit is design","Listeners that only observe or annotate must call next(); forgetting silently chokes the whole chain"]'
+         data-answer="waterfall is onion-style around middleware: each listener receives (...args, next); calling next() means allowing — the (possibly rewritten) request passes to the next layer and the result returns to your hands through next()'s return value; returning without calling next() short-circuits there — every later listener and the real execution is skipped, and the return value becomes the final result. When a policy listener owns the decision in a single-decision event, the short-circuit is exactly how it expresses denial; a listener that only observes or annotates must call next(), or it silently chokes the whole chain."
+         data-rationale="Five points: around middleware, next() delegation and value return, short-circuit consequences, when short-circuiting is design, and why observers must delegate."
+         data-review="sec-waterfall">
+      <div class="prompt"><span class="qnum">Q14.</span> In your own words, explain waterfall semantics: what does a listener receive, what does calling <code>next()</code> mean, and what happens if it doesn't? Why may a policy listener skip it while an observer must call it?</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check the points you actually made — checking fewer hurts your calibration; checking more only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="03-runtime-assembly.html"><strong>Chapter 3 · Assembling a Runtime</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

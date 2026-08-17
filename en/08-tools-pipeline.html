@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 8 · The Tool System: Registry and Execution Pipeline — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 8 · The Tool System</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/08-tools-pipeline.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="8">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 8 · Part II · The Core Spine</div>
+    <h1>The Tool System: Registry and Execution Pipeline</h1>
+    <p class="lede">
+      In the last chapter you saw the <code>tool-call</code> in an assistant message dropped into
+      'the tools pipeline'. This chapter unrolls that pipe: how tools register, which gates a call
+      passes through from model request to the <code>tool/result</code> event, where it can be
+      rejected, where it can be rewritten, and why even a rejected call is guaranteed to leave a
+      log record. By the end you will write a tool plugin of your own and know which pipeline
+      layer your policy belongs in.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Register a tool with <code>ctx.tools.register()</code> and state what 'registration is an effect' means</li>
+      <li>Recite the composition of a <code>ToolDefinition</code>: schema, the <code>output</code> declaration, <code>execute</code>, optional callbacks</li>
+      <li>Name the execution pipeline stages in order, and what each stage may rewrite or reject</li>
+      <li>Explain why a rejection also produces a <code>tool/result</code> event (model-visible ⟺ logged)</li>
+      <li>Distinguish the intended use of monotonic guards, <code>tools/execute</code> wrappers, and post-execute plugins</li>
+      <li>State why a tool's UI render intent is a pure function of args</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-registry">8.1 ctx.tools: the scoped tool registry</h2>
+
+  <p>
+    The <code>ToolRuntime</code> service from <code>packages/core/tools/</code> hangs on
+    <code>ctx.tools</code>. It is two things at once: a <strong>scoped registry</strong> and a
+    <strong>guard-style execution pipeline</strong>. The registry half first.
+  </p>
+  <p>
+    Registering a tool is an effect (Chapter 2's rule holds here too):
+  </p>
+  <pre><code><span class="code-key">export const</span> name = <span class="code-str">'my-tool'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'tools'</span>]
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx) {
+  <span class="code-key">const</span> dispose = ctx.tools.<span class="code-fn">register</span>(<span class="code-fn">defineTool</span>({ <span class="code-comment">/* … */</span> }))
+  <span class="code-key">return</span> dispose  <span class="code-comment">// or hand it to the plugin fiber: unregisters automatically when the fiber disposes</span>
+}</code></pre>
+  <p>
+    The disposer returned by <code>register()</code> is the unregister function; which scope a
+    registration lands in is decided by the caller's ctx — a plain plugin context registers a
+    <strong>global</strong> tool, while registering through some agent's <code>agent.ctx</code>
+    makes it visible to that agent only and <strong>shadows</strong> the same-name global tool
+    (Chapter 6's shadowing caught at its first scene here). A duplicate name within the same
+    layer throws immediately, and the error message even tells you: for a per-agent variant,
+    register via <code>agent.ctx</code>. Registration/unregistration/scope changes broadcast
+    <code>tools/change</code> (an unfiltered notification — a global change concerns every
+    agent's next assembly).
+  </p>
+  <p>
+    Two companion operations live on the scope:
+    <code class="small">ctx.tools.restrict({allow?, deny?})</code>
+    puts an allow/deny mask over an agent's <strong>inherited surface</strong> (multiple masks
+    intersect; the layer's own registrations are unaffected);
+    <code class="small">ctx.tools.presentAs('code')</code> lets a single agent opt into Code Mode
+    presentation (the deployment-level default is the tools plugin's <code>mode</code> config:
+    native / code / both). Both methods can be called only from a scoped context — calling them
+    from a plain context throws immediately, because 'global mask' and 'global presentation'
+    belong in configuration, not hidden inside some plugin's side effects.
+  </p>
+
+  <h2 id="sec-definition">8.2 ToolDefinition: everything a tool declares</h2>
+
+  <p>
+    A <code>ToolDefinition</code> (wrapping it in <code class="small">defineTool()</code> gets
+    you type inference) has four blocks; the minimal example in
+    <code>docs/cookbook/adding-a-tool.md</code> is the fastest memory anchor:
+  </p>
+  <ul>
+    <li>
+      <strong>The model-visible schema</strong>: <code>name</code>, <code>description</code>,
+      <code>parameters</code>. These are the only three fields the model ever sees — everything
+      else (timeouts, concurrency classification, presentation callbacks) is never sent to the
+      model.
+    </li>
+    <li>
+      <strong>The required <code>output</code> declaration</strong>:
+      <code>{schema, render, presentationMeta?}</code>.
+      The tool body returns only a <strong>canonical JSON value</strong> conforming to
+      <code>output.schema</code>;
+      <code>render(args, value)</code> projects it into model-visible content blocks;
+      <code>presentationMeta</code> projects it into replayable UI card data (landing in
+      <code>tool/result</code>'s <code>meta</code> field). Registering without
+      <code>output</code> is an immediate TypeError.
+    </li>
+    <li>
+      <strong><code>execute(args, exec)</code></strong>: the actual work. The contract:
+      arguments are already validated and frozen (<code>defineTool</code> validates first;
+      violations become an <code>INVALID_ARGS</code> error result); it must observe
+      <code>exec.signal</code> for cooperative cancellation; a throw or a value off the
+      declaration is normalized into an <code>isError</code> result — tool failure is a normal
+      result path, not a crash. <code>exec</code> also carries <code>deferContext(msg)</code>
+      (defers context injection until after the result lands) and <code>concludeTurn()</code>
+      (marks a successful result as concluding this turn).
+    </li>
+    <li>
+      <strong>Optional metadata</strong>: <code>timeoutMs</code> (a cooperative timeout budget;
+      policy metadata, never sent to the model),
+      <code>isConcurrencySafe(args)</code> (only a strict <code>true</code> allows parallelism;
+      see Chapter 7), <code>finalizeContent</code> (a last-pass content rewrite, which must be
+      synchronous and total), <code>presentCall</code> / <code>presentResult</code> (8.6).
+    </li>
+  </ul>
+
+  <h2 id="sec-pipeline">8.3 The execution pipeline: five gated stages + two short-circuits</h2>
+
+  <p>
+    When the agent loop's scheduler launches a call, it first records <code>tool/call</code>
+    <strong>into the log</strong> (recorded before execution), then enters the pipeline described
+    in <code>docs/tool-execution-pipeline.md</code>. Stage by stage:
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="tool execution pipeline">
+      <rect x="20" y="30" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="49" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">tool/call hits the log</text>
+      <text x="95" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">(recorded before execution)</text>
+      <line x1="170" y1="53" x2="205" y2="53" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="205,53 198,49 198,57" style="fill:var(--muted)"/>
+
+      <rect x="205" y="30" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="280" y="49" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">① pre-execute</text>
+      <text x="280" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">waterfall: allow/deny/ask</text>
+      <line x1="355" y1="53" x2="390" y2="53" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="390,53 383,49 383,57" style="fill:var(--muted)"/>
+
+      <rect x="390" y="30" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="460" y="49" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">② guards</text>
+      <text x="460" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">monotonic guards: deny only</text>
+      <line x1="530" y1="53" x2="565" y2="53" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="565,53 558,49 558,57" style="fill:var(--muted)"/>
+
+      <rect x="565" y="30" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="640" y="49" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">③ execute (around)</text>
+      <text x="640" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">timeout/retry/metrics wrapping</text>
+      <line x1="640" y1="76" x2="640" y2="110" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="640,110 636,103 644,103" style="fill:var(--muted)"/>
+
+      <rect x="545" y="110" width="190" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="640" y="129" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">the tool's execute() body</text>
+      <text x="640" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">fs gates / the tool's own events live here</text>
+      <line x1="545" y1="133" x2="510" y2="133" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="510,133 517,129 517,137" style="fill:var(--muted)"/>
+
+      <rect x="360" y="110" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="435" y="129" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">④ post-execute</text>
+      <text x="435" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">accept/block/replace/context</text>
+      <line x1="360" y1="133" x2="325" y2="133" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="325,133 332,129 332,137" style="fill:var(--muted)"/>
+
+      <rect x="175" y="110" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="250" y="129" text-anchor="middle" style="fill:var(--fg)" font-size="12">normalize + finalizeContent</text>
+      <text x="250" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">snapshot failure → isError</text>
+      <line x1="175" y1="133" x2="140" y2="133" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="140,133 147,129 147,137" style="fill:var(--muted)"/>
+
+      <rect x="20" y="110" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="80" y="129" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">⑤ tools/result</text>
+      <text x="80" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">read-only observation (emit)</text>
+      <line x1="80" y1="156" x2="80" y2="190" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="80,190 76,183 84,183" style="fill:var(--muted)"/>
+
+      <rect x="20" y="190" width="150" height="42" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="209" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">tool/result event</text>
+      <text x="95" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">the only model-visible outcome</text>
+
+      <path d="M 280 76 C 280 260, 95 240, 95 232" style="fill:none;stroke:var(--fail)" stroke-width="2" stroke-dasharray="6,4"/>
+      <polygon points="95,232 91,240 99,240" style="fill:var(--fail)"/>
+      <text x="240" y="272" style="fill:var(--fail)" font-size="11">denied/unapproved: skips the body but still finishes with tool/result</text>
+
+      <path d="M 640 156 C 640 200, 250 190, 250 156" style="fill:none;stroke:var(--warn)" stroke-width="2" stroke-dasharray="6,4"/>
+      <text x="420" y="196" style="fill:var(--warn)" font-size="11">a throw at any pipeline stage → normalized to isError (same finishing path)</text>
+
+      <rect x="20" y="290" width="695" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="367" y="309" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">an ask decision → one-shot ctx.approval prompt: allowed-once returns to ②; denied or no approval service → the rejection short-circuit</text>
+    </svg>
+    <figcaption>
+      The tool execution pipeline (per docs/tool-execution-pipeline.md). ①–④ are rewritable live waterfall/guard stages;
+      blue boxes (var(--accent)) are durable events; the red dashed line is the rejection short-circuit and the yellow dashed line is exception normalization — every path converges on
+      <code>tool/result</code>.
+    </figcaption>
+  </figure>
+
+  <ol>
+    <li>
+      <strong><code>tools/pre-execute</code> (waterfall)</strong>: the extensible allow / deny /
+      ask gate — hooks, permission policy, and sandbox wrapping all hang here. Listeners must
+      call <code>next()</code>; when <code>ask</code> is returned, a deployment with a
+      <code>ctx.approval</code> service gets a one-shot approval prompt (continue if allowed,
+      otherwise treat as rejected); with no approval service it <strong>degrades to
+      deny</strong>. Note that pre-execute <em>deliberately offers no argument rewriting</em> —
+      the arguments are already logged and presented at this point.
+    </li>
+    <li>
+      <strong>Registered monotonic guards</strong>: synchronous guards registered with
+      <code class="small">ctx.tools.guard(g)</code>, running after pre-execute and before the
+      body. They have only two return values: a reason (final rejection) or
+      <code>undefined</code> (abstain). <strong>There is no allow</strong> — so no matter how
+      listeners are ordered, nobody may flip a guard-rejected call back to allowed. That is what
+      'monotonic' means: tighten-only.
+    </li>
+    <li>
+      <strong><code>tools/execute</code> (around-dispatch waterfall)</strong>: wraps the actual
+      dispatch. 'Around execution' concerns — timeouts, retries, metrics — belong here. A wrapper
+      may only temporarily replace <code>exec.signal</code> (say, to impose a tighter deadline);
+      it cannot change the call's identity; the registry re-attaches the caller's original
+      signal before the body.
+    </li>
+    <li>
+      <strong><code>tools/post-execute</code> (waterfall)</strong>: post-processing of the
+      <strong>already-normalized</strong> result — accept (rewriting content or the canonical
+      value, attaching <code>additionalContexts</code> context) or block (turning corrective
+      feedback into an error result). Rejected/timed-out calls also arrive here (failure is a
+      result too).
+    </li>
+    <li>
+      <strong><code>tools/result</code> (emit, read-only)</strong>: observation of the frozen
+      final outcome. The agent loop then lands the <code>tool/result</code> durable event, with
+      the <code>meta</code> used by UI cards.
+    </li>
+  </ol>
+  <p>
+    One gatekeeper in the pipeline is easy to miss: after post, the registry performs
+    <strong>outer normalization</strong> (errors thrown at any stage and snapshot failures all
+    become isError uniformly), then gives the tool definition's <code>finalizeContent</code> one
+    last content-rewrite chance, and only then materializes, freezes, and broadcasts.
+    <strong>Whichever path is taken — normal, rejected, timed out, exceptional — the destination
+    is one <code>tool/result</code> event</strong>. This is the tool-side shape of the Chapter 4
+    invariant: model-visible ⟺ logged. A call rejected by policy shows the model the rejection
+    reason so it can change course, rather than vanishing into thin air and leaving the model to
+    guess at a dangling call.
+  </p>
+
+  <div class="demo" data-demo="toolPipeline">
+    <div class="demo-title">Try it — a tool call walks the execution pipeline</div>
+    <p>Pick a scenario and watch what happens at each pipeline stage:</p>
+    <label><input type="radio" name="d8" value="ok"> Passes normally</label>
+    <label><input type="radio" name="d8" value="reject"> Rejected by pre-policy</label>
+    <label><input type="radio" name="d8" value="timeout"> Guard timeout</label>
+    <div class="demo-output empty">Pick a scenario first.</div>
+  </div>
+
+  <h2 id="sec-guards">8.4 A policy-plugin example: two plugins from the guard group</h2>
+  <p>
+    The <code>packages/guard/</code> group holds two loop-hygiene/timeout plugins; they are the
+    model examples of 'policy goes in the pipeline, not into tools'. Note one detail easy to
+    misread from the name: <strong>the two plugins in this group do not both hang at the ②
+    guard position</strong> — each demonstrates a different pipeline layer:
+  </p>
+  <ul>
+    <li>
+      <strong><code>dsh-repeat-tool-reminder</code> (loop hygiene, observing at ④)</strong>:
+      counts how often each agent calls the same tool with the same arguments in a row; at the
+      thresholds (default 3/5/8) it injects an escalating reminder to make the model change
+      method or wrap up. It <strong>never vetoes and never rewrites</strong> calls — detection
+      hangs on <code>tools/post-execute</code> (denied calls count too: repeatedly ramming a
+      rejected call is exactly the loop worth interrupting), and the reminder is injected as
+      <code>additionalContexts</code> with the step, becoming a user/message reconstructible
+      from the log. The decision is left entirely to the model, so it is an advisory plugin.
+    </li>
+    <li>
+      <strong><code>dsh-tool-call-timeout-policy</code> (timeout, wrapping at ③)</strong>: a
+      <code>tools/execute</code> around-dispatch listener. For tools that declare
+      <code>timeoutMs</code>, it puts a deadline on <code>exec.signal</code>; when the deadline
+      wins it replaces the result with a structured <code>TOOL_TIMEOUT</code> error. The budget
+      comes from the tool's own declaration, so this plugin is <strong>zero-config</strong>.
+      Note that it is cooperative: only tools that actually forward <code>exec.signal</code> can
+      be 'timed out' — tools that ignore the signal are not hard-killed.
+    </li>
+  </ul>
+  <p>
+    So who is ② for? For the deployment owner's final veto that <strong>cannot be
+    reordered</strong> — the monotonic guards registered by
+    <code class="small">ctx.tools.guard(reason | undefined)</code>.
+    The pipeline doc sums it up: reorderable extension policy goes in pre-execute, owner policy
+    in guard, around-concerns (timeout/retry/metrics) wrap execute, and result observation and
+    rewriting go in post-execute / tools/result.
+  </p>
+
+  <h2 id="sec-parallel">8.5 Parallel versus sequential: the registry view</h2>
+  <p>
+    Chapter 7 covered how the scheduler groups with <code>executionMode</code>; here are the
+    facts on the registry side: <code class="small">ctx.tools.executionMode(exec)</code> looks up
+    the definition <strong>visible in that scope</strong>, and only when its
+    <code>isConcurrencySafe(args)</code> returns exactly <code>true</code> is it parallel —
+    unknown tools, shadowed, undeclared, or a throwing classifier are all treated as exclusive
+    (fail closed). Multiple parallel calls form a bounded rolling pool (default 10); exclusive
+    calls form barriers; dispatch may overlap, but pre-execute, result commits, and result
+    context all keep model order. On cancellation, already-started calls drain normally and
+    unstarted ones get synthetic error results — in the log, call and result are always paired.
+  </p>
+
+  <h2 id="sec-render-intent">8.6 Tool UI render intent: part of the design</h2>
+  <p>
+    A repository-level rule: a tool's UI render intent is <strong>part of the tool's design,
+    decided up front</strong>, not something the UI guesses after the fact. Tools declare their
+    cards through two <strong>pure functions</strong>:
+  </p>
+  <ul>
+    <li>
+      <code>presentCall(args)</code> → the <strong>pending card</strong>: shown when the call
+      starts and there is no result yet. The card vocabulary is <code>generic</code> (default;
+      may carry <code>locations</code> so the editor follows file positions),
+      <code>terminal</code> (this call is a shell command — tool-bash), and
+      <code>diff</code> (this call creates/modifies files, with an inline diff — tool-fs's
+      write/edit).
+    </li>
+    <li>
+      <code>presentResult(args, {content, isError, meta})</code> → the <strong>completed
+      card</strong>: besides the three base cards there are result views such as
+      <code>search</code> (grep/glob hit structures) and <code>web</code>
+      (structured sources for web_search/web_fetch), with data from the persisted
+      <code>result.meta</code>.
+    </li>
+  </ul>
+  <p>
+    Why must they be <strong>pure functions of args</strong>? Because these methods
+    <strong>run both in the live stream and during session-log replay</strong>: at replay time
+    there is no live session state, no clock, no filesystem. So the rule is strict: no I/O, no
+    reading session state, no time/randomness — if you need result-time facts (say, the actually
+    applied diff hunks), store them into the durable <code>meta</code> via
+    <code>output.presentationMeta</code> and read them back from there at replay. Meanwhile,
+    model-visible content and UI-visible cards are two separate tracks: UI-facing formatting
+    (console fences, path relativization) must <strong>never</strong> leak into the model
+    result.
+  </p>
+
+  <h2 id="sec-schema-bridge">8.7 The interface to prompt assembly</h2>
+  <p>
+    The last puzzle piece: how do registered tool schemas become what the model sees?
+    <code>ToolRuntime</code>'s constructor contains the line
+    <code class="small">ctx.systemPrompt.tools(context =&gt; this.wireSchemas(context.scope))</code> —
+    the registry hangs itself as one of system-prompt's <strong>tool schema providers</strong>,
+    resolving the visible tools per scope and projecting the three fields
+    <code>name/description/parameters</code>. So 'which tools the model can see this round' and
+    'which tools this scope can resolve' are forever the same answer. The full assembly story
+    (section ordering, <code>toolOrder</code> validation, Code Mode's SDK section) is next
+    chapter's topic.
+  </p>
+
+  <h2 id="sec-recap">8.8 Chapter recap</h2>
+  <ul>
+    <li><code>ctx.tools</code> = scoped registry + guard-style execution pipeline; <code>register()</code> is an effect returning a disposer; scoped registrations shadow same-name global tools.</li>
+    <li><code>ToolDefinition</code> = model-visible schema + required <code>output</code> (schema/render/presentationMeta) + <code>execute</code> + optional metadata; the tool body returns only canonical JSON values.</li>
+    <li>Pipeline order: tool/call hits the log → ① pre-execute (allow/deny/ask + approval degradation) → ② monotonic guards (deny only) → ③ execute around (timeout/retry/metrics) → the tool body → ④ post-execute (accept/block/replace/context) → normalize + finalizeContent → ⑤ tools/result (read-only) → the tool/result event.</li>
+    <li>Every stage may rewrite or reject; rejection/timeout/exception all produce a <code>tool/result</code> — model-visible ⟺ logged.</li>
+    <li>repeat-tool-reminder hangs on post-execute for advisory loop hygiene; timeout-policy wraps execute to enforce the tool-declared <code>timeoutMs</code>; the owner's final veto uses <code>ctx.tools.guard()</code>.</li>
+    <li>Parallelism fails closed: only a strict <code>isConcurrencySafe(args)</code> true is parallel; exclusive forms barriers; results commit in model order.</li>
+    <li>UI render intent (generic/terminal/diff/…) is decided up front; <code>presentCall</code>/<code>presentResult</code> are pure functions of args that must work during log replay.</li>
+    <li>The registry feeds schemas into prompt assembly via <code>ctx.systemPrompt.tools()</code> — the model-visible tool set and the scope-visible tool set share one source.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming a rejected call means 'nothing happened' — the pipeline short-circuits <strong>execution</strong>, not the <strong>record</strong>; <code>tool/result</code> still lands.</li>
+      <li>Writing deployment policy into tool bodies — it belongs in the pipeline: pre-execute for extensible policy, guard for the final veto, execute for timeout/retry, post-execute for result handling.</li>
+      <li>Expecting pre-execute to rewrite arguments — deliberately unsupported: arguments are already logged and presented; rewriting would desynchronize the log from execution.</li>
+      <li>Assuming <code>timeoutMs</code> is a hard kill — it is a cooperative budget that presupposes the tool forwards <code>exec.signal</code>.</li>
+      <li>Reading session state or the filesystem inside <code>presentCall</code> — none of that exists at replay; cards must depend only on args (+ durable meta).</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="8">
+    <h2>Chapter 8 Test</h2>
+
+    <div class="q" data-id="8-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — it returns the unregister function (disposer); registration is a one-shot effect, undone when the caller's fiber disposes."
+         data-rationale="B is correct. A is wrong: there is no 'global lock'. C is wrong: after registration the schema flows into assembly automatically; no manual push. D is wrong: precisely the reverse — a plain ctx registers a global tool, while a scoped (agent.ctx) registration is the per-agent one."
+         data-review="sec-registry">
+      <div class="prompt"><span class="qnum">Q1.</span> What does <code>ctx.tools.register(definition)</code> return, and what does it mean?</div>
+      <label class="opt"><input type="radio" name="q-8-1" value="a"> A. A global lock handle preventing other plugins from overriding</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="b"> B. An unregister function; registration is an effect, automatically undone when the caller's fiber disposes</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="c"> C. The model schema, which you must push to systemPrompt manually</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="d"> D. A per-agent handle that takes effect only within that agent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-2" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A, C, D are correct parts of a ToolDefinition. B is wrong: output is a required declaration; registering without it is an immediate TypeError — it is exactly the mechanism that makes tool return values validatable, projectable, and Code Mode-capable."
+         data-review="sec-definition">
+      <div class="prompt"><span class="qnum">Q2.</span> Which statements about the composition of a <code>ToolDefinition</code> are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="a"> A. The three model-visible fields: name / description / parameters</label>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="b"> B. The <code>output</code> declaration is optional, needed only when you want UI cards</label>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="c"> C. <code>execute(args, exec)</code> returns only canonical JSON values; rendering is output.render's job</label>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="d"> D. <code>isConcurrencySafe</code> and <code>timeoutMs</code> are policy metadata and are never sent to the model</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — tool/call hits the log first, then pre-execute → guards → execute (around the body) → post-execute → normalize/finalizeContent → tools/result → tool/result."
+         data-rationale="C is correct. A puts the body after post, reversing the order. B omits the guards layer — the non-reorderable final veto. D calls the emit-style tools/result a waterfall and omits post-execute."
+         data-review="sec-pipeline">
+      <div class="prompt"><span class="qnum">Q3.</span> What is the correct order of the execution pipeline?</div>
+      <label class="opt"><input type="radio" name="q-8-3" value="a"> A. tool/call → the execute body → pre-execute → guards → post-execute → tool/result</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="b"> B. tool/call → pre-execute → execute → post-execute → guards → tool/result</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="c"> C. tool/call → pre-execute → guards → execute (around the body) → post-execute → normalize + finalizeContent → tools/result → tool/result</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="d"> D. tool/call → guards → the tools/result waterfall → tool/result</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A — a guard is monotonic: it can only give a final rejection reason or abstain; there is no allow, so no ordering can flip a rejection back to an allow."
+         data-rationale="A is correct. B describes a waterfall's (pre-execute) power, which the guard exists precisely to foreclose. C is wrong: guards run before the tool body. D is wrong: a guard can be registered globally or onto a single agent via agent.ctx."
+         data-review="sec-pipeline">
+      <div class="prompt"><span class="qnum">Q4.</span> Where does the monotonicity of a 'monotonic guard' show up?</div>
+      <label class="opt"><input type="radio" name="q-8-4" value="a"> A. A guard can only reject or abstain; there is no allow return, so no ordering can turn a rejection back into an allow</label>
+      <label class="opt"><input type="radio" name="q-8-4" value="b"> B. Guards execute monotonically in registration order, and later ones can override earlier decisions</label>
+      <label class="opt"><input type="radio" name="q-8-4" value="c"> C. Guards run after the tool body and can only observe the result</label>
+      <label class="opt"><input type="radio" name="q-8-4" value="d"> D. Guards can only be registered in the global layer, not per agent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — a rejection still produces a tool/result event: model-visible ⟺ logged; the model sees the rejection reason and changes course."
+         data-rationale="D is correct. The 'silent disappearance / thrown exception' of A and B would both leave the model facing a dangling tool-call. C gets the recorded call right but misses the crucial result — the result event is the outcome the model sees."
+         data-review="sec-pipeline">
+      <div class="prompt"><span class="qnum">Q5.</span> What happens after a call is rejected by policy at <code>tools/pre-execute</code>?</div>
+      <label class="opt"><input type="radio" name="q-8-5" value="a"> A. The call silently disappears; the model never knows it happened</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="b"> B. The whole turn terminates with the error reason</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="c"> C. Only tool/call is recorded, with no result at all</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="d"> D. The pipeline short-circuits past the body but still finishes with an isError tool/result, and the model sees the rejection reason</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-6" data-type="fill" data-accepted='["tools/execute","tools execute","execute waterfall"]'
+         data-answer="tools/execute (the around-dispatch waterfall)."
+         data-rationale="Timeout/retry/metrics are around-dispatch concerns and wrap tools/execute; pre-execute is admission, post-execute is result processing, and guard is the final veto. That is exactly where timeout-policy hangs."
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q6.</span> Fill in the blank: to wrap tool calls with deadlines, retries, or metrics collection, you wrap the ______ waterfall.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B — repeat-tool-reminder hangs on tools/post-execute; it neither vetoes nor intercepts, injecting advisory reminders via additionalContexts."
+         data-rationale="B is correct. A is wrong: it blocks nothing (advisory). C is wrong: it is not a guard-stage guard; detection happens in post-execute. D is wrong: there is no forced escalation mechanism — the decision belongs to the model."
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q7.</span> What does <code>dsh-repeat-tool-reminder</code> do?</div>
+      <label class="opt"><input type="radio" name="q-8-7" value="a"> A. It blocks repeated tool calls at the guard stage</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="b"> B. It observes repeats at tools/post-execute (denied calls count too), injects escalating reminders via additionalContexts, and leaves the decision to the model</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="c"> C. It rewrites tool results, replacing the output of repeated calls with empty</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="d"> D. Past a threshold it trips a breaker for the tool and forces a change of course</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — the budget comes from the tool definition's own timeoutMs, so the plugin is zero-config; the timeout is cooperative — only tools that forward exec.signal actually stop."
+         data-rationale="C is correct. A is wrong: there is no plugin-level timeout config (zero config). B is wrong: it is a cooperative signal, not a hard process kill. D is wrong: no such field name exists in the code."
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q8.</span> Where does <code>dsh-tool-call-timeout-policy</code>'s timeout budget come from, and how does it take effect?</div>
+      <label class="opt"><input type="radio" name="q-8-8" value="a"> A. The plugin's own config option, set per tool name</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="b"> B. A global 30-second default that hard-kills the timed-out process tree</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="c"> C. It reads the timeoutMs declared by the tool definition (zero config), puts a deadline on exec.signal inside tools/execute, and replaces timeouts with a structured TOOL_TIMEOUT result</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="d"> D. It reads the <code>ToolDefinition.timeout</code> field and kills the child process</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-9" data-type="mcq" data-multiselect="true" data-correct='["a","d"]'
+         data-answer="A and D."
+         data-rationale="A, D are correct. B is wrong: presentCall returns the pending-card view (ToolCallView), not the completed card. C is wrong: the card vocabulary is generic / terminal / diff (result views add search/web); 'list' does not exist."
+         data-review="sec-render-intent">
+      <div class="prompt"><span class="qnum">Q9.</span> Which statements about tool UI render intent are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="a"> A. presentCall / presentResult must be pure functions, because they run both in the live stream and during log replay</label>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="b"> B. presentCall returns the completed card's final content</label>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="c"> C. The card vocabulary has four kinds: generic / terminal / diff / list</label>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="d"> D. Result-time facts (like the actually applied diff) should go into the durable result.meta via presentationMeta, to be used at replay time</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-10" data-type="fill" data-accepted='["ctx.systemPrompt.tools","systemPrompt.tools","ctx.systemPrompt.tools()"]'
+         data-answer="ctx.systemPrompt.tools(...) — the registry hangs itself as the tool schema provider."
+         data-rationale="ToolRuntime's constructor registers ctx.systemPrompt.tools(provider), resolving the visible tools per scope and projecting name/description/parameters. The 'model-visible tool set' and the 'scope-visible tool set' share one source."
+         data-review="sec-schema-bridge">
+      <div class="prompt"><span class="qnum">Q10.</span> Fill in the blank: the registry feeds tool schemas into system prompt assembly via <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-11" data-type="short"
+         data-key-points='["deployment policy does not go into tool bodies: pre-execute provides extensible allow/deny/ask admission","ctx.tools.guard() provides the non-reorderable final veto (monotonic: deny only)","tools/execute wraps dispatch, serving around-concerns like timeout/retry/metrics","tools/post-execute rewrites results or attaches additionalContexts; tools/result is read-only observation","every path (including rejection/timeout/exception) ends in a tool/result event, satisfying model-visible ⟺ logged"]'
+         data-answer="Policy goes in the pipeline: extensible admission policy hangs on tools/pre-execute (allow/deny/ask; ask goes through a one-shot ctx.approval prompt and degrades to deny without an approval service); the deployment owner's final veto is a monotonic guard registered with ctx.tools.guard() (reject or abstain only; no ordering can overturn it); timeout/retry/metrics wrap tools/execute (around dispatch); result rewriting/interception/context attachment uses tools/post-execute, with tools/result as read-only observation. Every outcome produces a tool/result event — model-visible ⟺ logged."
+         data-rationale="Check against 8.3/8.4: admission, final veto, around, result handling, and observation — five layers each in place, with nothing stuffed into the execute body, and the answer is complete."
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q11.</span> Suppose you must add a deployment policy of 'reject every call that writes outside the workspace, and let no plugin overrule it', plus 'bash calls time out at 60 seconds'. Where should each hang, and why can't they be written into the tool body?</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a point you actually covered — under-checking hurts the book's calibration of you; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    Next chapter: <a href="09-system-prompt.html"><strong>Chapter 9 · System Prompt Assembly</strong></a>.
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

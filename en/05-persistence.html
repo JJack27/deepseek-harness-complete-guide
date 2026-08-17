@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 5 · Persistence: JSONL/SQLite Backends and Versioning — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 5 · Persistence</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/05-persistence.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="5">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 5 · Part II · The Core Spine</div>
+    <h1>Persistence: JSONL/SQLite Backends and Versioning</h1>
+    <p class="lede">
+      The previous chapter's <code>SessionEvent</code> log is the live truth, alive in process
+      memory. This chapter covers how it becomes durable (crash-surviving): an abstract
+      persistence seam (<code>ctx.sessionPersistence</code>), two interchangeable backends (JSONL
+      and SQLite), two-layer versioning with a reject-on-mismatch loading policy, crash recovery,
+      and the projections, titles, and telemetry derived from the same log. After this chapter you
+      can answer where dsh stores your sessions, in what format, and what happens when versions
+      change.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">What you'll be able to do</div>
+    <ul>
+      <li>Describe the persistence seam's responsibility boundary: write-behind batching, the revision token, and what prepare/load/inspect/readFrom each solve</li>
+      <li>State the two backends' physical forms: one transcript file per session for JSONL; SQLite's three tables with one row per event</li>
+      <li>Distinguish the two versioning layers: <code>SessionHeader.version</code> (currently 0) covers the event vocabulary, SQLite <code>SCHEMA_VERSION</code> (currently 15) covers the table layout — both reject rather than migrate</li>
+      <li>Explain why crash recovery 「closes out orphan turns」 instead of truncating the log</li>
+      <li>List where log-derived state goes (the projection cache's cold-read ladder, titles, telemetry) and where non-session data goes (the <code>ctx.storage</code> hub)</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-persistence-seam">5.1 The in-memory log is the live truth; persistence is a seam</h2>
+
+  <p>
+    Pin down last chapter's division once more: <code>SessionStore</code>
+    (<code>ctx.sessions</code>) <strong>deliberately implements no persistence</strong>. Disk is a
+    plugin's business — the persistence plugin subscribes to <code>session/event</code> (a
+    synchronous notification; the plugin copies events into its own buffer without blocking the
+    producer) and drains at <code>session/flush</code> checkpoints. The abstract service is
+    <code>ctx.sessionPersistence</code> (package
+    <code>packages/session/session-persistence</code>), a standard capability seam: a Service
+    Definition declares the interface, two Service Providers implement it, several Consumers use
+    it — the same <code>SessionEvent</code> vocabulary, with <strong>no second persistence event
+    type</strong> to keep in sync.
+  </p>
+
+  <p>
+    The interface surface (all in <code>session-persistence/src/index.ts</code>), remembered by
+    use case:
+  </p>
+  <ul>
+    <li><code>locate(meta)</code>: synchronously resolves where a session's artifact lives — no reading, creating, or flushing. JSONL returns the transcript's absolute path; SQLite returns <code>undefined</code> (all sessions share one database).</li>
+    <li><code>create(meta)</code> / <code>append(id, events)</code>: register header metadata / persist a batch of contiguous events. <code>append</code> resolves only after durability completes.</li>
+    <li><code>prepare(id)</code>: for resume — takes out an unpublished <code>SessionPreparation</code> (the one from 4.8 last chapter), commits repair, and reserves exclusivity.</li>
+    <li><code>load(id)</code> / <code>inspect(id)</code>: load the balanced logical view (committing cold recovery) / inspect read-only without writing recovery.</li>
+    <li><code>readFrom(id, fromSeq)</code>: read the stored suffix from a seq — for read models that continue from a watermark.</li>
+    <li><code>list()</code> / <code>listSnapshots()</code>: lightweight enumeration reading only header metadata, without parsing full logs.</li>
+  </ul>
+
+  <h3>The coordinator and write-behind batching</h3>
+
+  <p>
+    The two backends do not each invent buffering:
+    <code>session-persistence/src/coordinator.ts</code> provides shared buffering,
+    serialization, repair, and disposal orchestration (a third-party backend may also implement
+    the seam directly). The batching policy lives in <code>write-behind.ts</code>:
+  </p>
+  <ul>
+    <li>The first pending event <strong>starts a fixed batch window</strong> (200ms by default,
+      configurable via <code>writeBatchMaxDelayMs</code>); later events within the window join the
+      same batch <strong>without resetting the deadline</strong>.</li>
+    <li>When the window expires it triggers one durable batch write; events arriving during the write get their own new window, forming subsequent batches.</li>
+    <li><code>session/flush</code> cancels the wait and drains to quiescence — which is why the loop treats it as an ordering and error-observation checkpoint before claiming the next ordinary turn.</li>
+    <li>On a background write failure, events are <strong>retained</strong> and automatic retry pauses; a new event restarts the window, and an explicit flush retries immediately and reports the failure through <code>agent/error</code> and the log — it is never written into an already-closed turn as a session event.</li>
+  </ul>
+
+  <p>
+    <strong>revision</strong> (<code>revision.ts</code>, <code>SessionPersistenceRevision</code>)
+    is an opaque token of the backend's own representation: it identifies both which storage
+    source and which version of that source, changing transactionally with each append or
+    repairing load. Consumers of derived state compare this cheap token before loading the full
+    log — if equal, no re-read is needed. Callers only test equality; they never interpret its
+    internals.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Persistence architecture">
+      <rect x="10" y="30" width="170" height="80" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="58" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">In-memory store (live truth)</text>
+      <text x="95" y="78" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">ctx.sessions · SessionEvent[]</text>
+      <text x="95" y="94" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">append is commit</text>
+
+      <line x1="180" y1="70" x2="248" y2="70" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="248,70 240,66 240,74" style="fill:var(--muted)"/>
+      <text x="214" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">session/event</text>
+
+      <rect x="250" y="24" width="200" height="94" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="350" y="50" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">ctx.sessionPersistence</text>
+      <text x="350" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Coordinator: write-behind batching</text>
+      <text x="350" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Repair / prepare / revision</text>
+      <text x="350" y="102" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">session/flush drain</text>
+
+      <line x1="450" y1="56" x2="518" y2="40" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="518,40 509,39 512,47" style="fill:var(--muted)"/>
+      <line x1="450" y1="88" x2="518" y2="104" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="518,104 512,97 509,106" style="fill:var(--muted)"/>
+
+      <rect x="520" y="14" width="230" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="635" y="36" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">JSONL backend</text>
+      <text x="635" y="54" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">One session.jsonl.zstd per session</text>
+
+      <rect x="520" y="82" width="230" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="635" y="104" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">SQLite backend</text>
+      <text x="635" y="122" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">node:sqlite · one row per event</text>
+
+      <line x1="95" y1="110" x2="95" y2="170" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <line x1="350" y1="118" x2="350" y2="170" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <line x1="635" y1="138" x2="635" y2="170" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="95,170 91,162 99,162" style="fill:var(--muted)"/>
+      <polygon points="350,170 346,162 354,162" style="fill:var(--muted)"/>
+      <polygon points="635,170 631,162 639,162" style="fill:var(--muted)"/>
+
+      <rect x="30" y="172" width="220" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="140" y="194" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">session-projection(+cache)</text>
+      <text x="140" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Projection read models + cold-read ladder</text>
+      <text x="140" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Lists never load full logs</text>
+      <text x="140" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">readFrom(seq) continues from the watermark</text>
+      <text x="140" y="272" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Equal revision skips the read</text>
+
+      <rect x="270" y="172" width="220" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="380" y="194" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">The session-title family</text>
+      <text x="380" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">First-prompt fallback / LLM summary</text>
+      <text x="380" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Every revision = a session/title event</text>
+      <text x="380" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">foldSessionTitle takes the latest</text>
+
+      <rect x="510" y="172" width="220" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="620" y="194" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">session-telemetry(+otel)</text>
+      <text x="620" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Live or on-demand capture</text>
+      <text x="620" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Handed to the SDK after the redact waterfall</text>
+      <text x="620" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">Dedup key (session.id, seq)</text>
+
+      <text x="380" y="306" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">The three boxes below are state derived from the log: log first, cache after, always re-derivable</text>
+    </svg>
+    <figcaption>Figure 5-1 · Persistence architecture: the in-memory store feeds the coordinator via session/event, and write-behind batches land in one of the two backends; projections / titles / telemetry are derived consumers of the same log.</figcaption>
+  </figure>
+
+  <h2 id="sec-jsonl-backend">5.2 The JSONL backend: one transcript file per session</h2>
+
+  <p>
+    <code>packages/session/session-persistence-jsonl</code> stores each session as one
+    append-only logical JSONL log. On-disk layout:
+  </p>
+
+  <pre><code>&lt;root&gt;/
+  --&lt;normalized-cwd&gt;--/        <span class="code-comment"># human-readable project directory (_no-cwd/ when no cwd)</span>
+    &lt;encoded-session-id&gt;/      <span class="code-comment"># the session's own directory</span>
+      session.jsonl.zstd       <span class="code-comment"># default: a sequence of checksummed zstd frames</span>
+      session.jsonl            <span class="code-comment"># only when compression: 'none'</span></code></pre>
+
+  <p>
+    Three things about the logical content are worth remembering:
+  </p>
+  <ul>
+    <li><strong>The first line is the <code>SessionHeader</code></strong> (tagged
+      <code>{ type: 'session', ... }</code>); after it, one stored record per line, with
+      <code>seq</code> contiguous across the entire decoded log
+      (<code>events[i].seq === i</code>). <code>assistant/chunk</code> loses not one entry.</li>
+    <li><strong>packed chunk row</strong>: with the default on (<code>packChunks: true</code>), runs of
+      ≥3 <code>assistant/chunk</code> deltas for the same block pack into one row
+      (<code>text-chunks</code> / <code>reasoning-chunks</code> / <code>tool-call-chunks</code> —
+      slash-free bare tags that cannot be confused with event types), using
+      <code>seq0/time0 + per-member dt</code> to reconstruct each member's
+      <code>seq/time</code> exactly — measured to shrink the logical log by roughly 60%.
+      <strong>Reads are layout-blind</strong>: packed, unpacked, and mixed files load to identical
+      results. This is a working instance of last chapter's contract — the persistence layer may
+      choose its encoding, but load must return the exact events.</li>
+    <li><strong>Physical encoding</strong>: the default is a concatenation of checksummed
+      Zstandard frames — one frame for the header line, then one frame per durable batch.
+      <code>compression: 'none'</code> keeps raw newline-delimited text. A root belongs to exactly
+      one encoding; mixed suffixes are rejected, not ignored.</li>
+  </ul>
+
+  <p>
+    One deliberate 「no default」 in configuration: <code>root</code> is required. Defaulting it
+    to <code>process.cwd()</code> would let files drift with the process's cwd (bash calls and
+    subprocesses both change it), scattering sessions everywhere. It is the textbook case of the
+    explicit-over-implicit convention.
+  </p>
+
+  <h2 id="sec-sqlite-backend">5.3 The SQLite backend: one row per event</h2>
+
+  <p>
+    <code>packages/session/session-persistence-sqlite</code> uses Node's built-in
+    <code>node:sqlite</code> (<code>DatabaseSync</code>); the DDL lives in
+    <code>src/schema.ts</code>, three tables:
+  </p>
+
+  <pre><code><span class="code-key">CREATE TABLE</span> persistence_state (   <span class="code-comment"># store identity: singleton row + random store_id</span>
+  singleton <span class="code-key">INTEGER PRIMARY KEY</span> <span class="code-key">CHECK</span> (singleton = 1),
+  store_id  <span class="code-key">TEXT NOT NULL</span>) <span class="code-key">STRICT</span>;
+
+<span class="code-key">CREATE TABLE</span> sessions (              <span class="code-comment"># session metadata table = SessionHeader</span>
+  id <span class="code-key">TEXT PRIMARY KEY</span>, version <span class="code-key">INTEGER NOT NULL</span>, created_at <span class="code-key">INTEGER NOT NULL</span>,
+  cwd <span class="code-key">TEXT</span>, parent_session <span class="code-key">TEXT</span>, seed_length <span class="code-key">INTEGER</span>, origin <span class="code-key">TEXT</span>,
+  delegation_depth <span class="code-key">INTEGER</span>, agent_preset <span class="code-key">TEXT</span>,
+  incarnation <span class="code-key">TEXT NOT NULL</span>,          <span class="code-comment"># stable identity assigned at materialization</span>
+  revision   <span class="code-key">INTEGER NOT NULL</span>) <span class="code-key">STRICT</span>;   <span class="code-comment"># monotonic log-change token</span>
+
+<span class="code-key">CREATE TABLE</span> events (                <span class="code-comment"># events table: one row per SessionEvent</span>
+  session_id <span class="code-key">TEXT NOT NULL REFERENCES</span> sessions(id) <span class="code-key">ON DELETE CASCADE</span>,
+  seq <span class="code-key">INTEGER NOT NULL</span>, type <span class="code-key">TEXT NOT NULL</span>, time <span class="code-key">INTEGER NOT NULL</span>,
+  data <span class="code-key">TEXT NOT NULL</span>,               <span class="code-comment"># JSON text of the event data</span>
+  source_event_seqs <span class="code-key">TEXT</span>,       <span class="code-comment"># JSON-encoded number[], or NULL</span>
+  surface_op <span class="code-key">TEXT</span>,                <span class="code-comment"># JSON-encoded SurfaceOp, or NULL</span>
+  ignorable  <span class="code-key">INTEGER</span>,              <span class="code-comment"># 1 when the marker is present</span>
+  <span class="code-key">PRIMARY KEY</span> (session_id, seq)) <span class="code-key">STRICT</span>;</code></pre>
+
+  <p>
+    The row fields <code>(session_id, seq, type, time, data, source_event_seqs, surface_op)</code>
+    map <strong>1:1</strong> onto the event, including the optional surface metadata — hence
+    「no second persistence schema to maintain」. A few behavioral details:
+  </p>
+  <ul>
+    <li><strong>Lazy materialization</strong>: the <code>sessions</code> row is written only on the
+      first <code>append</code>. A session created but never written to does not exist in
+      <code>list()</code> — abandoned sessions leave no trace, symmetric with JSONL's 「no file
+      until first append」.</li>
+    <li><strong>Journal mode</strong>: <code>wal</code> by default; rollback-journal modes
+      (<code>delete</code>/<code>truncate</code>/<code>persist</code>) are kept for filesystems
+      where the WAL shared-memory file is unavailable (network mounts). <code>memory</code>/
+      <code>off</code> are excluded — silently discarding log durability contradicts this
+      backend's promise.</li>
+    <li><code>locate()</code> returns <code>undefined</code> (one shared database, no per-session
+      artifact); it therefore also lacks raw-artifact reads
+      (<code>supportsRawArtifacts === false</code>), while JSONL's <code>readRaw</code> can replay
+      the exact bytes it wrote.</li>
+    <li><strong>revision's SQLite shape</strong>: the <code>revision</code> column in the sessions
+      row, monotonically +1 per changing transaction; <code>store_id</code> keeps revisions from
+      different backend instances from ever colliding.</li>
+  </ul>
+
+  <h2 id="sec-two-layer-versioning">5.4 Two-layer versioning: reject, don't migrate</h2>
+
+  <p>
+    dsh's version policy is one sentence: <strong>a log you cannot read must be rejected — never
+    quietly guessed at</strong>. In implementation, each of the two layers guards its own ground:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>The session-format layer</th><th>The SQLite schema layer</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Where the version lives</td><td><code>SessionHeader.version</code>, stamped from <code>SESSION_FORMAT_VERSION</code> at creation</td><td><code>PRAGMA user_version</code> (<code>SCHEMA_VERSION</code>) + <code>PRAGMA application_id</code></td></tr>
+      <tr><td>Current value</td><td><code>0</code> (pinned during pre-release: no compatibility promise)</td><td><code>15</code> (monotonically increasing; application id <code>0x44534850</code>)</td></tr>
+      <tr><td>What it covers</td><td>The structural semantics of the event vocabulary and envelope (header shape, envelope, core event semantics, the surface mechanism)</td><td>The table layout (how the three tables grow)</td></tr>
+      <tr><td>On mismatch</td><td>Throws <code>SessionFormatUnsupportedError</code>, with direction-aware wording: higher = written by a newer harness — upgrade the harness; lower = this build has no upgrade path</td><td>Refuses to open the database; <code>user_version</code> 0 with a non-empty database, or any version other than current, is rejected — never migrated in place</td></tr>
+      <tr><td>What never touches it</td><td>Adding an ordinary event type does not bump it — vocabulary growth is covered by the <code>ignorable</code> marker (previous chapter)</td><td>A session's own <code>version</code> lives in its sessions row, orthogonal to this layer</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Note the distinction between rejecting an unsupported format
+    (<code>SessionFormatUnsupportedError</code>: the log is not corrupted; this build simply
+    cannot read it) and corruption (<code>SessionPersistenceCorruptionError</code>: data in the
+    committed prefix is genuinely broken). The direction-aware rejection wording is a
+    product-level detail: the user should see 「upgrade the harness」 and never 「file
+    corrupted」. The JSONL backend can even determine direction from the raw header line — before
+    any structural validation; SQLite first uses the <code>SCHEMA_VERSION</code> pragma to keep
+    whole-database structure out. The repository AGENTS.md's pre-release stance says it plainly:
+    with no external consumers, prefer the correct foundation — reject old formats, rename
+    freely, and update every reference together.
+  </p>
+
+  <div class="demo" data-demo="versionReject">
+    <div class="demo-title">Try it — mismatched versions get rejected</div>
+    <p>Pick a version each for the log and the reader (a mechanism demo; values are illustrative only):</p>
+    <label><input type="radio" name="d5log" value="1"> Log v1</label>
+    <label><input type="radio" name="d5log" value="2"> Log v2</label>
+    <label><input type="radio" name="d5read" value="1"> Reader v1</label>
+    <label><input type="radio" name="d5read" value="2"> Reader v2</label>
+    <div class="demo-output empty">Pick one version each.</div>
+  </div>
+
+  <h2 id="sec-crash-recovery">5.5 Crash recovery: closing out orphan turns</h2>
+
+  <p>
+    Section 4.8 last chapter covered the repair <strong>semantics</strong>
+    (<code>interruptedTurnClosers</code>: error results for dangling calls, boundary completion,
+    <code>turn/end { interrupted }</code>, existing events untouched); this section adds the
+    persistence layer's execution timing and boundary judgment:
+  </p>
+  <ul>
+    <li><strong>Repair only cold sessions</strong>. For a still-live session id,
+      <code>load(id)</code> waits for the authoritative in-memory snapshot to become durable and
+      returns it; an open turn on a live session is rejected outright and never receives
+      synthesized interruption boundaries.</li>
+    <li><strong>Torn tail vs half-written turn</strong>: a physically half-written record (a broken
+      frame in JSONL, an unparseable row or seq hole in SQLite) is a never-committed torn tail and
+      is <strong>discarded</strong>; a <strong>fully written</strong> half turn is a committed fact
+      and is <strong>kept by closing it out</strong>. SQLite's <code>scanRows</code> uses the last
+      <code>turn/end</code> as the dividing line: holes before it are corruption in the committed
+      region (throw); holes after it are tolerable torn tail (trim).</li>
+    <li><strong>inspect writes no repair</strong>: a cold inspection completes the closure in
+      memory, leaving the physical torn tail untouched; <code>load</code> / <code>prepare</code>
+      are what commit the repair back to storage (and revision changes then).</li>
+    <li><strong>prepare's cache reuse</strong>: the coordinator keeps cold unpublished sessions in
+      a bounded LRU (5 by default), so repeated history reads and the subsequent resume share one
+      round of read, decompress, validate, freeze, construct.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Crash recovery timeline">
+      <text x="380" y="22" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Log on disk (after a crash)</text>
+      <g font-size="10">
+        <rect x="20" y="36" width="96" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="68" y="53" text-anchor="middle" style="fill:var(--fg)">turn/start</text>
+        <rect x="120" y="36" width="96" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="168" y="53" text-anchor="middle" style="fill:var(--fg)">user/message</text>
+        <rect x="220" y="36" width="110" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="275" y="53" text-anchor="middle" style="fill:var(--fg)">assistant/msg</text>
+        <rect x="334" y="36" width="90" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="379" y="53" text-anchor="middle" style="fill:var(--fg)">tool/call</text>
+        <rect x="428" y="36" width="100" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="478" y="53" text-anchor="middle" style="fill:var(--fg)">tool/result</text>
+        <rect x="532" y="36" width="110" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--fail)" stroke-dasharray="4,3"/>
+        <text x="587" y="53" text-anchor="middle" style="fill:var(--fg)">assistant/msg…</text>
+        <rect x="646" y="36" width="94" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--muted)" stroke-dasharray="3,3"/>
+        <text x="693" y="53" text-anchor="middle" style="fill:var(--fg-dim)">Torn tail</text>
+      </g>
+      <text x="587" y="78" text-anchor="middle" style="fill:var(--fail)" font-size="10">Turn not closed</text>
+      <text x="693" y="78" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Half-written; discarded</text>
+
+      <line x1="587" y1="84" x2="587" y2="116" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="587,116 583,108 591,108" style="fill:var(--muted)"/>
+
+      <rect x="300" y="118" width="380" height="76" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="490" y="140" text-anchor="middle" style="fill:var(--accent)" font-size="11.5" font-weight="700">Synthesized close-out at load (durably appended)</text>
+      <text x="490" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">tool/result (error: TOOL_OUTCOME_UNKNOWN, if any dangling calls)</text>
+      <text x="490" y="174" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">step/end (if any open step) → turn/end { kind: interrupted }</text>
+      <text x="490" y="190" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">seq continues; time reuses the last real event</text>
+
+      <line x1="68" y1="62" x2="68" y2="96" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <line x1="530" y1="62" x2="530" y2="96" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <text x="290" y="106" text-anchor="middle" style="fill:var(--pass)" font-size="10.5">The events above are fully written = committed facts; not one is touched</text>
+      <text x="380" y="216" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">Close out, don't truncate: all tool output in the large turn is preserved, and the restored transcript is provider-valid</text>
+    </svg>
+    <figcaption>Figure 5-2 · Crash recovery timeline: a fully written orphan turn is closed out with synthesized boundaries (interrupted), and the physically torn tail is discarded; the dividing line is whether the write completed, not whether a turn/end exists.</figcaption>
+  </figure>
+
+  <h2 id="sec-derived-state">5.6 Derived state: projections, titles, telemetry</h2>
+
+  <p>
+    With the session log on disk, a whole class of 「read models」 can derive from it — log first,
+    cache after, and the cache can always be thrown away and re-derived. This section meets three
+    families (all under <code>packages/session/</code>).
+  </p>
+
+  <h3>Projections and the cold-read ladder (session-projection / session-projection-cache)</h3>
+
+  <p>
+    <code>ctx.sessionProjections</code> is a framework-drives, domain-computes registry: each
+    domain registers a projection unit
+    <code>{ key, schema, init, apply, view, stateVersion }</code> — three pure synchronous
+    functions plus declarations. The framework subscribes to <code>session/event</code> once and
+    streams every committed event through every unit's <code>apply</code>;
+    <code>snapshot(session)</code> yields a consistent snapshot of all units at one
+    <code>asOfSeq</code>. Two performance disciplines are part of the contract: an
+    <code>apply</code> that does not care about the event must <strong>return the same state
+    reference</strong> (reference equality exempts downstream work); state events must carry
+    <strong>whole values</strong>, not deltas (last-wins, self-describing).
+  </p>
+
+  <p>
+    With <code>session-projection-cache</code> mounted, each session's projection checkpoints
+    persist to storage-domain (see 5.7), and cold reads take the <strong>ladder</strong> and
+    <strong>never load the full log</strong>:
+  </p>
+
+  <pre><code>Cache row ((key → ver, seq, val), zero I/O)
+  → restoreFloor (anchored one event below the lowest usable watermark)
+  → persistence-layer readFrom(id, floor) (reads only the suffix)
+  → restore folds → write back refreshed rows (fail-soft)</code></pre>
+
+  <p>
+    Session <strong>lists</strong> therefore never parse a full log:
+    <code>cachedSnapshot(meta)</code> reads whole values straight from stored records; on a
+    <code>ver</code> mismatch the row is discarded and re-derived (not migrated); records are
+    bound to the log's lifecycle identity (<code>createdAt</code>/<code>cwd</code>), so residual
+    caches from a replaced backend are recognized and dropped. Writes have two mandatory points
+    (<code>turn/end</code>, session dispose) plus two throttle configs
+    (<code>writeEveryEvents</code>, <code>writeIntervalMs</code> — both required; flush cadence is
+    a deployment decision with no universal default).
+  </p>
+
+  <h3>Titles (the session-title family)</h3>
+
+  <p>
+    The session list needs a one-line title for humans. The strategy: serve a usable one
+    immediately, then asynchronously trade up. The first few words of the first human prompt
+    (byte-limited, control sequences stripped, never cutting a code point) immediately become the
+    fallback title; optional providers (<code>session-title-llm</code>,
+    <code>session-title-first-prompt-llm</code>, <code>session-title-all-prompts-llm</code>,
+    distinguished by summary scope) later generate a better one with a model. <strong>Every
+    accepted revision is a log-only <code>session/title</code> session event</strong>, and
+    <code>foldSessionTitle()</code> takes the latest — titles are event-sourced too, and a fork
+    inherits the parent's title events. A manual user rename (<code>rename</code>) writes a
+    <code>user</code>-source title event and <strong>pins</strong> the session: later human
+    messages no longer trigger automatic retitling, and only an explicit <code>refresh</code>
+    unpins. Automatic titling never delays the main response: the provider runs only for requests
+    the loop itself issued and only when routing exactly matches the recorded
+    <code>request/header</code>, appending an independent log-only event when done (opening no
+    turn).
+  </p>
+
+  <h3>Telemetry (session-telemetry / session-telemetry-otel)</h3>
+
+  <p>
+    <code>SessionTelemetryCoordinator</code> hands session records to backends implementing
+    <code>SessionTelemetrySink</code> (<code>emit</code>/<code>flush</code>/<code>shutdown</code>)
+    — <code>session-telemetry-otel</code> is the OTel implementation. Capture has two modes:
+    <code>live</code> (hooking <code>session/created</code> / <code>session/event</code> /
+    <code>session/flush</code> / <code>session/disposed</code> / <code>agent/error</code>) or
+    <code>on-demand</code> (an explicit <code>captureSession()</code> replaying a log prefix).
+    Outbound records pass a <strong><code>sessionTelemetry/record</code> redact waterfall</strong>
+    — the package ships no rules of its own; how clean the export is depends on which rules the
+    deployment mounts. Redaction touches only the outbound copy; the canonical log is never
+    rewritten. Two trade-offs worth remembering: only the first <code>assistant/chunk</code> per
+    <code>(turn, step)</code> is emitted (the signal that streaming began), so holes in production
+    seqs are normal, not loss; receivers dedupe by <code>(session.id, event.seq)</code>. Resume
+    does not backfill records the previous process failed to deliver (at-most-once), and the
+    sharing policy gated by feedback (<code>full</code>/<code>feedback-only</code>/
+    <code>disabled</code>) is disclosed by the deployment.
+  </p>
+
+  <h2 id="sec-non-session-storage">5.7 Non-session data: the storage hub and DSH_HOME</h2>
+
+  <p>
+    Not all durable data is session logs. Application data like workspace preferences and
+    user-feedback records goes through another family (<code>packages/storage/</code>):
+  </p>
+  <ul>
+    <li><code>storage/</code> — the hub, seam <code>ctx.storage</code>: connects named backends with typed data shapes;</li>
+    <li><code>storage-json/</code> (backend <code>json</code>, JSON files) and
+      <code>storage-sqlite/</code> (backend <code>sqlite</code>) — two swappable backends;</li>
+    <li><code>storage-domain/</code> — <code>ctx.storageDomain</code>: typed domain record storage
+      (<code>DomainSpec</code>/<code>Domain</code>, <code>domain/changed</code> events); consumers
+      get domain shapes, not raw backends.</li>
+  </ul>
+
+  <p>
+    Consumers include <code>workspace</code> (workspace data, with the json backend landing
+    beside <code>workspace.json</code> at the storage root), <code>message-feedback</code>
+    (feedback records), and 5.6's projection cache (the <code>session_projcache</code> domain).
+    The difference from session logs in one sentence: <strong>these are not event streams but
+    per-domain record stores</strong> — they need no append-only, seq, or projection machinery,
+    which is why they deserve their own seam.
+  </p>
+
+  <p>
+    Where these files live is decided by <code>packages/util/home-paths</code>: the
+    <span class="kbd">$DSH_HOME</span> environment variable overrides the default, which is
+    <code>~/.dsh</code> (<code>DSH_HOME_DIR_NAME</code>). User-level data like projection caches
+    and preset roots all sit under this roof, directory-partitioned per deployment configuration.
+  </p>
+
+  <h2 id="sec-recap">5.8 Chapter recap</h2>
+  <ul>
+    <li>Persistence is a plugin seam, not the store's job: <code>ctx.sessionPersistence</code> declares locate/create/append/prepare/load/inspect/readFrom/list(listSnapshots); two backends implement the same contract, with no second persistence event type.</li>
+    <li>The coordinator does write-behind: the first event opens a fixed batch window (200ms default, not reset) and later events join the batch; <code>session/flush</code> drains to quiescence; failures retain and retry; revision is the backend's own opaque change token.</li>
+    <li>The JSONL backend: one transcript per session (a concatenation of zstd frames by default), the header line is the SessionHeader, and the packed chunk row is a lossless encoding (reads are layout-blind); <code>root</code> deliberately has no default.</li>
+    <li>The SQLite backend: three tables (store identity, sessions metadata, events with one row per event, 1:1 mapping including surface columns), lazy materialization, WAL by default.</li>
+    <li>Both versioning layers are reject-on-mismatch: the session layer's <code>SESSION_FORMAT_VERSION = 0</code> covers the event vocabulary (a mismatch throws <code>SessionFormatUnsupportedError</code> with direction-aware wording); the SQLite layer's <code>SCHEMA_VERSION = 15</code> + application id <code>0x44534850</code> covers the table layout. No migration.</li>
+    <li>Crash recovery closes out without truncating: a fully written orphan turn gets synthesized tool/results (TOOL_NOT_STARTED / TOOL_OUTCOME_UNKNOWN), step/end, turn/end { interrupted }; the physically torn tail is discarded; only cold sessions are repaired.</li>
+    <li>Derived state derives from the log: the projection registry (apply returns the same reference; whole-value events) + the projection cache's cold-read ladder (cache row → readFrom suffix → fold and write back; lists never load full logs); titles are <code>session/title</code> events (fallback + optional LLM provider; a user rename pins); telemetry hands off to a sink after the redact waterfall, deduped by (session.id, seq).</li>
+    <li>Non-session data goes through the <code>ctx.storage</code> hub (json/sqlite backends + storage-domain typed shapes) and lives under <span class="kbd">$DSH_HOME</span> (default <code>~/.dsh</code>).</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Believing <code>append()</code> commits only after reaching disk. Commit happens at the push into the in-memory log; persistence is asynchronous batching. For a durability barrier, <code>flush</code> explicitly.</li>
+      <li>Conflating the two version layers. <code>SessionHeader.version</code> versions the event vocabulary; SQLite <code>SCHEMA_VERSION</code> versions the table layout; neither stands in for the other.</li>
+      <li>Expecting old logs to auto-migrate to the new format. dsh's policy is reject-on-mismatch versioning: an unreadable log throws a direction-explicit error, leaving migration paths to a future upgrade chain.</li>
+      <li>Believing crash recovery discards half a turn's work. It closes out, not truncates — every fully written event is kept; only the physically torn tail is dropped.</li>
+      <li>Treating the projection cache as authoritative. A cache row may be stale (seq says by how much) but never wrong; the log is the authority, and a <code>ver</code> mismatch discards and re-derives outright.</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="5">
+    <h2>Chapter 5 Test</h2>
+
+    <div class="q" data-id="5-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — session/event is a synchronous notification; the persistence plugin copies events into its buffer and returns immediately; durability rides the session/flush checkpoint."
+         data-rationale="B is correct: the hot path touches no I/O, and the write-behind batch window (200ms default) groups writes to disk. A is wrong: append returns synchronously without waiting for disk. C is wrong: no side-channel write path exists; bypassing the seam equals losing the log. D is wrong: flush is an explicit checkpoint, not automatic per-event."
+         data-review="sec-persistence-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> What path does an event take from the in-memory log to disk?</div>
+      <label class="opt"><input type="radio" name="q-5-1" value="a"> A. session.append() waits for the disk write before returning</label>
+      <label class="opt"><input type="radio" name="q-5-1" value="b"> B. append commits and synchronously broadcasts session/event; the persistence plugin buffers, batch-writes to disk in fixed windows, and drains at session/flush</label>
+      <label class="opt"><input type="radio" name="q-5-1" value="c"> C. Every plugin writes files directly; there is no unified seam</label>
+      <label class="opt"><input type="radio" name="q-5-1" value="d"> D. Synchronized automatically by database triggers</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-2" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A and C — the first pending event starts a fixed-deadline window (later events join without resetting it); on a background write failure events are retained and automatic retry pauses."
+         data-rationale="A and C are correct. B is wrong: each batch gets one new window, not each event. D is wrong: an explicit flush retries immediately and reports via agent/error; pausing automatic retry is not deletion, and the events are retained."
+         data-review="sec-persistence-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> Which statements about write-behind batching are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="a"> A. The first pending event starts a fixed-deadline batch window; later events join the same batch</label>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="b"> B. Every new event resets the batch window's deadline</label>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="c"> C. On a background write failure, events are retained and automatic retry pauses; a new event restarts the window</label>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="d"> D. Failed events are discarded and regenerated next time</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-3" data-type="mcq" data-correct='["d"]'
+         data-answer="D — The events-table row maps field-for-field 1:1 onto SessionEvent (including the surface_op / source_event_seqs columns); there is no second persistence schema."
+         data-rationale="D is correct: that is the seam design's goal. A is wrong: events is a per-event row keyed by (session_id, seq). B is wrong: the data column holds JSON text; no attribute columns are built. C is wrong: surface metadata has dedicated (JSON-encoded) columns, fully preserved."
+         data-review="sec-sqlite-backend">
+      <div class="prompt"><span class="qnum">Q3.</span> How does the SQLite backend store one event?</div>
+      <label class="opt"><input type="radio" name="q-5-3" value="a"> A. One row per turn, with events nested in a JSON array</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="b"> B. Each event's fields are expanded into dynamic attribute columns</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="c"> C. surfaceOp and sourceEventSeqs are stored inside the data column with no separate columns</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="d"> D. One row per event in events, keyed by (session_id, seq), with row fields mapping 1:1 to the event</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-4" data-type="fill" data-accepted='["15","schema_version","user_version","the user_version pragma"]'
+         data-answer="15 (SCHEMA_VERSION, checked via PRAGMA user_version)."
+         data-rationale="SQLite's table-structure version is the monotonically increasing SCHEMA_VERSION, currently 15, stored in PRAGMA user_version; together with application_id 0x44534850 it keeps unrelated databases out."
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q4.</span> Fill in the blank: the SQLite backend's current table-structure version SCHEMA_VERSION is <code>______</code> (write the number or the field name).</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-5" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The two versions are orthogonal: header.version covers each session's event-vocabulary format, SCHEMA_VERSION covers the whole database's table layout, each guarding its own object."
+         data-rationale="C is correct. A is wrong: sessions rows also store each session's version; both layers coexist. B is wrong: the direction is reversed — the header version does not describe table layout. D is wrong: no auto-migration exists; both layers are reject-on-mismatch."
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q5.</span> What is the relationship between <code>SessionHeader.version</code> and SQLite <code>SCHEMA_VERSION</code>?</div>
+      <label class="opt"><input type="radio" name="q-5-5" value="a"> A. The SQLite backend checks only SCHEMA_VERSION, never the session's version</label>
+      <label class="opt"><input type="radio" name="q-5-5" value="b"> B. SessionHeader.version describes the table layout; SCHEMA_VERSION describes the event vocabulary</label>
+      <label class="opt"><input type="radio" name="q-5-5" value="c"> C. Two orthogonal layers: the former versions each session's event format (stored in the sessions row), the latter versions the whole database's table structure; both reject on mismatch</label>
+      <label class="opt"><input type="radio" name="q-5-5" value="d"> D. A higher SCHEMA_VERSION automatically migrates the old database to the new structure</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-6" data-type="mcq" data-correct='["a"]'
+         data-answer="A — A version higher than the current build reports 「written by a newer harness — upgrade the harness」; lower reports 「this build has no upgrade path」; corruption is never misreported."
+         data-rationale="A is correct: SessionFormatUnsupportedError and CorruptionError are deliberately separate, and the direction-aware wording points the user at an upgrade. B is wrong: that misreports cannot-read as broken. C is wrong: there is no silent skipping and no downgraded read. D is wrong: JSONL determines direction from the raw header line before structural validation, so even future formats report the right direction."
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q6.</span> A log's format version is higher than the current harness supports. What does the user see?</div>
+      <label class="opt"><input type="radio" name="q-5-6" value="a"> A. SessionFormatUnsupportedError, advising a harness upgrade to open it</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="b"> B. SessionPersistenceCorruptionError, reporting a corrupted log</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="c"> C. Silently skips unreadable events and continues loading</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="d"> D. Best-effort parsing under old-version semantics</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-7" data-type="mcq" data-multiselect="true" data-correct='["b","d"]'
+         data-answer="B and D — error tool/results carrying TOOL_NOT_STARTED or TOOL_OUTCOME_UNKNOWN, and a synthesized turn/end whose reason is interrupted."
+         data-rationale="B and D are correct: the error codes distinguish never-started-retryable from started-outcome-unknown. A is wrong: interrupted is synthesized by persistence repair; the loop never emits it. C is wrong: existing events are untouched; append-only means no rewriting."
+         data-review="sec-crash-recovery">
+      <div class="prompt"><span class="qnum">Q7.</span> When loading a crashed log, what does repair synthesize? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="a"> A. turn/end with reason kind: aborted</label>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="b"> B. Error tool/results for dangling tool calls (TOOL_NOT_STARTED / TOOL_OUTCOME_UNKNOWN)</label>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="c"> C. Rewriting pre-crash events to fill in missing pairs</label>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="d"> D. turn/end with reason kind: interrupted</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Cache row → restoreFloor anchor → readFrom(id, floor) reads only the suffix → restore folds → write back; the list layer reads cache rows directly, with zero full-log loads."
+         data-rationale="C is correct: every rung of the ladder avoids full reads, and readFrom returns only the suffix past the watermark. A is wrong: that is exactly the cost the ladder exists to eliminate. B is wrong: a ver mismatch discards and re-derives; it does not migrate. D is wrong: the anchor sits one event below the lowest watermark, and truncated logs are handled provably (an out-of-range row triggers one full read from 0)."
+         data-review="sec-derived-state">
+      <div class="prompt"><span class="qnum">Q8.</span> When the projection cache's 「cold-read ladder」 reads a cold session's projections, what does it do?</div>
+      <label class="opt"><input type="radio" name="q-5-8" value="a"> A. Load the full log from the start and fold</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="b"> B. Migrate old-ver cache rows to the new stateVersion</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="c"> C. Cache row → restoreFloor watermark → readFrom reads only the suffix → fold → fail-soft write back</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="d"> D. Anchors above the highest watermark, reading too much rather than too little</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Every accepted title revision is a log-only session/title event; folding to the latest yields the current title, and a fork inherits the title events too."
+         data-rationale="B is correct: titles are event-sourced too. A is wrong: there is no separate store — rename also appends an event (user source, and it pins). C is wrong: automatic titling deliberately never delays the main response; the provider appends an independent log-only event when done, opening no turn. D is wrong: the LLM summary is an optional provider's asynchronous enhancement, not the sole source."
+         data-review="sec-derived-state">
+      <div class="prompt"><span class="qnum">Q9.</span> How are session titles stored in dsh?</div>
+      <label class="opt"><input type="radio" name="q-5-9" value="a"> A. In a title database separate from the session log</label>
+      <label class="opt"><input type="radio" name="q-5-9" value="b"> B. Each revision appends a session/title session event; folding takes the latest</label>
+      <label class="opt"><input type="radio" name="q-5-9" value="c"> C. In an in-memory cache written by the LLM provider at generation time</label>
+      <label class="opt"><input type="radio" name="q-5-9" value="d"> D. Computed once at session end</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-10" data-type="mcq" data-correct='["d"]'
+         data-answer="D — These are application data, not event streams; they go through ctx.storage (json/sqlite backends + storage-domain typed shapes)."
+         data-rationale="D is correct: non-session data needs no append-only / seq / projection machinery, so a separate seam fits better. A is wrong: the session log holds only conversation facts. B is wrong: environment variables are not storage. C is wrong: settings is another capability (user settings)."
+         data-review="sec-non-session-storage">
+      <div class="prompt"><span class="qnum">Q10.</span> Where do non-session data like workspace preferences and user feedback go?</div>
+      <label class="opt"><input type="radio" name="q-5-10" value="a"> A. Appended as session events</label>
+      <label class="opt"><input type="radio" name="q-5-10" value="b"> B. Environment variables</label>
+      <label class="opt"><input type="radio" name="q-5-10" value="c"> C. The settings capability</label>
+      <label class="opt"><input type="radio" name="q-5-10" value="d"> D. The storage hub: ctx.storage backends + storage-domain typed domain records</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-11" data-type="fill" data-accepted='["~/.dsh",".dsh","dsh_home","$dsh_home"]'
+         data-answer="~/.dsh (overridable via the DSH_HOME environment variable)."
+         data-rationale="packages/util/home-paths defines DSH_HOME_DIR_NAME = .dsh, joined under the OS home directory by default; the DSH_HOME environment variable overrides it."
+         data-review="sec-non-session-storage">
+      <div class="prompt"><span class="qnum">Q11.</span> Fill in the blank: the default home directory for dsh user data is <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-12" data-type="short"
+         data-key-points='["Two layers each guard their own ground: SessionHeader.version covers the event vocabulary of each session; SQLite SCHEMA_VERSION covers the table layout of the whole database","Current values: SESSION_FORMAT_VERSION = 0 (pre-release, no compatibility promise), SCHEMA_VERSION = 15 (monotonically increasing)","Mismatch always rejects (SessionFormatUnsupportedError / refusing to open the database), never migrating or silently downgrading","Rejection wording distinguishes direction: newer = upgrade the harness, older = no upgrade path; never misreported as corrupt","Adding an ordinary event type does not bump the version; vocabulary growth is covered by the ignorable marker"]'
+         data-answer="Key points: two version layers (header.version covers the event vocabulary / SCHEMA_VERSION covers the table layout, currently 0 and 15); mismatch rejects without migrating, with direction-aware wording; version bumps are reserved for structural change, and vocabulary growth rides the ignorable marker. The pre-release stance: prefer rejecting over building compatibility shims."
+         data-rationale="State the four points — what each layer governs, reject-don't-migrate, direction awareness, and ignorable covering vocabulary growth — and you are there."
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q12.</span> In your own words, explain dsh's two-layer versioning and reject-on-mismatch loading: what each layer governs, the current values, what happens on mismatch, and why adding an event type needs no version bump.</div>
+      <textarea class="short" placeholder="Write your understanding…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check only what you truly said — checking less harms the book's calibration of you; checking more only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="06-agent-and-scope.html"><strong>Chapter 6 · The Agent Abstraction and the Scope Mechanism</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

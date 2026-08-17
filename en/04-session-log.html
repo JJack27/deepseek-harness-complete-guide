@@ -1,0 +1,837 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 4 · The Session Log: Event Sourcing's Source of Truth — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 4 · Session Log</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/04-session-log.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="4">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 4 · Part II · The Core Spine</div>
+    <h1>The Session Log: Event Sourcing's Source of Truth</h1>
+    <p class="lede">
+      This is the heaviest chapter in the book. dsh's entire answer to 「what is one agent
+      conversation」 is compressed into one package, <code>packages/core/session</code>: an
+      append-only <code>SessionEvent</code> log. The history the model sees, the transcript the UI
+      displays, recovery after a crash, new sessions forked from the middle, telemetry export —
+      all are projections of the same event stream. After this chapter you should be able to
+      explain to anyone why dsh stores conversations this way.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">What you'll be able to do</div>
+    <ul>
+      <li>Explain the event-sourcing orientation: dsh stores no 「current conversation state」 and only appends 「facts that happened」, and why that lets fork/resume/transcripts/telemetry all derive from the same stream</li>
+      <li>Read a <code>SessionEvent</code>'s envelope fields and the full event vocabulary, including how plugins extend <code>SessionEventMap</code> with declaration merging</li>
+      <li>Describe <code>deriveMessages()</code>'s projection rules, especially the division of labor between <code>assistant/chunk</code> and <code>assistant/message</code></li>
+      <li>Apply the 「model-visible ⟺ logged」 invariant to a new requirement: decide whether to add a session event or use another channel</li>
+      <li>State what problem <code>SessionHeader</code>, <code>session/end-seed</code>, <code>fork()</code> boundaries, and <code>repair.ts</code> each solve</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-event-sourcing">4.1 Store facts, not state</h2>
+
+  <p>
+    Imagine you must record an agent conversation. The most intuitive approach maintains a
+    「current state」: an array of messages, push one in each time the model replies, edit history
+    in place when needed. The problem with this approach is not writing but reading —
+    <strong>state can answer 「what is it now」 but never 「how did it get here」</strong>. You want
+    to fork and retry from turn 3, replay the streaming output as it happened, account for token
+    usage per step, restore the scene after a crash — every one of those needs forces you to
+    record a separate 「how it evolved」, and the truth scatters into several competing copies.
+  </p>
+
+  <p>
+    dsh chooses the reverse: <strong>append only facts that happened; store no current
+    state</strong>. One conversation is one <code>Session</code>, whose entire content is a
+    grow-only, never-edited <code>SessionEvent</code> log (an append-only log). The user sent a
+    message — a fact. The model emitted a streaming fragment — a fact. A tool call and its
+    result, the start and end of a turn — all facts. Any 「current state」 — most typically the
+    model history — is <strong>a projection derived from this log</strong>; the deriving function
+    is pure and can be rerun at any time.
+  </p>
+
+  <p>
+    That is what 「the session truth exists exactly once」 means:
+  </p>
+  <ul>
+    <li><strong>resume</strong> (continue the session after a process restart): pour the persisted event stream back into memory and the projections hold as before;</li>
+    <li><strong>fork</strong> (branch a new session from some historical moment): take a stable prefix of the event stream as the seed;</li>
+    <li><strong>transcripts</strong> (UI replay): render in event order — even the typewriter-like streaming process replays token by token;</li>
+    <li><strong>telemetry</strong>: consumes projections of the same stream;</li>
+    <li><strong>persistence</strong>: writes the stream to disk verbatim, with no second serialization format to maintain.</li>
+  </ul>
+
+  <p>
+    The vehicle is <code>ctx.sessions</code> (<code>SessionStore</code>, a Cordis service): it
+    holds the registry of all live sessions in the current process; each <code>Session</code>
+    object internally is a <code>SessionEvent[]</code> log plus a few projection caches. Note the
+    division — <strong>the in-memory log is the live truth, and writing to disk is a plugin's
+    job</strong>: the persistence plugin subscribes to the <code>session/event</code> broadcast
+    and drains its buffer at <code>session/flush</code> checkpoints. The whole persistence seam is
+    the next chapter's protagonist.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Source location</div>
+    <p class="small" style="margin:0;">
+      <code>packages/core/session/src/index.ts</code> (the <code>Session</code> class and
+      <code>SessionStore</code>), <code>types.ts</code> (the event vocabulary and envelope types),
+      <code>surface.ts</code> (surface projection), <code>repair.ts</code> (crash repair),
+      <code>preparation.ts</code> (pre-publication preparation). Documentation lives in
+      <code>docs/subsystems/session.md</code> and the Session log section of
+      <code>docs/architecture.md</code>.
+    </p>
+  </div>
+
+  <h2 id="sec-event-envelope">4.2 SessionEvent: what one log entry looks like</h2>
+
+  <p>
+    Each event is a member of a discriminated union (over <code>type</code>), with fixed envelope
+    fields:
+  </p>
+
+  <pre><code><span class="code-key">type</span> <span class="code-fn">SessionEvent</span>&lt;T <span class="code-key">extends</span> SessionEventType = SessionEventType&gt; = {
+  type: T            <span class="code-comment">// the event type; the discriminating tag for switches</span>
+  seq: number        <span class="code-comment">// monotonic sequence within the session; always equals the number of events before it</span>
+  time: number       <span class="code-comment">// Unix epoch milliseconds</span>
+  data: SessionEventMap[T]  <span class="code-comment">// typed payload, pure JSON</span>
+  ignorable?: true   <span class="code-comment">// marker letting readers safely skip unknown types</span>
+}</code></pre>
+
+  <p>
+    Two contracts are worth engraving in your mind:
+  </p>
+  <ul>
+    <li>
+      <strong>The <code>seq = log.length</code> continuity contract</strong>. Event sequence numbers start at 0 and are
+      strictly contiguous; an event's index in the log is its own <code>seq</code>. This contract is the foundation
+      of the whole system: persistence backends can write line by line, and after a crash one can tell
+      「where to truncate」 — all thanks to it. Even high-frequency events like
+      <code>assistant/chunk</code> are <strong>not allowed to be filtered out</strong> — drop one and
+      <code>seq</code> grows a hole.
+    </li>
+    <li>
+      <strong>Payloads must be lossless JSON</strong>. <code>Session.append()</code> runs one recursive
+      validation-plus-snapshot at the entrance: values like BigInt, functions, <code>undefined</code>,
+      circular references, <code>Date</code>, and <code>Map</code> throw on the spot — a bad event
+      <strong>never enters the log</strong>, rather than failing later at flush time. Validated data is
+      deep-frozen — once an event is in the log, no code can rewrite the established fact.
+    </li>
+  </ul>
+
+  <h3>The core event vocabulary</h3>
+
+  <p>
+    <code>SessionEventMap</code> declares the payloads of all event types. The core members (the
+    ones you will see again and again in any session):
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Event type</th><th>Payload essentials</th><th>Role</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>turn/start</code> / <code>turn/end</code></td><td><code>{ turn }</code>; end carries a <code>TurnEndReason</code></td><td>Turn boundaries. A turn is the shell around zero or more steps</td></tr>
+      <tr><td><code>step/start</code> / <code>step/end</code></td><td><code>{ turn, step }</code></td><td>Step boundaries. A step = one model call + the tool executions it requests</td></tr>
+      <tr><td><code>user/message</code></td><td>A complete <code>UserMessage</code></td><td>User-side messages entering the model-visible surface: human questions, context injected via <code>agent.inject()</code>, goal continuation turns — <code>source</code> distinguishes the three</td></tr>
+      <tr><td><code>assistant/chunk</code></td><td><code>{ turn, step, chunk }</code></td><td>Raw streaming fragments; token-by-token replay fidelity</td></tr>
+      <tr><td><code>assistant/message</code></td><td><code>{ turn, step, message, usage? }</code></td><td>The assembled assistant message; derived history uses it, and usage travels with the message</td></tr>
+      <tr><td><code>tool/call</code></td><td><code>{ turn, step, callId, name, arguments }</code></td><td>The tool call the model requested; <code>arguments</code> is the model's verbatim unparsed JSON string</td></tr>
+      <tr><td><code>tool/result</code></td><td><code>{ turn, step, message, error?, meta? }</code></td><td>The model-visible result of a tool call; <code>meta</code> is tool-private presentation data (must be JSON-serializable)</td></tr>
+      <tr><td><code>request/header</code></td><td><code>{ header: EpochHeader, reason }</code></td><td>The full envelope of the next request: call config + rendered system prompt + tool schemas. Log-only</td></tr>
+      <tr><td><code>request/context</code></td><td>Resolved routing and capacity metadata</td><td>Log-only, recorded only when routing or capacity changes</td></tr>
+      <tr><td><code>session/end-seed</code></td><td>Empty payload</td><td>The boundary marker where the construction seed ends (see 4.6)</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    「What configuration did the model actually see in this step」 is answered by
+    <code>request/header</code>: the first request of every loop instance records one complete
+    snapshot (<code>reason: 'initial'</code> or <code>'resume'</code>), and another is recorded
+    whenever the configuration changes (<code>'change'</code>). The latest snapshot alone
+    reconstructs the request envelope — <strong>every conversation request is a pure function of
+    the log</strong>, which is the other half of reconstructability (4.5).
+  </p>
+
+  <h3 id="sec-event-extensibility">The vocabulary is merge-extensible</h3>
+
+  <p>
+    <code>SessionEventMap</code> is not a closed enum. Plugins declare their own event types
+    through declaration merging — for example <code>compaction/start</code> /
+    <code>compaction/end</code> added by the compaction seam, or <code>agent/inbox/spliced</code>
+    added by the agent package:
+
+  </p>
+
+  <pre><code><span class="code-comment">// inside some plugin: merge a new event type into the session vocabulary</span>
+<span class="code-key">declare module</span> <span class="code-str">'@deepseek-ai/dsh-session/types'</span> {
+  <span class="code-key">interface</span> SessionEventMap {
+    <span class="code-str">'my-plugin/notice'</span>: { text: <span class="code-key">string</span> }
+  }
+}</code></pre>
+
+  <p>
+    After the merge, <code>session.append('my-plugin/notice', { text })</code> is type-safe. These
+    plugin events are <strong>log-only</strong> by default: they are replayable fact records,
+    carrying no surface metadata and never entering model history.
+  </p>
+
+  <p>
+    Extensibility immediately raises a reader's question: what happens when an older dsh reads
+    events written by a newer plugin? The answer is <strong>required-on-read by default</strong>:
+    on encountering an unknown <code>type</code> with no <code>ignorable: true</code> marker on
+    the envelope, the reader must refuse to rebuild the session rather than silently drop the
+    event — an unrecognized required event may change how the rest of the log reads. Writers mark
+    <code>ignorable</code> only when the event is 「purely informational, and losing it cannot
+    affect reconstruction」. The direction of this default deserves reflection: <strong>forgetting
+    the marker results in a refusal (inconvenient but harmless to data), not a silently gutted
+    session (harmful to data)</strong>. In this repository's builds, all known types are generated
+    into the <code>KNOWN_SESSION_EVENT_TYPES</code> set in <code>known-event-types.ts</code>, and
+    the persistence read path uses it for exactly this decision.
+  </p>
+
+  <h2 id="sec-append-path">4.3 The append path: append, broadcast, and invariants</h2>
+
+  <p>
+    <code>Session.append(type, data, ...opts)</code> is the log's only entrance. What it does, in
+    order:
+  </p>
+  <ol>
+    <li>Run one <strong>lossless-JSON validation + snapshot</strong> each on <code>data</code> and the surface metadata, throwing on failure — the log's entrance is the validation's entrance;</li>
+    <li>Construct the event object (<code>seq = log.length</code>, <code>time = Date.now()</code>) and <strong>deep-freeze</strong> it;</li>
+    <li>Validate the surface transition's legality (4.4);</li>
+    <li>Resolve a snapshot of the <code>session/event</code> listeners;</li>
+    <li><strong>Push into the log — the append is committed at this moment</strong>;</li>
+    <li>Invoke listeners one by one; each listener's failure is only logged — it affects neither the return value nor the listeners after it.</li>
+  </ol>
+
+  <p>
+    Note the order of commit and notification: <strong>the event enters the log first, the
+    listeners run after</strong>. The append is synchronous and touches no I/O on the hot path —
+    the persistence plugin batches asynchronously in its own buffer (next chapter). Even a
+    crashing observer cannot make a committed fact disappear; that is the 「contained observer」
+    semantics.
+  </p>
+
+  <p>
+    The boundary between log events and Cordis events is most easily blurred here, so it deserves
+    its own paragraph: a <code>SessionEvent</code> is a <strong>log entry</strong>, not a Cordis
+    event. A log event reaches listeners through the single Cordis emit channel
+    <code>session/event</code>, whose payload is <code>(session, event)</code>. There are exactly
+    four Cordis events around the session lifecycle:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Cordis event</th><th>Mode</th><th>Semantics</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>session/created</code></td><td>emit</td><td>Session publication completed. A synchronous throw can veto publication and roll back</td></tr>
+      <tr><td><code>session/disposed</code></td><td>emit</td><td>A published session leaves the store (including the paired notification of a publication rollback)</td></tr>
+      <tr><td><code>session/event</code></td><td>emit</td><td>The post-commit, fire-and-forget append stream. Persistence, telemetry, and projections all hook here</td></tr>
+      <tr><td><code>session/flush</code></td><td>parallel</td><td>An awaited durability checkpoint: all listeners run in parallel and are awaited, with no waterfall veto</td></tr>
+    </tbody>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Session log event pipeline">
+      <rect x="10" y="30" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="85" y="58" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">loop / tools / plugins</text>
+      <text x="85" y="80" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">session.append(type, data)</text>
+
+      <line x1="160" y1="65" x2="218" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="218,65 210,61 210,69" style="fill:var(--muted)"/>
+      <text x="189" y="52" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Synchronous validation + freeze</text>
+
+      <rect x="220" y="20" width="170" height="90" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="305" y="48" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">Append-only log</text>
+      <text x="305" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">seq = log.length</text>
+      <text x="305" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">push is commit</text>
+
+      <line x1="390" y1="65" x2="448" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="448,65 440,61 440,69" style="fill:var(--muted)"/>
+      <text x="419" y="52" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">session/event broadcast</text>
+
+      <rect x="450" y="10" width="140" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="520" y="30" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Persistence plugin</text>
+      <text x="520" y="47" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Buffer → batched flush</text>
+
+      <rect x="450" y="68" width="140" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="520" y="88" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Telemetry / projections</text>
+      <text x="520" y="105" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Derived-state consumers</text>
+
+      <rect x="450" y="126" width="140" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="520" y="146" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">UI transcript replay</text>
+      <text x="520" y="163" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Renders in event order</text>
+
+      <line x1="305" y1="110" x2="305" y2="190" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="305,190 301,182 309,182" style="fill:var(--muted)"/>
+      <rect x="140" y="192" width="330" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="305" y="211" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">deriveMessages(): model-history projection</text>
+      <text x="305" y="228" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">The next model request reads this derived result</text>
+
+      <line x1="470" y1="174" x2="470" y2="192" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="640" y="105" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">session/flush checkpoint</text>
+      <text x="640" y="120" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">drains the buffer to the durable layer</text>
+      <text x="380" y="270" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">One stream, four consumers: flush, telemetry, replay, derivation — the session truth exists exactly once</text>
+    </svg>
+    <figcaption>Figure 4-1 · The event stream pipeline: append (validate + freeze + push-is-commit) → session/event broadcast → persistence buffer → the various projections. Model history is one of the projections, not a separate store.</figcaption>
+  </figure>
+
+  <p>
+    Figure 4-1 is this chapter's mental map. Pay special attention to the bottom: model history
+    has the same standing as telemetry and UI replay — all just consumers of this stream.
+    <strong>There is no 「authoritative message array」</strong> for other data to sync with.
+  </p>
+
+  <h2 id="sec-derive-messages">4.4 deriveMessages(): projecting model history from the log</h2>
+
+  <p>
+    <code>session.deriveMessages()</code> is the pure projection that folds the event log into
+    <code>Message[]</code> (the <code>messages</code> field of a model request). It does not scan
+    all events directly; it walks an <strong>ordered surface</strong> maintained by surface
+    metadata: only three 「message-producing events」 (<code>SurfaceEventType</code>) can enter the
+    surface — <code>user/message</code>, <code>assistant/message</code>,
+    <code>tool/result</code> — and each of their appends <strong>must</strong> declare a
+    <code>surfaceOp</code> (how to join the surface); the compiler enforces at the call site that
+    non-surface types (like <code>turn/start</code>, <code>assistant/chunk</code>) cannot pass
+    this parameter.
+  </p>
+
+  <pre><code><span class="code-comment">// appending a surface event must declare surfaceOp; the ordinary path is append</span>
+session.<span class="code-fn">append</span>(<span class="code-str">'user/message'</span>, message, {
+  surfaceOp: <span class="code-str">'append'</span>,
+  sourceEventSeqs: [],  <span class="code-comment">// optional: which earlier events this references</span>
+})</code></pre>
+
+  <p>
+    <code>surfaceOp</code> has two forms:
+  </p>
+  <ul>
+    <li><code>'append'</code>: add to the tail of the surface. The ordinary path for user messages, assistant messages, and tool results.</li>
+    <li>
+      <code>{ op: 'replace', start, end }</code>: <strong>shadow</strong> the surface nodes from
+      <code>start</code> to <code>end</code> (inclusive) and substitute this event for them. This is
+      compaction's (context compression) mechanism: the summary event replaces the summarized
+      stretch of history, the old nodes vanish from derived history, but <strong>the original
+      events remain in the log</strong> — the human transcript reads the original events of append
+      origin while the model reads the compacted surface, and neither disturbs the other.
+    </li>
+  </ul>
+
+  <p>
+    The per-node projection rules (<code>deriveEventMessage</code>, a public pure function —
+    external rebuilders and the core use the same rules, so they cannot diverge):
+  </p>
+  <ul>
+    <li><code>user/message</code> → one user message, <code>content</code> projected verbatim (human questions, injected context, and goal continuation turns alike; <code>source</code> distinguishes origin);</li>
+    <li><code>assistant/message</code> → one assistant message; <strong>an assistant/message with empty content is skipped</strong> — a step truncated by max-tokens or that produced no content still records an assistant/message to carry usage and provider/model, but empty content must not enter the model transcript;</li>
+    <li><code>tool/result</code> → one user-role message containing a <code>tool-result</code> block;</li>
+    <li>Everything else (<code>turn/*</code>, <code>step/*</code>, plugin log-only events) is structural record and projects to no message.</li>
+  </ul>
+
+  <h3>The chunk/message division of labor (a frequently tested detail)</h3>
+
+  <p>
+    One step's model output appears in the log <strong>twice</strong>: one
+    <code>assistant/chunk</code> per fragment during streaming, and one assembled
+    <code>assistant/message</code> after the stream ends. The division of labor:
+  </p>
+  <ul>
+    <li><strong><code>assistant/chunk</code>: replay fidelity and metering</strong>. UI typewriter
+      replay and per-token timestamps rely on it; token accounting also reads each step's
+      usage-type chunk first, and for a failed request with no assistant message, its usage chunk
+      is the only metering record.</li>
+    <li><strong><code>assistant/message</code>: the derivation authority</strong>.
+      <code>deriveMessages()</code> recognizes only it. Raw chunks are <strong>skipped</strong> in
+      derivation — the assembled message is the authoritative copy. It may carry
+      <code>sourceEventSeqs</code> pointing back at the chunks that compose it.</li>
+  </ul>
+
+  <p>
+    So 「delete chunks to save space」 sounds tempting but directly violates the <code>seq</code>
+    continuity contract — the persistence layer may only change encoding (the JSONL backend's
+    packed chunk row is such an encoding, see next chapter), never delete events. The projection
+    itself is cached: each surface node projects once, later calls process only new nodes, O(new
+    nodes); one <code>replace</code> rewriting the surface rebuilds the cache wholesale (controlled
+    by the <code>replaceGeneration</code> counter). The returned array is a fresh snapshot each
+    time, and its <code>Message</code> objects are shared with the log and deep-frozen — mutating
+    history through the projection is not even representable in JavaScript.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="deriveMessages projection">
+      <text x="95" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Event log (by seq)</text>
+      <g font-size="10.5">
+        <rect x="20" y="36" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="52" text-anchor="middle" style="fill:var(--fg)">turn/start</text>
+        <rect x="20" y="64" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="80" text-anchor="middle" style="fill:var(--fg)">user/message</text>
+        <rect x="20" y="92" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="108" text-anchor="middle" style="fill:var(--fg)">assistant/chunk ×n</text>
+        <rect x="20" y="120" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="136" text-anchor="middle" style="fill:var(--fg)">assistant/message</text>
+        <rect x="20" y="148" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="164" text-anchor="middle" style="fill:var(--fg)">tool/call</text>
+        <rect x="20" y="176" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="192" text-anchor="middle" style="fill:var(--fg)">tool/result</text>
+        <rect x="20" y="204" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="220" text-anchor="middle" style="fill:var(--fg)">turn/end</text>
+      </g>
+
+      <line x1="172" y1="76" x2="360" y2="70" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <line x1="172" y1="132" x2="360" y2="104" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="360,104 352,100 352,108" style="fill:var(--muted)"/>
+      <line x1="172" y1="188" x2="360" y2="138" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="360,138 352,134 352,142" style="fill:var(--muted)"/>
+
+      <text x="290" y="60" text-anchor="middle" style="fill:var(--fail)" font-size="10">chunks never enter the surface</text>
+
+      <rect x="362" y="48" width="160" height="112" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="442" y="70" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Ordered surface</text>
+      <text x="442" y="90" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">maintained by surfaceOp</text>
+      <text x="442" y="106" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">sequence of message-producing events</text>
+      <text x="442" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">replace can shadow a range</text>
+      <text x="442" y="148" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">(compaction summary)</text>
+
+      <line x1="522" y1="104" x2="588" y2="104" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="588,104 580,100 580,108" style="fill:var(--muted)"/>
+      <text x="555" y="92" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">per-node projection</text>
+
+      <rect x="590" y="48" width="150" height="112" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="665" y="68" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">deriveMessages()</text>
+      <g font-size="10.5">
+        <text x="665" y="92" text-anchor="middle" style="fill:var(--fg)">user message</text>
+        <text x="665" y="112" text-anchor="middle" style="fill:var(--fg)">assistant message</text>
+        <text x="665" y="132" text-anchor="middle" style="fill:var(--fg)">tool-result message</text>
+        <text x="665" y="152" text-anchor="middle" style="fill:var(--fg-dim)">→ next request</text>
+      </g>
+      <text x="380" y="248" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">chunks preserve replay fidelity; the message is the derivation authority — double-written but one truth</text>
+    </svg>
+    <figcaption>Figure 4-2 · The data path of deriveMessages(): log → the surfaceOp-maintained ordered surface → per-node pure projection → the model's message history. assistant/chunk stays in the log serving replay and metering but never enters the surface.</figcaption>
+  </figure>
+
+  <div class="demo" data-demo="eventLogDerive">
+    <div class="demo-title">Try it — derive model history from the event log</div>
+    <p>Append session events step by step and watch deriveMessages() and 「model-visible ⟺ logged」:</p>
+    <button data-run>Next</button>
+    <div class="demo-output empty">Click to start.</div>
+  </div>
+
+  <h2 id="sec-model-visible-logged">4.5 The core invariant: model-visible ⟺ logged</h2>
+
+  <p>
+    The repository's most important session rule can now be stated in full:
+  </p>
+
+  <div class="box key">
+    <p style="margin:0;">
+      <strong>Whatever enters a model request must be reconstructable from the session log</strong>
+      (model-visible means logged). A runtime invariant (the invariant plugin) asserts it.
+      Therefore: adding a new model-visible input necessarily means adding a session event —
+      extend <code>SessionEventMap</code> and make the consuming path render from the log.
+    </p>
+  </div>
+
+  <p>
+    This rule turns 「can it be recovered」 from a prayer into a mechanical check. Consider its
+    coverage:
+  </p>
+  <ul>
+    <li><strong>Message history</strong>: <code>deriveMessages()</code> derives solely from the log (4.4).</li>
+    <li><strong>Request envelope</strong>: the system prompt, tool schemas, and call config are carried by
+      <code>request/header</code> snapshots; the latest one rebuilds it, and the request is a pure function of the log.</li>
+    <li><strong>The composition itself</strong>: which preset assembled the agent determines the tools and
+      prompts the model sees, so a preset switch must land an <code>agent-preset/selected</code>
+      session event — otherwise the composition rebuilt after resume differs from the one that
+      produced this history, and the model faces a history it cannot act on.</li>
+    <li><strong>Injected context</strong>: file-change notices, skill contents, and the like that
+      <code>agent.inject()</code> stuffs into the next request land as <code>user/message</code>
+      events (<code>source</code> marks the origin), not as request-time side-channel magic.</li>
+  </ul>
+
+  <p>
+    Conversely, runtime details that need no reconstruction after resume — say a tool execution's
+    internal process beyond its presentation metadata — need not and should not invent events.
+    The test: 「can the model still perceive it on its next request?」 If yes, it must be
+    rebuildable from the log; if no, do not pollute the vocabulary. The repository convention
+    writes this as a hard constraint (AGENTS.md: a new model-visible input requires a session
+    event); you will meet it again in Chapter 23 on gates.
+  </p>
+
+  <p>
+    One corollary deserves its own call-out: modifying request config at an interception point is
+    allowed — the <code>agent/request</code> waterfall may replace <code>LlmCallConfig</code> —
+    but once changed, the header is recorded into the log (the next <code>request/header</code>
+    snapshot), and the next request compares against the log. You may change the facts; you may
+    not bypass the bookkeeping.
+  </p>
+
+  <h2 id="sec-header-and-end-seed">4.6 SessionHeader and session/end-seed</h2>
+
+  <p>
+    One category of information deliberately stays <strong>outside</strong> the log: the session's
+    creation metadata. <code>SessionHeader</code> is a small deep-frozen object, read via
+    <code>session.header</code>:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Field</th><th>Meaning</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>version</code></td><td>The on-disk format version, from <code>SESSION_FORMAT_VERSION</code> (currently 0). Persistence backends reject any other version at load — no migration</td></tr>
+      <tr><td><code>id</code> / <code>createdAt</code></td><td>Session identity and creation time</td></tr>
+      <tr><td><code>cwd</code></td><td>The absolute working directory at creation (must be absolute; storage backends directory by it)</td></tr>
+      <tr><td><code>parentSession</code></td><td>Seed lineage: which session this one was forked/resumed from</td></tr>
+      <tr><td><code>seedLength</code></td><td>The prefix length inherited through the seed, letting resume/fork tell 「the parent's history」 from 「this one's own work」</td></tr>
+      <tr><td><code>origin</code> / <code>delegationDepth</code></td><td>Subagent classification and delegation depth (the recursion budget must survive restarts, hence persisted)</td></tr>
+      <tr><td><code>agentPreset</code></td><td>The preset id that assembled this session's agent (4.5 explained why it must persist)</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Why outside the log? Because they are <strong>storage concerns, not replayable conversation
+    state</strong>: they produce no messages, take no part in derivation, and should not consume
+    <code>seq</code>. The lineage fields are pure data — 「who I branched from」 grants no runtime
+    visibility, a point Chapter 6 returns to when discussing scope.
+  </p>
+
+  <h3>session/end-seed: the persisted projection of the seed boundary</h3>
+
+  <p>
+    A session created by resume or fork carries an event seed at construction. Seeded events and
+    live writes are byte-indistinguishable, so the <code>Session</code> constructor appends one
+    empty-payload <strong><code>session/end-seed</code></strong> event at the end of the seed, as
+    the boundary of 「where this lifetime began writing」. Three things trip people up:
+  </p>
+  <ul>
+    <li>It is the <strong>persisted projection</strong> of <code>firstLiveSeq</code> (a field on the
+      in-memory object): with the object in hand you read the field; with only disk bytes you read
+      the event.</li>
+    <li>Read the <strong>last</strong> <code>session/end-seed</code>; do not assume it sits at the
+      <code>firstLiveSeq</code> position — a session opened repeatedly with no work in between
+      does not get a fresh marker each time.</li>
+    <li><strong>The constructor is the only legitimate writer</strong>. A plugin appending one itself
+      would silently misread its earlier live writes as seed history. That is why the core's
+      invariant companion deliberately ignores it — writing it wrongly is 「misuse of a power
+      reserved for its author」.</li>
+  </ul>
+
+  <h2 id="sec-fork">4.7 fork: branching from any stable boundary</h2>
+
+  <p>
+    Event sourcing pays out in this section. Forking a session copies no 「state」; it takes a
+    prefix of the event stream as the seed:
+  </p>
+
+  <pre><code><span class="code-comment">// grow a live child session from a stable prefix of source</span>
+<span class="code-key">const</span> child = ctx.sessions.<span class="code-fn">fork</span>(source, boundary?, childSessionId?)</code></pre>
+
+  <p>
+    The semantics, parameter by parameter:
+  </p>
+  <ul>
+    <li><code>source</code>: a live <code>Session</code> object or a live <code>SessionId</code>.
+    Passing an object no longer in the store yields <code>SESSION_NOT_LIVE</code>.</li>
+    <li><code>boundary</code>: an inclusive source event <code>seq</code>;
+    omitted it means 「the current last event」.</li>
+    <li><code>childSessionId</code>: an optional child session id; omitted, the store assigns one.</li>
+  </ul>
+
+  <p>
+    The child automatically carries lineage metadata: <code>parentSession</code>,
+    <code>seedLength</code> (= the seed length), and the inherited <code>cwd</code>. Rejections
+    are typed (<code>SessionForkError</code> carries an error code):
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Error code</th><th>Thrown when</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>SESSION_NOT_FOUND</code> / <code>SESSION_NOT_LIVE</code></td><td>The source id is not in the store / the source object is not a live instance of the store</td></tr>
+      <tr><td><code>SESSION_ALREADY_EXISTS</code></td><td>The requested child id is already taken</td></tr>
+      <tr><td><code>INVALID_BOUNDARY</code></td><td>boundary is not a non-negative safe integer, or points at a nonexistent/non-contiguous seq</td></tr>
+      <tr><td><code>OPEN_TURN</code></td><td>The selected prefix ends inside an unclosed turn</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code>OPEN_TURN</code> deserves a pause. The selected prefix <strong>is allowed</strong> to
+    end on a standalone log-only event between turns (say after one <code>turn/end</code> and
+    before the next <code>turn/start</code>), but <strong>not allowed</strong> to stop in the
+    middle of an open turn — such a seed would carry dangling tool calls and unclosed boundaries,
+    and the restored transcript would be invalid for the provider. The API chooses to refuse
+    rather than quietly trim: to fork, name a stable boundary explicitly. (The
+    <code>dsh-subagent-fork-in-process</code> scenario, where a tool delegates to a subagent
+    mid-flight, keeps its own completion-prefix trimming because the parent turn is usually still
+    open — that is another package's explicit policy.)
+  </p>
+
+  <h2 id="sec-repair-and-preparation">4.8 Crash repair and pre-publication preparation</h2>
+
+  <p>
+    The log world's last set of mechanisms handles two corners: what to do when a process crashes
+    mid-turn, and who owns a disk-rebuilt session before it is published.
+  </p>
+
+  <h3>repair.ts: close out, don't truncate</h3>
+
+  <p>
+    When a process crashes, the on-disk log may stop mid-way: a <code>turn/start</code> never got
+    its <code>turn/end</code>, and a tool call in an assistant message never got its
+    <code>tool/result</code>. dsh's repair semantics (<code>interruptedTurnClosers(events)</code>,
+    a pure, deterministic function):
+  </p>
+  <ol>
+    <li>Scan the log, tracking open turns, open steps, and dangling tool calls
+      (an assistant message's tool-call block appeared but has no paired <code>tool/result</code>);</li>
+    <li>Synthesize one <strong>error <code>tool/result</code></strong> per dangling call, with error codes
+      distinguishing two cases: <code>TOOL_NOT_STARTED</code> (never recorded as started — safe to
+      retry) and <code>TOOL_OUTCOME_UNKNOWN</code> (started but the result never reached disk — outcome
+      unknown; the synthesized text explicitly warns the model to 「verify external state before
+      deciding whether to retry」);</li>
+    <li>Append one <code>step/end</code> (if a step is open) and one <code>turn/end</code>, with reason
+      <code>{ kind: 'interrupted' }</code>;</li>
+    <li>The synthesized events' <code>seq</code> continues the log, and <code>time</code> reuses the
+      last real event's timestamp.</li>
+  </ol>
+
+  <p>
+    The key trade-off: <strong>not one event already on disk before the crash is touched</strong>.
+    A large turn in a long task may hold enormous tool output; truncation would destroy the work.
+    Closing out merely adds the boundaries so the restored transcript is valid for the provider.
+    Incidentally, <code>interrupted</code> is the one <code>TurnEndReason</code> <strong>the loop
+    itself never emits</strong> — it belongs exclusively to crash recovery (the persistence
+    backend invokes this repair at load; next chapter). If the log is already balanced (no open
+    turn), nothing is synthesized.
+  </p>
+
+  <h3>preparation.ts: ownership before publication</h3>
+
+  <p>
+    Between being rebuilt from disk and being mounted into the store and published to observers,
+    a session passes through a window: whose is it? <code>SessionPreparation</code> answers — it
+    wraps one definite unpublished <code>Session</code> and implements <code>Disposable</code>
+    (usable directly with <code>using</code> syntax): on successful publication or rollback,
+    <code>[Symbol.dispose]()</code> releases the provider's held state exactly once (an optional
+    <code>release</code> callback decides whether to return it to cache or discard it). This lets
+    the resume path share the expensive work — read, validate, freeze, construct the session —
+    across multiple cold reads and the eventual resume; the details belong to the persistence
+    coordinator, expanded next chapter.
+  </p>
+
+  <h2 id="sec-recap">4.9 Chapter recap</h2>
+  <ul>
+    <li>dsh appends facts only and stores no state: <code>Session</code> is an append-only <code>SessionEvent</code> log; fork/resume/transcripts/telemetry/persistence are all projections of the same stream, and the session truth exists exactly once.</li>
+    <li>The event envelope is <code>type/seq/time/data</code> (surface events additionally carry <code>surfaceOp</code>/<code>sourceEventSeqs</code>); <code>seq = log.length</code> is strictly contiguous; payloads must be lossless JSON and are deep-frozen on entry.</li>
+    <li>The vocabulary is declared by <code>SessionEventMap</code> and is declaration-merge extensible by plugins; unknown events are required-on-read by default unless the envelope carries <code>ignorable: true</code>.</li>
+    <li><code>append</code> validates synchronously, commits on push, then broadcasts <code>session/event</code>; persistence rides the <code>session/flush</code> checkpoint.</li>
+    <li><code>deriveMessages()</code> projects model history along the <code>surfaceOp</code>-maintained ordered surface; <code>assistant/chunk</code> preserves replay and metering but never enters derivation, <code>assistant/message</code> is the derivation authority; compaction shadows ranges with <code>replace</code>.</li>
+    <li><strong>model-visible ⟺ logged</strong>: everything entering a model request must be rebuildable from the log, asserted by a runtime invariant; a new model-visible input requires a new session event.</li>
+    <li><code>SessionHeader</code> (version, cwd, lineage, preset) is storage metadata outside the log; <code>session/end-seed</code> is the persisted projection of the seed boundary, and the constructor is its only legitimate writer.</li>
+    <li><code>fork(source, boundary?, childSessionId?)</code> takes a stable prefix as the seed and refuses to stop inside an open turn (<code>OPEN_TURN</code>).</li>
+    <li>Crash repair closes out without truncating: dangling tool calls get error results (<code>TOOL_NOT_STARTED</code> / <code>TOOL_OUTCOME_UNKNOWN</code>), then <code>step/end</code> and <code>turn/end { interrupted }</code>; <code>SessionPreparation</code> holds the unpublished session until publication or rollback.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Reading <code>SessionEvent</code> as a Cordis event. A log entry is not a member of the event bus; it reaches listeners only through the single <code>session/event</code> emit.</li>
+      <li>Believing <code>assistant/chunk</code> participates in model-history derivation. Derivation recognizes only <code>assistant/message</code>; chunks serve replay and token metering, yet the persistence layer may not drop a single one (seq continuity).</li>
+      <li>Stuffing new model input through a 「request-time side channel」 instead of adding an event. It violates model-visible ⟺ logged, and the runtime invariant rejects it on the spot.</li>
+      <li>Stamping <code>ignorable: true</code> on every new event for convenience. The marker belongs only to purely informational records whose loss cannot affect reconstruction; required-on-read by default is a deliberate safety stance.</li>
+      <li>Treating <code>session/end-seed</code> as a 「session start」 marker, or assuming it always sits at <code>firstLiveSeq</code>. It is the boundary where the seed <strong>ends</strong>; read the last one.</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="4">
+    <h2>Chapter 4 Test</h2>
+
+    <div class="q" data-id="4-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — fork, resume, transcripts, telemetry, and persistence are all projections of the same event stream; no separate evolution record per need."
+         data-rationale="C is correct: state answers only 「what is it now」, while fork/resume/replay/statistics all need 「how did it get here」 — one event stream suffices. A is the selling point of state-based storage, exactly the route dsh abandoned. B is backwards: projection is a pure function, so deriving is precisely cheap and rerunnable. D is wrong: the event log is itself what persists; no second serialization format is needed."
+         data-review="sec-event-sourcing">
+      <div class="prompt"><span class="qnum">Q1.</span> What is the primary payoff of dsh's choice to 「append only facts and store no current state」?</div>
+      <label class="opt"><input type="radio" name="q-4-1" value="a"> A. Appending is faster than updating, saving CPU</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="b"> B. Deriving the message array is cheaper than storing it directly</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="c"> C. fork, resume, transcript replay, telemetry, and persistence all derive from the same stream; the session truth exists exactly once</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="d"> D. The event stream lets the persistence layer skip serialization</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B — seq always equals the number of events before it (seq = log.length), strictly contiguous from 0; even assistant/chunk must not be filtered out."
+         data-rationale="B is correct: this is the continuity contract the whole system leans on; line-by-line persistence and crash judgment both depend on it. A is wrong: seq is per-session, not global. C is wrong: timestamps live in the separate time field, unrelated to seq. D is exactly backwards: dropping chunks punches holes, so not one may be lost."
+         data-review="sec-event-envelope">
+      <div class="prompt"><span class="qnum">Q2.</span> Which statement about <code>seq</code> in the event envelope is correct?</div>
+      <label class="opt"><input type="radio" name="q-4-2" value="a"> A. It is a process-global increasing counter</label>
+      <label class="opt"><input type="radio" name="q-4-2" value="b"> B. It equals the number of events before it, strictly contiguous from 0, so even assistant/chunk cannot be filtered out</label>
+      <label class="opt"><input type="radio" name="q-4-2" value="c"> C. It sorts by timestamp and may be non-contiguous</label>
+      <label class="opt"><input type="radio" name="q-4-2" value="d"> D. It permits skipping high-frequency chunks at storage time to save space</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-3" data-type="mcq" data-multiselect="true" data-correct='["a","d","f"]'
+         data-answer="A, D, and F — user/message, assistant/message, and tool/result are the complete set of SurfaceEventType; no other events enter the surface."
+         data-rationale="A, D, and F are correct: SurfaceEventType is exactly these three message-producing types. B is wrong: chunks are replay/metering data and are skipped in derivation. C is wrong: turn boundaries are structural records. E is wrong: request/header is a log-only snapshot of the request envelope."
+         data-review="sec-derive-messages">
+      <div class="prompt"><span class="qnum">Q3.</span> Which event types are SurfaceEventType, so their events enter the projection of deriveMessages()? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="a"> A. <code>user/message</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="b"> B. <code>assistant/chunk</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="c"> C. <code>turn/start</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="d"> D. <code>assistant/message</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="e"> E. <code>request/header</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="f"> F. <code>tool/result</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C — chunks preserve streaming replay and token-metering fidelity; the message is the authoritative copy for derived history."
+         data-rationale="C is correct: double-writing with distinct duties. A is wrong: derivation skips chunks entirely. B is wrong: exactly the reverse — the persistence layer may not lose one chunk (seq continuity) and can only change encoding (packed chunk row). D is wrong: both persist, and dropping either class breaks the contract."
+         data-review="sec-derive-messages">
+      <div class="prompt"><span class="qnum">Q4.</span> What is the division of labor between <code>assistant/chunk</code> and <code>assistant/message</code>?</div>
+      <label class="opt"><input type="radio" name="q-4-4" value="a"> A. chunks derive history; messages drive UI display</label>
+      <label class="opt"><input type="radio" name="q-4-4" value="b"> B. messages reach disk; chunks stay in memory only</label>
+      <label class="opt"><input type="radio" name="q-4-4" value="c"> C. chunks preserve token-by-token replay and metering fidelity; the message is the authority for model-history derivation; both persist in full</label>
+      <label class="opt"><input type="radio" name="q-4-4" value="d"> D. Old versions used chunks; new versions use messages</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — In your plugin, declaration-merge an extension of SessionEventMap so the new input lands in the log as a session event, and render from the log."
+         data-rationale="B is correct: it is the direct corollary of model-visible ⟺ logged and the repository convention's verbatim requirement. A is the typical violation, rejected by the runtime invariant. C is a mere encoding detail and solves no reconstructability. D is exactly backwards: precisely because injected content enters model requests, it must land as user/message events."
+         data-review="sec-model-visible-logged">
+      <div class="prompt"><span class="qnum">Q5.</span> You want to give the model a new visible input (say a live weather summary). What is the correct path?</div>
+      <label class="opt"><input type="radio" name="q-4-5" value="a"> A. Splice it straight into messages at request assembly, without logging</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="b"> B. Extend SessionEventMap with a new session event (or reuse the user/message injection path) and render from the log</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="c"> C. JSON.stringify the data and stuff it into a tool result's meta field</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="d"> D. Inject via agent.inject(), since injected content needs no logging</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-6" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B and C — both the message history and the request envelope (system prompt, tool schemas, call config) must be rebuildable from the log."
+         data-rationale="B and C are correct: deriveMessages and request/header snapshots cover the two respectively. A is wrong: the log is deep-frozen; no code can rewrite history. D is wrong: listener failures are contained and affect neither committed appends nor history."
+         data-review="sec-model-visible-logged">
+      <div class="prompt"><span class="qnum">Q6.</span> What does the 「model-visible ⟺ logged」 invariant cover? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="a"> A. Message history may be rewritten in memory first and logged afterwards</label>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="b"> B. The message history the model sees must be derivable from the log</label>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="c"> C. System prompt, tool schemas, and call config must be rebuildable from request/header snapshots</label>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="d"> D. A session/event listener throwing should rewrite events already in the log</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-7" data-type="fill" data-accepted='["surfaceOp","surfaceop","surface op","thesurfaceop"]'
+         data-answer="surfaceOp (the marker for how an event joins the ordered surface: append or replace)."
+         data-rationale="deriveMessages() walks the ordered surface maintained by surfaceOp. All three SurfaceEventTypes must declare it on every append; non-surface types cannot even pass it at compile time. The replace of compaction relies on it to shadow ranges."
+         data-review="sec-derive-messages">
+      <div class="prompt"><span class="qnum">Q7.</span> Fill in the blank: deriveMessages() does not scan all events directly; it projects node by node along an ordered surface maintained by <code>______</code> markers.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Required-on-read by default: an unrecognized event without ignorable: true must refuse the rebuild; over-refusing beats silently gutting the session."
+         data-rationale="D is correct: this is the safety stance — a forgotten marker is mere inconvenience, while silently skipping could rebuild a wrong session. A is wrong: that treats ignorable as the default. B is wrong: no such auto-upgrade exists. C is wrong: the writer side never silently skips; packing for space is an encoding-layer matter (packed rows) unrelated to the read decision."
+         data-review="sec-event-envelope">
+      <div class="prompt"><span class="qnum">Q8.</span> An older build reads a log containing an unrecognized event type with no ignorable marker on the envelope. What should the reader do?</div>
+      <label class="opt"><input type="radio" name="q-4-8" value="a"> A. Silently skip the event and continue rebuilding</label>
+      <label class="opt"><input type="radio" name="q-4-8" value="b"> B. Automatically upgrade the log to the new format</label>
+      <label class="opt"><input type="radio" name="q-4-8" value="c"> C. Delete the event and note it in the file</label>
+      <label class="opt"><input type="radio" name="q-4-8" value="d"> D. Refuse to rebuild the whole session — an unknown required event may change how the rest of the log reads</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A — Throws SessionForkError with code OPEN_TURN; the API refuses rather than quietly trimming."
+         data-rationale="A is correct: a prefix with an open turn carries dangling tool calls and unclosed boundaries, and the restored transcript would be provider-invalid; the boundary may be a standalone log-only event between turns, but it must be closed. B is wrong: no auto-trim exists. C is wrong: this is validation of the live in-memory source, unrelated to persistence. D is wrong: forking normally is right — ending between turns is a legal boundary."
+         data-review="sec-fork">
+      <div class="prompt"><span class="qnum">Q9.</span> A fork's boundary selects a prefix that ends inside an unclosed turn. What happens?</div>
+      <label class="opt"><input type="radio" name="q-4-9" value="a"> A. The fork is refused with error code OPEN_TURN</label>
+      <label class="opt"><input type="radio" name="q-4-9" value="b"> B. Automatically trimmed back to the previous turn/end</label>
+      <label class="opt"><input type="radio" name="q-4-9" value="c"> C. The log is flushed to disk first, then forked</label>
+      <label class="opt"><input type="radio" name="q-4-9" value="d"> D. Forks normally; turn boundaries are irrelevant to fork</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-10" data-type="mcq" data-multiselect="true" data-correct='["a","c","e"]'
+         data-answer="A, C, and E — cwd, parentSession, and agentPreset are all SessionHeader fields; model is AgentOptions' business and turn counts live in the log."
+         data-rationale="A, C, and E are correct: the header also holds version, id, createdAt, seedLength, origin, and delegationDepth — all storage metadata. B is wrong: model selection is recorded in request/header events and AgentOptions, not a session-header field. D is wrong: turn numbers come from counting turn/start in the log and never enter the header."
+         data-review="sec-header-and-end-seed">
+      <div class="prompt"><span class="qnum">Q10.</span> Which of the following live in SessionHeader (rather than the event log)? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="a"> A. The absolute working directory cwd at session creation</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="b"> B. The currently used model id</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="c"> C. The seed lineage parentSession and seedLength</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="d"> D. The total number of turns the session has had</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="e"> E. The preset id that assembled this session's agent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Synthesizes error tool/results for dangling calls, then appends step/end and turn/end { interrupted }; not one event already on disk before the crash is touched."
+         data-rationale="B is correct: closing out rather than truncating preserves a large turn's tool output, and the restored transcript is provider-valid. A is wrong: truncation is exactly the rejected approach. C is wrong: the log is append-only; existing events cannot be rewritten. D is wrong: TOOL_NOT_STARTED covers only calls never started; started ones get TOOL_OUTCOME_UNKNOWN."
+         data-review="sec-repair-and-preparation">
+      <div class="prompt"><span class="qnum">Q11.</span> What does crash recovery (repair.ts) do to a log that stops mid-way?</div>
+      <label class="opt"><input type="radio" name="q-4-11" value="a"> A. Truncate to the last complete turn, discarding the partial events</label>
+      <label class="opt"><input type="radio" name="q-4-11" value="b"> B. Append error tool/results for dangling tool calls, then step/end and turn/end { interrupted }, leaving existing events untouched</label>
+      <label class="opt"><input type="radio" name="q-4-11" value="c"> C. Rewrite the pre-crash events to fill in missing pairs</label>
+      <label class="opt"><input type="radio" name="q-4-11" value="d"> D. Mark every unfinished call uniformly as TOOL_NOT_STARTED</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-12" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Consumers reading stored history locate the last session/end-seed: the seqs before it came from the seed (resume/fork/replay); this lifetime never wrote them."
+         data-rationale="C is correct: end-seed is the persisted projection of firstLiveSeq — empty payload, position is the meaning. A is wrong: it marks the seed's end, not the session's start. B is wrong: the constructor is the only legitimate writer and repeated opens add no repeated markers, hence read the last one. D is wrong: telemetry relies precisely on it (or in-memory firstLiveSeq) to avoid re-reporting resumed history."
+         data-review="sec-header-and-end-seed">
+      <div class="prompt"><span class="qnum">Q12.</span> What is the <code>session/end-seed</code> event for?</div>
+      <label class="opt"><input type="radio" name="q-4-12" value="a"> A. Marks the moment a new session was created</label>
+      <label class="opt"><input type="radio" name="q-4-12" value="b"> B. Must be appended anew on every process restart</label>
+      <label class="opt"><input type="radio" name="q-4-12" value="c"> C. Marks the end boundary of the construction seed: earlier seqs are inherited from resume/fork/replay, and consumers reading stored history look for the last one</label>
+      <label class="opt"><input type="radio" name="q-4-12" value="d"> D. Serves only telemetry dedup; other consumers ignore it</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-13" data-type="short"
+         data-key-points='["Everything entering a model request must be reconstructable from the session log (model-visible ⟺ logged)","A runtime invariant asserts it, and violations are rejected on the spot","A new model-visible input must extend SessionEventMap and render from the log","The rule makes post-resume/fork rebuilding mechanically verifiable instead of a matter of hope","The request envelope (system prompt, tool schemas, config) is also carried by request/header snapshots, making each request a pure function of the log"]'
+         data-answer="Key points: everything entering a model request must be rebuildable from the log; a runtime invariant asserts it; new inputs must go through new session events (extending SessionEventMap); message history derives via deriveMessages and the request envelope rebuilds from request/header snapshots — so every request is a pure function of the log, and the correctness of resume/fork becomes mechanically verifiable."
+         data-rationale="Cover the four points — rebuildable from the log, asserted by the invariant, new events as the only entrance, requests as pure functions of the log — and you own this rule."
+         data-review="sec-model-visible-logged">
+      <div class="prompt"><span class="qnum">Q13.</span> In your own words, explain 「model-visible ⟺ logged」: what it requires, what enforces it, and why it makes the correctness of resume and fork mechanically checkable.</div>
+      <textarea class="short" placeholder="Write your understanding…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check only what you truly said — checking less harms the book's calibration of you; checking more only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="05-persistence.html"><strong>Chapter 5 · Persistence: JSONL/SQLite Backends and Versioning</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 19 · Web UI Architecture — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 19 · Web UI</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/19-web-ui.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="19">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 19 · Part IV · Product Front Ends and Protocols</div>
+    <h1>Web UI architecture: host, client modules, ui-slots</h1>
+    <p class="lede">
+      Behind <code>dsh web</code> is not “a monolith with a UI” but two halves: the host in the
+      Node process and the SPA in the browser. This chapter builds exactly one key intuition —
+      <strong>the browser half is plugin-based too</strong>: every region of the page is a
+      <code>ui-*</code> feature plugin, composed through ui-slots extension slots. The connection
+      details of RPC and WebSocket are left to Chapter 20; here we only mark where the channels
+      sit.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State the boundary of the two-half architecture: the host half (webserver + frontend-static) and the browser half (a Vite SPA).</li>
+      <li>Describe the browser shell's two-stage boot: the <code>window.__DSH_BOOT__</code> module graph → the vendored Loader plugin face.</li>
+      <li>Explain ui-slots' register model and the self-nominating election of chain slots.</li>
+      <li>Distinguish the two sources of session data: the cold-read projection cache and the live <code>session/projection</code> frames.</li>
+      <li>Spell out the trigger conditions and granularity of client plugin HMR.</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-two-halves">19.1 One product, two halves</h2>
+
+  <p>
+    The Node process that <code>dsh web</code> starts is the host half; the Vite SPA the browser
+    loads (<code>apps/web</code>, package name <code>@deepseek-ai/dsh-web-frontend</code>) is the
+    browser half. Each has its own set of roles across the two package groups
+    <code>packages/client/</code> and <code>packages/host/</code>:
+  </p>
+
+  <ul>
+    <li><strong>Host half</strong>: <code>dsh-host-webserver</code> provides a plain
+        <code>node:http</code> server (<code>ctx.webServer</code>) that handles only named routes,
+        upgrade routes, and the single fallback seat; <code>dsh-host-frontend-static</code>
+        occupies the fallback seat and serves the built <code>dist/</code> of
+        <code>apps/web</code> with SPA semantics. The host half also carries every
+        <code>ctx.*</code> business service — agents, sessions, settings, commands, skills…
+        everything from Chapters 3 through 17 runs here.</li>
+    <li><strong>Browser half</strong>: <code>dsh-client-web</code> is the boot shell,
+        <code>dsh-client-modules</code> is the module system, <code>dsh-client-web-react</code>
+        connects the shell runtime to React, <code>dsh-client-runtime</code> provides the
+        Session/Workspace object layer, and the thirty-plus <code>ui-*</code> packages are
+        feature plugins.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Browser and host two-half architecture diagram">
+      <rect x="10" y="16" width="400" height="360" rx="12" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="210" y="42" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">Browser half (Vite SPA)</text>
+      <text x="210" y="60" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">@deepseek-ai/dsh-web-frontend</text>
+
+      <rect x="30" y="74" width="170" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="115" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">client-web boot shell</text>
+      <text x="115" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">AppWebEntry().run()</text>
+
+      <rect x="215" y="74" width="180" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="305" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">client-modules</text>
+      <text x="305" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">window.__DSH_BOOT__ graph → lazy CJS table</text>
+
+      <rect x="30" y="132" width="170" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="115" y="151" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">client-runtime</text>
+      <text x="115" y="167" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Session / Workspace object layer</text>
+
+      <rect x="215" y="132" width="180" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="305" y="151" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">web-react</text>
+      <text x="305" y="167" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">createSlotRenderer / hooks binding</text>
+
+      <rect x="30" y="196" width="365" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="212" y="218" text-anchor="middle" style="fill:var(--accent-2)" font-size="11" font-weight="700">Thirty-plus ui-* feature plugins (also lines on the plugin tree)</text>
+      <text x="212" y="236" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ui-slots · ui-theme · ui-layout · ui-conversation · ui-tool · ui-settings* ·</text>
+      <text x="212" y="249" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ui-subagent · ui-workflow-run · ui-commands · ui-skill …</text>
+
+      <rect x="30" y="270" width="365" height="42" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="212" y="288" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">client-connection (wire consumption layer)</text>
+      <text x="212" y="303" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ctx.connection · readiness host.describe (details in Chapter 20)</text>
+
+      <text x="212" y="340" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9" font-style="italic">Data: cold-read projection cache + live session/projection frames</text>
+
+      <rect x="490" y="16" width="400" height="360" rx="12" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="690" y="42" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">Host half (Node process)</text>
+
+      <rect x="510" y="74" width="170" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="595" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">host-webserver</text>
+      <text x="595" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">plain node:http · ctx.webServer</text>
+
+      <rect x="695" y="74" width="175" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="782" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">host-frontend-static</text>
+      <text x="782" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">fallback seat → apps/web dist/</text>
+
+      <rect x="510" y="196" width="360" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="690" y="218" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">ctx services: agents / sessions / settings / commands / skills …</text>
+      <text x="690" y="236" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Every capability plane from Chapters 3–17 runs in this half</text>
+
+      <rect x="510" y="270" width="360" height="42" rx="6" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="690" y="288" text-anchor="middle" style="fill:var(--warn)" font-size="11" font-weight="700">/api FetchHandler: Typert interceptor claims → apiproxy fallback</text>
+      <text x="690" y="303" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">expanded in Chapter 20</text>
+
+      <line x1="410" y1="290" x2="490" y2="290" style="stroke:var(--muted)" stroke-width="2.5"/>
+      <polygon points="490,290 482,286 482,294" style="fill:var(--muted)"/>
+      <text x="450" y="278" text-anchor="middle" style="fill:var(--fg)" font-size="9">HTTP POST</text>
+
+      <line x1="490" y1="316" x2="410" y2="316" style="stroke:var(--accent-2)" stroke-width="2.5"/>
+      <polygon points="410,316 418,312 418,320" style="fill:var(--accent-2)"/>
+      <text x="450" y="334" text-anchor="middle" style="fill:var(--accent-2)" font-size="9">WebSocket downstream ×2</text>
+
+      <line x1="245" y1="66" x2="770" y2="66" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <polygon points="770,66 762,62 762,70" style="fill:var(--muted)"/>
+      <text x="507" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">GET static assets: index.html miss fallback (SPA routing) + index taps inject the boot manifest</text>
+    </svg>
+    <figcaption>The two-half architecture: the host is plain node:http + static dist + all ctx services; the browser is an SPA with its own plugin tree. Arrows only mark channel positions; protocol details are in Chapter 20.</figcaption>
+  </figure>
+
+  <p>
+    The most easily overlooked line in this diagram is the small note on “GET static assets”:
+    when frontend-static serves index.html it first passes through the webserver's
+    <code>applyIndexTaps</code> — that is how the boot manifest enters the page. What the browser
+    does after receiving the index unfolds in the next section.
+  </p>
+
+  <h2 id="sec-host-half">19.2 The host half: webserver and frontend-static</h2>
+
+  <p>
+    <code>dsh-host-webserver</code> deliberately “knows no harness concepts”: it is a
+    default-exported <code>WebServer</code> plugin (config is only <code>host</code> and
+    <code>port</code>) providing <code>ctx.webServer</code>. Other plugins register named HTTP
+    routes with it (<code>register</code>, exact or prefix), upgrade routes
+    (<code>registerUpgrade</code>, matching WebSocket by exact path), and the single fallback
+    handler (<code>registerFallback</code>; a second registrant throws). Match order is fixed:
+    all-table exact → longest prefix → fallback. The <code>/api</code> bridge, the downstream
+    WebSocket, plugin bundle routes, and the HMR event stream are all routes registered by other
+    plugins — the webserver itself serves not one file. <code>host</code> accepts only
+    <code>127.0.0.1</code> (the default posture) and <code>0.0.0.0</code> (deliberate network
+    exposure); a bind failure (e.g. EADDRINUSE) throws at activation so the Loader assembly
+    fails together with the binding diagnosis.
+  </p>
+
+  <p>
+    <code>dsh-host-frontend-static</code> is the factory occupant of the fallback seat:
+    out-of-bounds traversal is 403, any miss falls back to <code>index.html</code> with HTTP 200
+    (SPA routing), unknown extensions are served as <code>application/octet-stream</code>, and
+    non-GET/HEAD with no matching route answers 405. <code>distIndex</code> is resolved by the
+    assembling application (the <code>dsh-web-app</code> bundle) from the frontend package's
+    exports — deployments never hardcode it. The seat is single-owner and effect-scoped: dispose
+    this plugin and the seat is released, with the webserver reverting to 404.
+  </p>
+
+  <h2 id="sec-browser-half">19.3 The browser half is plugins too: from __DSH_BOOT__ to app-shell</h2>
+
+  <p>
+    The browser shell's entry is <code>AppWebEntry(el).run()</code> in
+    <code>packages/client/web</code> (<code>@deepseek-ai/dsh-client-web</code>). It boots in two
+    stages — what the repository docs call web2:
+  </p>
+
+  <ol>
+    <li><strong>Module face</strong>: build <code>dsh-client-modules</code>'s
+        <code>ClientModuleLoader</code> from the entry graph <code>window.__DSH_BOOT__</code>
+        that the host pushed into the page, prefetching the <code>immediately</code> layer in
+        parallel. At this point executing a bundle <strong>only registers a factory</strong> and
+        produces no side effects.</li>
+    <li><strong>Plugin face</strong>: mount the vendored Cordis Loader and inject the module
+        system through its <code>internal</code> contract — the vendored side's only consumption
+        point is <code>EntryTree.import</code>, so swapping internal is equivalent to swapping
+        “how plugin code arrives”. Each line of the graph becomes one loader entry, plus the
+        shell's own app-shell assembly entry; AppRoot waits for settle (the Loader quiescent +
+        every entry fiber ACTIVE) and renders the full UI in one shot.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 880 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Browser shell two-stage boot sequence">
+      <rect x="10" y="20" width="130" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="75" y="42" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">index.html</text>
+      <text x="75" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">with index taps injected</text>
+
+      <line x1="140" y1="46" x2="175" y2="46" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="175,46 167,42 167,50" style="fill:var(--muted)"/>
+
+      <rect x="175" y="20" width="180" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="265" y="42" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">Stage 1: module face</text>
+      <text x="265" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">__DSH_BOOT__ → ClientModuleLoader</text>
+
+      <rect x="375" y="20" width="200" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="475" y="42" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">Executing a bundle = registering factories only</text>
+      <text x="475" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Side effects live in factory closures and run at materialization</text>
+
+      <line x1="355" y1="46" x2="375" y2="46" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="375,46 367,42 367,50" style="fill:var(--muted)"/>
+
+      <line x1="475" y1="72" x2="475" y2="105" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="475,105 471,97 479,97" style="fill:var(--muted)"/>
+
+      <rect x="330" y="105" width="290" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="475" y="127" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">Stage 2: plugin face</text>
+      <text x="475" y="143" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">vendored Loader + internal injection · one entry per graph line</text>
+
+      <line x1="620" y1="131" x2="655" y2="131" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="655,131 647,127 647,135" style="fill:var(--muted)"/>
+
+      <rect x="655" y="105" width="215" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="762" y="127" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">settle → AppRoot lights up once</text>
+      <text x="762" y="143" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Single entry failure = stay on the loading page + per-entry report</text>
+
+      <rect x="175" y="180" width="500" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="425" y="200" text-anchor="middle" style="fill:var(--warn)" font-size="10" font-weight="700">The shell's self-sufficiency hard rule</text>
+      <text x="425" y="216" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Boot state and signals are hand-written in this package (loader-status.ts); the kernel imports zero plugin packages — the loading page must work even when plugins are down</text>
+    </svg>
+    <figcaption>Two-stage boot: the module face turns bundles into a registered factory table, and the plugin face lets the vendored Loader govern fiber lifecycles; app-shell is the shell's own pseudo-entry that, like an ordinary plugin, injects and waits for slots/sessions/layout.</figcaption>
+  </figure>
+
+  <p>
+    <code>dsh-client-modules</code> itself deserves a sentence: it is “the browser counterpart of
+    Node's internal ESM loader”, implemented as a lazy CJS table. Executing a plugin bundle is
+    merely <code>window.__ModuleLoader__.load({id, factory})</code> registering a factory; all of
+    the module body's side effects (including CSS injection) live inside the factory closure and
+    run only at materialization (<code>factory(require)</code>), which records into
+    <code>loadCache</code>. A factory requiring another registered-but-unmaterialized module
+    recursively materializes it, so load order needs no external sorting; a require cycle throws.
+    The Node half scans the enabled Loader entries for packages carrying the web
+    <code>dsh.client</code>, resolves each one's <code>exports["./client"]</code>, and packs the
+    built bundle plus source map into the boot graph, served via <code>/plugins</code> —
+    <strong>the host graph decides the composition; the shell makes zero composition
+    decisions</strong>.
+  </p>
+
+  <h2 id="sec-ui-slots">19.4 ui-slots: the composition law of the browser UI</h2>
+
+  <p>
+    How do thirty-plus <code>ui-*</code> packages assemble into one interface? The answer is
+    ui-slots' <strong>slot terminal design</strong>. One <code>register</code> does four things
+    at once: contribute a component to a declared slot, declare child slots (declaration = render
+    authorization = runtime specification, one table), optionally mount a store seat, and expose
+    the registrant's business face. A component's props are the intersection of four shared
+    sets: runtime props (the parent's renderSlot call site + session standard parts + global
+    seats), child-render props, store props, and business props — each derived from a single
+    source of truth, with no second synchronization.
+  </p>
+
+  <p>
+    Two kinds of slots are worth distinguishing. A <strong>keyed slot</strong> is routed by the
+    dispatch site choosing an <code>entryKey</code>; a <strong>chain slot</strong> is the reverse
+    — each registration carries its own pure <code>ChainSelect</code> selector (optionally with
+    an ascending priority, ties broken by registration order), the first registration to return
+    non-null is elected, and its return value is passed to the component as the
+    <code>matched</code> prop; if all miss, control falls back to the holder's
+    <code>renderSlotChain</code>. The sidebar, the session view, and the settings page's
+    extension areas all grow through this mechanism.
+  </p>
+
+  <p>
+    The layering is clean too: <code>dsh-client-web-react</code> provides
+    <code>createSlotRenderer</code> (the SlotRenderer implementation the shell installs into the
+    runtime), <code>SessionProvider</code>, the sole hook constructors
+    <code>bindSnapshotSelector</code> and <code>useInvoke</code>;
+    <strong>feature plugins depend only on ui-slots' types, never on web-react</strong>. The
+    snapshot store engine (<code>defineStore</code>) lives in the runtime package; host and
+    engine pass only bare observable sources, and hook binding belongs entirely to the rendering
+    machine.
+  </p>
+
+  <h2 id="sec-data-flow">19.5 Session lists and live streams: the two faces of projection</h2>
+
+  <p>
+    Echoing Chapter 5: the host side has a <code>ctx.sessionProjections</code> projection
+    registry, and cold and hot data take two separate paths.
+  </p>
+
+  <ul>
+    <li><strong>Cold read</strong>: opening the page, lists like <code>session.list</code> need
+        not wake any Agent. The gateway keeps two projection cells of its own (e.g.
+        <code>sessionListMetadata</code> caches the monotonic “blank→non-blank” flip and the
+        time of the most recent human prompt); for very small session artifacts (within the
+        default 1 KiB threshold) it can even do an exact fold to derive blank and the latest
+        prompt. Cold sessions stay “metadata only” in the list until you open or resume one, at
+        which point the host attaches the log and folds out a log-backed title.</li>
+    <li><strong>Live</strong>: after attaching to a session, the client seeds a
+        <code>ProjectionValueStore</code> from the history tail page's <code>projections</code>
+        block (carrying an <code>asOfSeq</code> watermark) and thereafter updates each cell
+        (title, todos, queue, jobs…) from <code>session/projection</code> mux frames under
+        <strong>higher-seq-wins</strong>. These frames are <strong>live push state and never
+        enter the log</strong> — Chapter 4's “model-visible ⟺ logged” invariant is
+        unaffected.</li>
+  </ul>
+
+  <p>
+    The runtime fans the shared host stream out to Session and Workspace owners and hands every
+    generic <code>host/remote-event</code> frame to <code>ctx.remote.$dispatch</code>
+    (Chapter 20). Session content itself is assembled by <code>ConversationNodeAssembler</code>:
+    a plugin registers a business Definition that maps an event to a stable
+    <code>{kind, id}</code>, builds a Context at the unique initiating event, folds related
+    updates, and produces final nodes for the registered view targets — appends evaluate a
+    Definition once and update only matching Contexts; paging back preserves existing Contexts
+    and node identity. ui-conversation registers the built-in Chat Definition, while
+    ui-trajectory registers an independent Definition and target builder over the same event
+    window; the two views never consume each other's folds.
+  </p>
+
+  <h2 id="sec-hmr">19.6 Development mode: client plugin hot reload</h2>
+
+  <p>
+    <code>dsh-client-hmr</code> lets script-loaded client plugins hot-replace, but one
+    precondition is often misunderstood: the web bundle <strong>mounts the HMR line
+    unconditionally</strong>, yet it rebuilds nothing itself. What actually triggers rebuilds is
+    the separately run <code>pnpm run dev:web</code> watcher rewriting the client bundle;
+    without the watcher, the node-side stat-poll sees no change and the whole chain stays idle.
+  </p>
+
+  <p>
+    When a rebuild happens, the browser half subscribes to the system SSE channel
+    (<code>GET /plugins/events</code>), and each <code>rebuilt</code> frame reloads one plugin
+    through a serial queue: invalidate the old factory → prefetch the new bundle (registered
+    while the old fiber still serves) → delete the registry → drain the old fiber → remove owned
+    style tags → <code>entry.refresh()</code> re-imports and re-mounts. Reload of dependents
+    relies on Cordis itself: once a fiber's activation epoch changes, its service providers'
+    uids all change, so replacing one provider cascades to every dependent — zero graph analysis
+    on the client. The granularity is a coarse <strong>whole-plugin reload</strong> — React
+    internal state is lost while the data layer (connection/runtime fibers, Session objects)
+    stays put; a failed reload does not roll back, the entry stays FAILED and is visible in the
+    loader status projection.
+  </p>
+
+  <h2 id="sec-recap">19.7 Chapter recap</h2>
+  <ul>
+    <li>Two-half architecture: the host half is <code>dsh-host-webserver</code> (plain <code>node:http</code>, all routes registered by other plugins) + <code>dsh-host-frontend-static</code> (the single fallback seat, serving <code>apps/web</code>'s dist/); the browser half is a Vite SPA.</li>
+    <li>The browser shell boots in two stages: the module face builds a ClientModuleLoader from <code>window.__DSH_BOOT__</code> (executing a bundle only registers a factory), and the plugin face mounts the vendored Loader (one entry per graph line); AppRoot waits for settle and lights up once.</li>
+    <li>The browser UI is “everything is a plugin” too: thirty-plus ui-* feature plugins compose through ui-slots' register; chain slots elect via the registration's own ChainSelect; feature plugins depend only on ui-slots types.</li>
+    <li>Cold reads of the session list go through the projection cache and exact folds of small artifacts (waking no Agent); the live stream goes through <code>session/projection</code> frames with higher-seq-wins, never entering the log.</li>
+    <li>client HMR needs the separate <code>pnpm run dev:web</code> watcher to trigger; reload is whole-plugin granularity, and dependent cascades ride fiber activation epochs.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming the webserver serves files — it serves not one; dist is served by frontend-static occupying the fallback seat, and a second fallback registration throws outright.</li>
+      <li>Treating <code>window.__DSH_BOOT__</code> as something the browser computes itself — it is the entry graph pushed by the host; the shell makes zero composition decisions.</li>
+      <li>Assuming side effects run as soon as a bundle executes — execution only registers a factory; side effects happen at materialization (<code>factory(require)</code>).</li>
+      <li>Adding a web-react dependency to a feature UI plugin — type dependencies should point only to ui-slots; hook binding belongs to the rendering machine.</li>
+      <li>Expecting <code>session/projection</code> frames in the session log — they are live push state and never touch disk.</li>
+      <li>Complaining HMR does not work — first confirm the separately run <code>pnpm run dev:web</code>; the HMR line is mounted but rebuilds no bundle by itself.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="19">
+    <h2>Chapter 19 Test</h2>
+
+    <div class="q" data-id="19-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — dsh-host-webserver is a plain node:http server providing ctx.webServer; all routes are registered by other plugins."
+         data-rationale="B is correct. A is wrong — the webserver contains no harness concepts and serves no files. C is wrong — frontend-static is just another plugin occupying the fallback seat. D is wrong — the /api route belongs to the connection plugin."
+         data-review="sec-host-half">
+      <div class="prompt"><span class="qnum">Q1.</span> Who provides the host half's HTTP server, and what is the implementation?</div>
+      <label class="opt"><input type="radio" name="q-19-1" value="a"> A. An Express app built into dsh-host-frontend-static</label>
+      <label class="opt"><input type="radio" name="q-19-1" value="b"> B. dsh-host-webserver: plain node:http, providing ctx.webServer</label>
+      <label class="opt"><input type="radio" name="q-19-1" value="c"> C. A server implemented jointly by dsh-host-webserver and frontend-static</label>
+      <label class="opt"><input type="radio" name="q-19-1" value="d"> D. apps/web's Vite dev server used directly as the production server</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — frontend-static occupies the webserver's single fallback seat; a miss falls back to index.html with 200 (SPA routing), and the index response passes through index taps."
+         data-rationale="C is correct: that is the channel through which the boot manifest enters the page. A is wrong — the seat is single-owner; a second registration throws. B is wrong — out-of-bounds traversal is 403. D is wrong — unknown extensions are served as application/octet-stream."
+         data-review="sec-host-half">
+      <div class="prompt"><span class="qnum">Q2.</span> Who serves the SPA's dist, and under what semantics?</div>
+      <label class="opt"><input type="radio" name="q-19-2" value="a"> A. The webserver serves it itself, and the fallback can be shared by many</label>
+      <label class="opt"><input type="radio" name="q-19-2" value="b"> B. frontend-static serves it; out-of-bounds traversal returns 200</label>
+      <label class="opt"><input type="radio" name="q-19-2" value="c"> C. frontend-static occupies the single fallback seat; a miss falls back to index.html, and the index response runs index taps</label>
+      <label class="opt"><input type="radio" name="q-19-2" value="d"> D. frontend-static serves it; unknown extensions are always served as text/html</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-3" data-type="mcq" data-correct='["a"]'
+         data-answer="A — It is the client module entry graph the host pushes into the page; the shell makes zero composition decisions, and the roster and immediately layer live in the assembling application."
+         data-rationale="A is correct. B is wrong — the module system is built at runtime. C is wrong — it is a graph (which modules, which layers), not a WebSocket. D is wrong — Vite build artifacts are served via /plugins, unrelated to this variable."
+         data-review="sec-browser-half">
+      <div class="prompt"><span class="qnum">Q3.</span> What is <code>window.__DSH_BOOT__</code>?</div>
+      <label class="opt"><input type="radio" name="q-19-3" value="a"> A. The browser module entry graph pushed by the host (boot graph)</label>
+      <label class="opt"><input type="radio" name="q-19-3" value="b"> B. A table of loaded scripts scanned by the browser itself</label>
+      <label class="opt"><input type="radio" name="q-19-3" value="c"> C. A WebSocket handle for the downstream event stream</label>
+      <label class="opt"><input type="radio" name="q-19-3" value="d"> D. A build-artifact manifest injected by Vite</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-4" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, and C."
+         data-rationale="A/B/C are correct. D is wrong: the design is a one-shot render; a single entry failure stays on the loading page with loud per-entry reporting — no progressive availability."
+         data-review="sec-browser-half">
+      <div class="prompt"><span class="qnum">Q4.</span> Which statements about the two-stage boot are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="a"> A. Stage 1 builds the ClientModuleLoader from <code>__DSH_BOOT__</code> and prefetches the immediately layer in parallel</label>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="b"> B. Stage 2 mounts the vendored Cordis Loader, with the module system injected through the internal contract</label>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="c"> C. AppRoot waits for settle and then renders the full UI in one shot</label>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="d"> D. When a single entry fails, the other plugins render first for progressive availability</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-5" data-type="fill" data-accepted='["物化","materialize","materialization","factory(require)"]'
+         data-answer="Materialization (materialize: factory(require) executes and records into loadCache)."
+         data-rationale="In the lazy CJS model, executing a bundle only registers a factory; the module body's side effects (including CSS injection) live in the factory closure and run at materialization. A factory requiring another registered-but-unmaterialized module recursively materializes it."
+         data-review="sec-browser-half">
+      <div class="prompt"><span class="qnum">Q5.</span> Fill in the blank: in the lazy CJS model, executing a plugin bundle only registers a factory; side effects happen when the module is ______.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Feature plugins depend only on ui-slots' types; hook binding and the rendering machine live in web-react, installed by the shell."
+         data-rationale="D is correct: web-react is shell-side glue, and feature packages do not depend on it. A/C make the rendering machine a feature dependency — the direction is reversed. B is wrong — the runtime provides object services and holds no typed contract slot system."
+         data-review="sec-ui-slots">
+      <div class="prompt"><span class="qnum">Q6.</span> For an ordinary ui-* feature plugin, where should the type dependency point?</div>
+      <label class="opt"><input type="radio" name="q-19-6" value="a"> A. web-react</label>
+      <label class="opt"><input type="radio" name="q-19-6" value="b"> B. client-runtime</label>
+      <label class="opt"><input type="radio" name="q-19-6" value="c"> C. Either web-react or ui-slots, whichever</label>
+      <label class="opt"><input type="radio" name="q-19-6" value="d"> D. ui-slots</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B — In a chain slot, registrations self-nominate through their own ChainSelect selector: the first to return non-null is elected, and its return value becomes the component's matched prop."
+         data-rationale="B is correct. A describes keyed slot routing — exactly reversed. C is wrong — priority only affects election order and does not decide child slots. D is wrong — an all-miss falls back to the holder's renderSlotChain, not a crash."
+         data-review="sec-ui-slots">
+      <div class="prompt"><span class="qnum">Q7.</span> What is the core difference between a chain slot and a keyed slot?</div>
+      <label class="opt"><input type="radio" name="q-19-7" value="a"> A. Chain slots are routed by the dispatch site choosing an entryKey; keyed slots use selectors</label>
+      <label class="opt"><input type="radio" name="q-19-7" value="b"> B. In a chain slot, registrations self-nominate with ChainSelect and the first non-null wins; a keyed slot is routed by the dispatch site choosing an entryKey</label>
+      <label class="opt"><input type="radio" name="q-19-7" value="c"> C. A chain slot can register only one component; a keyed slot can have many</label>
+      <label class="opt"><input type="radio" name="q-19-7" value="d"> D. When a chain slot misses entirely, the whole application crashes</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Via the projection cache (e.g. the sessionListMetadata cell) plus exact folds of small artifacts, restoring and publishing no Agent."
+         data-rationale="C is correct: this is the cold-read path's design. A/B are wrong — the cold list deliberately attaches no Agent, which would add first-open latency. D is wrong — the SQLite content index serves search, not the projection cache behind list ordering."
+         data-review="sec-data-flow">
+      <div class="prompt"><span class="qnum">Q8.</span> Where do a cold session's blank flag and latest-prompt time in the list come from?</div>
+      <label class="opt"><input type="radio" name="q-19-8" value="a"> A. By restoring the session's Agent and asking it live</label>
+      <label class="opt"><input type="radio" name="q-19-8" value="b"> B. By replaying the full log on every list request</label>
+      <label class="opt"><input type="radio" name="q-19-8" value="c"> C. Projection cache cells + exact folds of artifacts within the threshold, waking no Agent</label>
+      <label class="opt"><input type="radio" name="q-19-8" value="d"> D. The browser's localStorage cache</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A — higher-seq-wins: one generic value store per session, where a newer higher seq overrides an older one; this is live push state, never written to the log."
+         data-rationale="A is correct. B is wrong — a new value with an older seq does not override. C is wrong — the session content events themselves are in the log, but the projection frames are not. D is wrong — last-wins is a policy for things like the jobs mirror; projection cells uniformly use higher-seq-wins."
+         data-review="sec-data-flow">
+      <div class="prompt"><span class="qnum">Q9.</span> Under what rule do <code>session/projection</code> frames take effect on the client?</div>
+      <label class="opt"><input type="radio" name="q-19-9" value="a"> A. higher-seq-wins, and never written to the session log</label>
+      <label class="opt"><input type="radio" name="q-19-9" value="b"> B. last-wins, and written to the log as a SessionEvent</label>
+      <label class="opt"><input type="radio" name="q-19-9" value="c"> C. lower-seq-wins, used only for cold reads</label>
+      <label class="opt"><input type="radio" name="q-19-9" value="d"> D. first-wins, the first frame always prevails</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The node-side stat-poll reacts only to real rebuilds: the separately run pnpm run dev:web watcher must rewrite the client bundle, or the whole chain stays idle."
+         data-rationale="B is correct: the HMR line is mounted unconditionally but builds nothing itself. A is wrong — an ordinary vite dev is not this channel. C is wrong — SSE is only the browser half's receiving channel and triggers no rebuild. D is wrong — refreshing the page of course reloads everything, but that is not HMR."
+         data-review="sec-hmr">
+      <div class="prompt"><span class="qnum">Q10.</span> When does client plugin HMR actually happen?</div>
+      <label class="opt"><input type="radio" name="q-19-10" value="a"> A. Any time you edit source; the Vite dev server notifies automatically</label>
+      <label class="opt"><input type="radio" name="q-19-10" value="b"> B. The separate pnpm run dev:web watcher rewrites the client bundle and the node side polls a real rev change</label>
+      <label class="opt"><input type="radio" name="q-19-10" value="c"> C. The browser checks automatically every second after subscribing to /plugins/events</label>
+      <label class="opt"><input type="radio" name="q-19-10" value="d"> D. Just refresh the page manually; there is no other way</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-11" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A/B/D are correct: these three are exactly the evidence that the browser UI is plugins too. C is wrong — the shell's self-sufficiency is a hard rule: the kernel imports zero plugin packages and load state is hand-written; app-shell is the shell's own pseudo-entry, but it injects and waits for slots/sessions/layout — precisely the plugin posture."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> Which statements support “the browser UI is everything-is-a-plugin too”? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="a"> A. The browser half mounts the vendored Cordis Loader, one loader entry per boot-graph line</label>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="b"> B. ui-* feature plugins compose into extension slots via ui-slots' register</label>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="c"> C. The boot shell imports every ui-* plugin package itself</label>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="d"> D. The host graph decides composition (roster and immediately layer in the assembling application); the shell makes zero composition decisions</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-12" data-type="short"
+         data-key-points='["The two-half boundary: the host is the Node process (webserver node:http + frontend-static serving dist + all ctx services); the browser is a Vite SPA","The browser shell two-stage boot: __DSH_BOOT__ → ClientModuleLoader (registering factories), then mounting the vendored Loader (one entry per graph line)","ui-* feature plugins compose via ui-slots register; chain slots self-nominate via ChainSelect; feature plugins depend only on ui-slots types","Cold reads go through the projection cache / small-artifact folds waking no Agent; live updates go through session/projection frames with higher-seq-wins and never enter the log","The connection channels (POST /api and two downstream WebSockets) are only located here; protocol details belong to Chapter 20"]'
+         data-answer="The host half is the Node process: dsh-host-webserver provides the plain node:http server with routes registered by each plugin, dsh-host-frontend-static occupies the single fallback seat and serves apps/web's dist/, and all ctx services run in this half. The browser half is a Vite SPA: the shell AppWebEntry boots in two stages — first building the ClientModuleLoader from the host-pushed __DSH_BOOT__ graph (executing a bundle only registers a factory), then mounting the vendored Loader so each graph line becomes an entry; the interface is composed of thirty-plus ui-* feature plugins via ui-slots. On data, cold reads go through the projection cache and live updates through session/projection frames; the connection channels to the host (POST /api, two downstream WebSockets) are left to Chapter 20."
+         data-rationale="Two-half boundary + two-stage boot + ui-slots composition + two data paths — with those four in place this chapter stands."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> In your own words, walk through the two-half architecture: what lives in each half, how the browser grows its UI, and where the data comes from.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a key point you actually covered — under-checking hurts your calibration; over-checking just fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="20-typert-rpc.html"><strong>Chapter 20 · Typert and the RPC Gateway</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

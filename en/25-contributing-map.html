@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 25 · The Contribution Map and Expert Navigation — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 25 · The Contribution Map</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/25-contributing-map.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="25">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 25 · Part V · Engineering and Contribution</div>
+    <h1>The Contribution Map and Expert Navigation</h1>
+    <p class="lede">
+      The final chapter does two things: it completes the process map for leaving a change in
+      this repository — the Agent Notes decision ledger, the bilingual documentation contract,
+      PR labels and stack rules; then it assembles all twenty-five chapters into one navigation
+      map, turning I want to change X, so first read Y into a table lookup. After this chapter
+      you go from someone who reads dsh to someone who can start work in dsh. This is the
+      closing chapter; take the diagram slowly.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State the Agent Note lifecycle directories (proposed / implemented / rejected / archived), the six classes, and the rule that non-trivial changes carry a Note in the same PR.</li>
+      <li>Explain the archived tree's freeze contract: never edited and never treated as current authority, enforced by <code>verify-archived-agent-notes</code>.</li>
+      <li>Describe the bilingual documentation pairing structure (<code>*.md</code> + <code>*.zh.md</code> + <code>*.i18n.yaml</code>) and the one-home-per-fact hierarchy tax.</li>
+      <li>Recite the PR rules: one <code>kind/*</code>, all material <code>area/*</code>, native Issue Type, and the <code>--force-with-lease</code> discipline for stacked PRs.</li>
+      <li>Use the book's navigation map to locate the package, event, or registry to read first for an I want to change X.</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-agent-notes">25.1 Agent Notes: the ledger of decisions</h2>
+
+  <p>
+    <code>.agents/notes/</code> houses exactly one kind of document: a record of a decision that
+    shapes the codebase — <strong>why it was settled this way and what was given up</strong> —
+    the things code and ordinary documentation cannot carry. The path is itself metadata:
+    <code>{lifecycle}/{class}/yyyy-mm-dd-topic-title.md</code>. Four lifecycle directories:
+    <code>proposed/</code> (proposals reviewed before implementation), <code>implemented/</code>
+    (shipped decisions that also <strong>stay current with the code</strong> — when code moves
+    a file or changes a default, the same change updates the Note's facts),
+    <code>rejected/</code> (vetoed proposals, kept only while their reasoning still blocks a
+    tempting mistake, otherwise the whole triplet is deleted), and <code>archived/</code>
+    (frozen history, below). The classes are a closed set enforced by
+    <code>scripts/agent-note-tree.ts</code> and the classification gates:
+    <code>feature</code> / <code>bug-fix</code> / <code>simplification</code> /
+    <code>architecture</code> / <code>process</code> / <code>testing</code> — the dividing line
+    is <strong>architecture governs the source code we ship, process governs the tools and
+    workflows around it</strong>, while <code>refactor</code> is deliberately excluded (it
+    overlaps simplification).
+  </p>
+
+  <p>
+    Timing is a hard rule: <strong>every non-trivial change must add or update at least one
+    Agent Note in the same PR</strong>. Non-trivial means a change to behavior, architecture,
+    cross-file/cross-package contracts, process or tooling, testing strategy, on-disk/wire/config
+    formats, or any decision a maintainer might reopen. Updating the Note that already owns the
+    decision satisfies the rule — do not create duplicates; purely mechanical/local edits are
+    exempt. File format is enforced by <code>verify-agent-note-format</code> (part of doc-sync):
+    the first two lines are exactly <code># Agent Note: &lt;title&gt;</code> and
+    <code>Status: &lt;status&gt;</code> (proposed / implemented /
+    <code>rejected — one-line reason</code>; the status must match the directory); the body
+    opens with <code>## Problem</code>; the implemented skeleton is Problem → Decision → … →
+    Alternatives considered → Consequences, and spec-speak like Proposal/Plan/Acceptance
+    criteria is forbidden. <strong>Every Note must carry <code>## Alternatives
+    considered</code></strong>: a decision without a record of what it defeated is an invitation
+    to relitigate — precisely the failure Agent Notes exist to prevent. Notes cross-link with
+    relative markdown links and never bare numbers, so links can be mechanically verified and
+    survive directory moves.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">archived is frozen</div>
+    <p>
+      An implemented Note is archived once the decision has fully landed and its reasoning is
+      unlikely to guide future work: the whole English/Chinese/sidecar triplet moves into
+      <code>archived/{class}/</code>, gains a line <code>Archived: YYYY-MM-DD</code>, and is
+      thereafter <strong>never edited, translated, reordered, updated, moved, or deleted</strong>,
+      nor treated as authority on current behavior. Documentation gates skip archived sources;
+      active documents may still reference it deliberately as history. The enforcer is
+      <code>verify-archived-agent-notes</code>: the closed class tree, complete triplets,
+      archive metadata, sidecar hashes, and the append-only freeze manifest. Archiving is judged
+      with the calibrated dsh-archive-agent-notes workflow — not by counting words or age.
+    </p>
+  </div>
+
+  <h2 id="sec-bilingual-docs">25.2 Bilingual documentation and doc-sync</h2>
+
+  <p>
+    This repository's documentation is English–Chinese in parallel: <code>*.md</code> and
+    <code>*.zh.md</code> mirror each other section by section, with a
+    <code>*.i18n.yaml</code> sidecar alongside recording pairing status; the pairing contract is
+    owned by <code>docs/i18n/README.md</code> and verified by
+    <code>verify-translation-pairing</code>. Routine bilingual work follows docs/AGENTS.md:
+    terminology guidance and a single-pass active-agent translation that re-records the sidecar;
+    only an <strong>explicit user invocation</strong> runs the <code>dsh-translate-docs</code>
+    skill. On the Git side there is also a pairing merge driver (pre-commit / pre-merge-commit
+    validate staged records).
+  </p>
+
+  <p>
+    The hierarchy tax in docs/AGENTS.md is one sentence: <strong>one home per fact</strong>. The
+    root AGENTS.md keeps only standing commands (one to three lines each, linking to their
+    home); architecture.md is the ordered map; subsystems/ holds one page of type reference per
+    subsystem; Agent Notes hold decision rationale; postmortem/ is the only layer allowed
+    narrative war stories; cookbook/ holds how-tos with numbered verification steps; package
+    READMEs are the per-package contract (including Model Experience); generated references
+    (tool-catalog, config-catalog, module-graph, and others) regenerate from source with
+    freshness gated. The four writing rules that bite most often: documentation states
+    <strong>the current state, not the change history</strong> (avoid used to / now / no longer;
+    stories go into Notes or postmortems); <strong>one physical line per paragraph</strong>
+    (verify-md-wrap); fenced <code>ts</code> blocks must compile (doc-typecheck), and quoted
+    types use <code>ts type-equiv</code> with a manifest registration against drift;
+    cross-references use relative markdown links (verify-md-links). Word budgets are guarded by
+    <code>verify-doc-budgets</code> — when red, relocate first, then compress, and only raise
+    the manifest ceiling when truly necessary. All of this, plus catalog regeneration, JSDoc,
+    and Agent Note checks, aggregates into <code>pnpm run doc-sync</code> (Chapter 23).
+  </p>
+
+  <p>
+    The documentation website is a projection, not a home: <code>website/</code> owns only the
+    VitePress configuration, presentation assets, and the publishing manifest
+    (<code>website/docs.ts</code> maps docs/ sources from every layer into the route trees of
+    both locales); Markdown stays in its owning layer and the projection is written into the
+    ignored <code>website/.generated/</code> — never hand-edited. When changing this subtree run
+    <code>pnpm docs:check</code>.
+  </p>
+
+  <h2 id="sec-pr-rules">25.3 PR rules, labels, and stacks</h2>
+
+  <p>
+    AGENTS.md's requirement for PR history is deliberate choice: <strong>split independent
+    changes</strong>; fix a bug in the PR that introduced it first, rather than propagating it
+    forward. Standalone PRs and official stacks may merge-forward or rebase after review;
+    history rewrites use <code>--force-with-lease</code> and abort on remote movement,
+    <strong>never raw <code>--force</code></strong>; an in-progress merge-forward preserves its
+    checkpoint before taking a newer base (per
+    <code>.agents/notes/implemented/process/2026-08-02-native-github-stacks-and-optional-rebases.md</code>,
+    with the companion skill dsh-merging-stacked-prs). Before pushing, pick the minimal check
+    set with the dsh-pre-push-checks skill (Chapter 23's evidence-surface mappings);
+    <code>gh stack sync</code> is validated immediately after, and nothing merges before checks
+    pass.
+  </p>
+
+  <p>
+    The label tax: every PR carries exactly one <code>kind/*</code> (the kind of change), every
+    materially affected <code>area/*</code>, plus the native GitHub Issue Type — the taxonomy is
+    owned by
+    <code>.agents/notes/implemented/process/2026-08-08-unified-github-label-taxonomy.md</code>.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Read CONTRIBUTING.md first: the current state of external PRs</div>
+    <p>
+      The repository root's CONTRIBUTING.md states it plainly: DeepSeek Harness is still early
+      and under active development, and it <strong>currently does not accept external pull
+      requests</strong>. Participation is ecosystem-shaped — report problems and vote in GitHub
+      Discussions; write plugins that excite you and tag the GitHub project with the
+      <code>dsh-plugin</code> topic; write blog posts and how-tos; answer community questions.
+      The repository's stance: packages in the official repo are not inherently more important
+      than community packages — this repository is more like an idea, an official showcase, a
+      source of inspiration. So the PR rules of the previous section and this chapter mean two
+      things for you: follow the full process with the same discipline in your checkout/fork
+      (minimal check sets, same-PR Notes and snapshots), and participate in the ecosystem with
+      out-of-tree plugins (Chapter 24).
+    </p>
+  </div>
+
+  <h2 id="sec-book-map">25.4 The book-wide navigation map</h2>
+
+  <p>
+    The twenty-five chapters stack into five layers, each lower one the foundation of the next:
+    without the Cordis mental model you cannot read the event streams; without event streams,
+    the loop; without the loop, the tool pipeline; without seams, the wholesale move of the
+    execution world; without the first four parts, what the testing system and gates protect.
+    The quick-reference table on the right maps the most common I want to change X to its entry
+    point — note that every row points at an <strong>extension point, event, or seam</strong>,
+    and not one row points at the agent-loop itself.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 660" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Map of the book's five parts and the change quick-reference table">
+      <text x="14" y="24" style="fill:var(--fg-dim)" font-size="13" font-weight="700">The five parts (stacked bottom-up)</text>
+
+      <rect x="14" y="560" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="28" y="584" style="fill:var(--accent)" font-size="13" font-weight="700">Part I · Foundations (Ch. 1-3)</text>
+      <text x="28" y="604" style="fill:var(--fg)" font-size="11">dsh overview · Cordis mental model · runtime assembly</text>
+      <text x="28" y="620" style="fill:var(--fg-dim)" font-size="11">The foundation of everything: plugins, Context, the boot chain</text>
+
+      <line x1="179" y1="560" x2="179" y2="538" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,532 173,542 185,542" style="fill:var(--muted)"/>
+
+      <rect x="14" y="460" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="28" y="484" style="fill:var(--accent)" font-size="13" font-weight="700">Part II · The core pipeline (Ch. 4-10)</text>
+      <text x="28" y="504" style="fill:var(--fg)" font-size="11">session log · persistence · agent/scope · loop</text>
+      <text x="28" y="520" style="fill:var(--fg)" font-size="11">tool pipeline · system prompt · LLM layer</text>
+
+      <line x1="179" y1="460" x2="179" y2="438" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,432 173,442 185,442" style="fill:var(--muted)"/>
+
+      <rect x="14" y="360" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="28" y="384" style="fill:var(--accent)" font-size="13" font-weight="700">Part III · Capability surfaces (Ch. 11-17)</text>
+      <text x="28" y="404" style="fill:var(--fg)" font-size="11">the seam's three roles · execution world · fs · subagents</text>
+      <text x="28" y="420" style="fill:var(--fg)" font-size="11">context pressure · the human plane · capability tour</text>
+
+      <line x1="179" y1="360" x2="179" y2="338" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,332 173,342 185,342" style="fill:var(--muted)"/>
+
+      <rect x="14" y="260" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="28" y="284" style="fill:var(--accent)" font-size="13" font-weight="700">Part IV · Product surface and protocols (Ch. 18-21)</text>
+      <text x="28" y="304" style="fill:var(--fg)" font-size="11">CLI/boot · Web UI · Typert RPC</text>
+      <text x="28" y="320" style="fill:var(--fg)" font-size="11">ACP / JSON-RPC SDK / Python</text>
+
+      <line x1="179" y1="260" x2="179" y2="238" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,232 173,242 185,242" style="fill:var(--muted)"/>
+
+      <rect x="14" y="160" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="28" y="184" style="fill:var(--accent-2)" font-size="13" font-weight="700">Part V · Engineering and contribution (Ch. 22-25)</text>
+      <text x="28" y="204" style="fill:var(--fg)" font-size="11">the five test channels · gates and conventions · extension practice</text>
+      <text x="28" y="220" style="fill:var(--fg)" font-size="11">the contribution map (you are here)</text>
+
+      <rect x="14" y="60" width="330" height="76" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="28" y="84" style="fill:var(--pass)" font-size="13" font-weight="700">After graduation</text>
+      <text x="28" y="104" style="fill:var(--fg)" font-size="11">docs/architecture.md → capability-seams.md</text>
+      <text x="28" y="120" style="fill:var(--fg)" font-size="11">→ agent-loop/src/agent.ts in full</text>
+
+      <line x1="179" y1="160" x2="179" y2="140" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="4 3"/>
+      <polygon points="179,136 173,144 185,144" style="fill:var(--muted)"/>
+
+      <text x="384" y="24" style="fill:var(--fg-dim)" font-size="13" font-weight="700">I want to change X → first read Y (lookup table)</text>
+
+      <rect x="384" y="36" width="502" height="596" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+
+      <rect x="398" y="48" width="216" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="406" y="64" style="fill:var(--fg-dim)" font-size="11" font-weight="700">I want to change…</text>
+      <rect x="626" y="48" width="246" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="634" y="64" style="fill:var(--fg-dim)" font-size="11" font-weight="700">First read / first go to…</text>
+
+      <text x="406" y="94" style="fill:var(--fg)" font-size="11">loop behavior</text>
+      <text x="634" y="94" style="fill:var(--accent)" font-size="11">agent/* events and extension points (do not change the loop)</text>
+
+      <text x="406" y="120" style="fill:var(--fg)" font-size="11">Add a model-visible input</text>
+      <text x="634" y="120" style="fill:var(--accent)" font-size="11">a new session event (SessionEventMap)</text>
+
+      <text x="406" y="146" style="fill:var(--fg)" font-size="11">Persistence format</text>
+      <text x="634" y="146" style="fill:var(--accent)" font-size="11">SessionEventMap / SESSION_FORMAT_VERSION</text>
+
+      <text x="406" y="172" style="fill:var(--fg)" font-size="11">Swap the execution environment</text>
+      <text x="634" y="172" style="fill:var(--accent)" font-size="11">fs / subprocess provider (swap the seam's implementation)</text>
+
+      <text x="406" y="198" style="fill:var(--fg)" font-size="11">Add a model tool</text>
+      <text x="634" y="198" style="fill:var(--accent)" font-size="11">ctx.tools.register + defineTool (Ch. 24)</text>
+
+      <text x="406" y="224" style="fill:var(--fg)" font-size="11">A new model vendor</text>
+      <text x="634" y="224" style="fill:var(--accent)" font-size="11">LlmAdapter + ctx.llm.registerAdapter</text>
+
+      <text x="406" y="250" style="fill:var(--fg)" font-size="11">Change the system prompt</text>
+      <text x="634" y="250" style="fill:var(--accent)" font-size="11">ctx.systemPrompt.section()</text>
+
+      <text x="406" y="276" style="fill:var(--fg)" font-size="11">Intercept / wrap tool calls</text>
+      <text x="634" y="276" style="fill:var(--accent)" font-size="11">tools/pre-execute · execute · result</text>
+
+      <text x="406" y="302" style="fill:var(--fg)" font-size="11">Add a human command</text>
+      <text x="634" y="302" style="fill:var(--accent)" font-size="11">ctx.commands (packages/interaction/commands)</text>
+
+      <text x="406" y="328" style="fill:var(--fg)" font-size="11">Add a background job</text>
+      <text x="634" y="328" style="fill:var(--accent)" font-size="11">ctx.jobs.start (the long-task runtime)</text>
+
+      <text x="406" y="354" style="fill:var(--fg)" font-size="11">Browser UI</text>
+      <text x="634" y="354" style="fill:var(--accent)" font-size="11">ui-slots (packages/client/ui-slots)</text>
+
+      <text x="406" y="380" style="fill:var(--fg)" font-size="11">Web Chat business node</text>
+      <text x="634" y="380" style="fill:var(--accent)" font-size="11">ConversationNodeDefinition + chat renderers</text>
+
+      <text x="406" y="406" style="fill:var(--fg)" font-size="11">RPC surface</text>
+      <text x="634" y="406" style="fill:var(--accent)" font-size="11">Typert type graph + gateway (Ch. 20)</text>
+
+      <text x="406" y="432" style="fill:var(--fg)" font-size="11">Subagents</text>
+      <text x="634" y="432" style="fill:var(--accent)" font-size="11">ctx.subagents provider registry (Ch. 14)</text>
+
+      <text x="406" y="458" style="fill:var(--fg)" font-size="11">Drive a turn on a schedule</text>
+      <text x="634" y="458" style="fill:var(--accent)" font-size="11">followup(source: cron) (Ch. 17)</text>
+
+      <text x="406" y="484" style="fill:var(--fg)" font-size="11">Connect an MCP server</text>
+      <text x="634" y="484" style="fill:var(--accent)" font-size="11">dsh-mcp-client + insert overlay (Ch. 24)</text>
+
+      <text x="406" y="510" style="fill:var(--fg)" font-size="11">Permissions / approval</text>
+      <text x="634" y="510" style="fill:var(--accent)" font-size="11">tools/pre-execute returning ask (Ch. 16)</text>
+
+      <text x="406" y="536" style="fill:var(--fg)" font-size="11">Context pressure</text>
+      <text x="634" y="536" style="fill:var(--accent)" font-size="11">compaction seam + agent/pre-step (Ch. 15)</text>
+
+      <line x1="398" y1="552" x2="872" y2="552" style="stroke:var(--muted)" stroke-width="1"/>
+
+      <text x="406" y="578" style="fill:var(--fg-dim)" font-size="11">After the change (same for every row)</text>
+      <text x="406" y="602" style="fill:var(--pass)" font-size="11">Pick checks by evidence surface (Ch. 23) · add a keyless snapshot in the same PR (Ch. 22)</text>
+      <text x="406" y="622" style="fill:var(--pass)" font-size="11">Non-trivial changes carry an Agent Note (25.1)</text>
+    </svg>
+    <figcaption>The book's closing navigation map. Left: the five parts depend on each other bottom-up, with the graduation route on top; right: the quick-reference table from common changes to entry points — every row lands on an extension point, event, or seam, none on the agent-loop itself; the table's tail is the closing obligation shared by every change.</figcaption>
+  </figure>
+
+  <div class="box key">
+    <div class="box-title">Reading the quick-reference table as one sentence</div>
+    <p>
+      Behavior goes to extension points, data goes to event streams, implementations go to
+      provider seams: if what you want to change is none of the three, go back to
+      docs/architecture.md and find who owns it — cannot find the entry point is almost always a
+      symptom of reading the wrong layer.
+    </p>
+  </div>
+
+  <h2 id="sec-graduation">25.5 The graduation route</h2>
+
+  <p>
+    Having finished the book, compact the knowledge into muscle memory in this order:
+  </p>
+
+  <table>
+    <thead><tr><th>Step</th><th>Do</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Read <code>docs/architecture.md</code> end to end</td><td>Compresses the 25 chapters back into one ordered map: composition, core packages, the loop, seams, extension points — required reading before changing packages/.</td></tr>
+      <tr><td>2</td><td>Read <code>docs/capability-seams.md</code></td><td>One concentrated review of the three-role pattern; afterwards every new capability is located by it.</td></tr>
+      <tr><td>3</td><td>Read <code>packages/core/agent-loop/src/agent.ts</code> in full</td><td>See with your own eyes how Chapter 6-7's turn/step, inbox admission, and every interception point look in code.</td></tr>
+      <tr><td>4</td><td>Run <code>pnpm run test:snapshot</code> once</td><td>Walks the entire assembled-transcript replay without a key; watch it go green and feel the golden-fixture system.</td></tr>
+      <tr><td>5</td><td>Submit your first PR</td><td>Pick a small change from Chapter 24's three practice passes (or a new plugin), choose the minimal check set per Chapter 23, and carry a Note and snapshots. On the external route: CONTRIBUTING.md currently takes no external PRs — run the full process in a fork, or participate through the <code>dsh-plugin</code> ecosystem.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    One last reminder: every fact you are reading right now is subordinate to the repository.
+    Gate lists will change, packages will move, events will grow — what does not change is the
+    locating method this book teaches: find the fact's home, read it, then change it.
+  </p>
+
+  <h2 id="sec-recap">25.6 Chapter recap</h2>
+  <ul>
+    <li>Agent Notes are the decision ledger: <code>proposed/implemented/rejected/archived</code> × six classes; non-trivial changes carry one in the same PR; <code>## Alternatives considered</code> is mandatory; implemented stays current, archived is permanently frozen and not authority.</li>
+    <li>Bilingual docs = the <code>*.md</code> + <code>*.zh.md</code> + <code>*.i18n.yaml</code> pairing; one home per fact; current state without change history; one physical line per paragraph; <code>doc-sync</code> aggregates all documentation gates; only explicit invocation runs dsh-translate-docs; website/ is only a projection.</li>
+    <li>PRs: split independent changes, fix in the introducing PR; one <code>kind/*</code> + all material <code>area/*</code> + native Issue Type; stacks may merge-forward/rebase, rewrites use only <code>--force-with-lease</code>; dsh-pre-push-checks picks the minimal set before pushing.</li>
+    <li>CONTRIBUTING.md currently takes no external PRs: participation is via Discussions, blog posts, and the plugin ecosystem tagged with the <code>dsh-plugin</code> topic.</li>
+    <li>The navigation mnemonic: behavior goes to extension points, data goes to event streams, implementations go to provider seams; after the change, pick checks by evidence surface, add a keyless snapshot in the same PR, and carry an Agent Note.</li>
+    <li>The graduation route: architecture.md → capability-seams.md → agent.ts in full → <code>test:snapshot</code> → the first PR.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common misconceptions</div>
+    <ul style="margin:0;">
+      <li>Citing an archived Note as current authority — it is frozen history; check implemented Notes and the source for current behavior.</li>
+      <li>A non-trivial PR without an Agent Note — hard rule; updating the Note that already owns the decision suffices, so do not create duplicates.</li>
+      <li>Writing should/migration plans/acceptance checklists in an implemented Note — spec-speak is rejected by the format gate; it records only shipped facts.</li>
+      <li>Writing used to / now / no longer in docs — change history goes into Notes and postmortems; current documents state only current mechanisms.</li>
+      <li>Using raw <code>--force</code> on stacked PRs — use only <code>--force-with-lease</code>, and abort on remote movement.</li>
+      <li>Assuming outsiders can submit PRs directly — read CONTRIBUTING.md first; the current channel is Discussions and the dsh-plugin ecosystem.</li>
+      <li>Forgetting required-on-read and <code>SESSION_FORMAT_VERSION</code>'s structural-change rules when touching the persistence format — go back to Chapter 4 and <code>SessionEventMap</code>.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="25">
+    <h2>Chapter 25 Test</h2>
+
+    <div class="q" data-id="25-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Every non-trivial change must add or update at least one Agent Note in the same PR."
+         data-rationale="C is correct. A defers the obligation to the next PR. B exempts only purely mechanical/local edits, not behavior changes. D is backwards: updating the Note that already owns the decision satisfies the rule; creating duplicates is what is forbidden."
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q1.</span> What is the exact requirement behind non-trivial changes must carry an Agent Note?</div>
+      <label class="opt"><input type="radio" name="q-25-1" value="a"> A. Add one in the next PR after the decision lands</label>
+      <label class="opt"><input type="radio" name="q-25-1" value="b"> B. Only architecture-level changes need one; behavior changes are exempt</label>
+      <label class="opt"><input type="radio" name="q-25-1" value="c"> C. Add or update at least one in the same PR; updating the Note that already owns the decision suffices</label>
+      <label class="opt"><input type="radio" name="q-25-1" value="d"> D. Every behavior change must create a new one; reusing an old Note is not allowed</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A/B/D are correct: archived triplets are permanently frozen and not current authority; implemented stays current with the code; cross-links use relative markdown links. C is wrong: implemented forbids spec-speak sections like Proposal/Plan/Acceptance criteria, and the format gate rejects them."
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q2.</span> Which statements about Agent Note rules are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="a"> A. An archived triplet is never edited, translated, moved, or deleted</label>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="b"> B. An implemented Note's facts are updated in the same change as the code (paths, names, structure)</label>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="c"> C. An implemented Note should contain a migration plan and acceptance checklist</label>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="d"> D. Notes cross-link with relative markdown links, never bare numbers</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — architecture governs the source structure we ship; process governs the tools and workflows around the code (gates, the package manager, vendoring)."
+         data-rationale="B is correct; this is the dividing line named in the README. A would be runtime structure. C is testing. D is feature. Also, refactor is deliberately excluded, covered by the simplification criteria."
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q3.</span> A decision about changing the lint gates and package-manager configuration falls under which class?</div>
+      <label class="opt"><input type="radio" name="q-25-3" value="a"> A. architecture</label>
+      <label class="opt"><input type="radio" name="q-25-3" value="b"> B. process</label>
+      <label class="opt"><input type="radio" name="q-25-3" value="c"> C. testing</label>
+      <label class="opt"><input type="radio" name="q-25-3" value="d"> D. feature</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Every Note must have Alternatives considered: a decision without a record of what it defeated invites relitigation."
+         data-rationale="C is correct; this is the failure Agent Notes exist to prevent. A/B/D are not mandatory sections; Testing/Deferred/Related may appear but are not required."
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q4.</span> Which section must every Agent Note carry?</div>
+      <label class="opt"><input type="radio" name="q-25-4" value="a"> A. ## Testing</label>
+      <label class="opt"><input type="radio" name="q-25-4" value="b"> B. ## Related</label>
+      <label class="opt"><input type="radio" name="q-25-4" value="c"> C. ## Alternatives considered</label>
+      <label class="opt"><input type="radio" name="q-25-4" value="d"> D. ## Migration plan</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-5" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, C."
+         data-rationale="A/B/C are correct: the bilingual pair is md + zh.md + i18n.yaml mirroring section by section; dsh-translate-docs runs only on explicit user invocation; website/ owns only configuration and projection, with Markdown staying in its layer. D is wrong: one physical line per paragraph, and verify-md-wrap enforces the soft-wrap habit."
+         data-review="sec-bilingual-docs">
+      <div class="prompt"><span class="qnum">Q5.</span> Which statements about the bilingual documentation system are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="a"> A. The pairing structure is *.md + *.zh.md + *.i18n.yaml</label>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="b"> B. dsh-translate-docs runs only on explicit user invocation</label>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="c"> C. website/ owns only the VitePress configuration and publishing manifest; Markdown stays in its owning layer</label>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="d"> D. Paragraphs may wrap arbitrarily; the gate only checks spelling</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Narrative war stories belong only to postmortem/; ordinary documents state current mechanisms, and history goes into Notes or postmortems."
+         data-rationale="B is correct; this is the hierarchy tax's one-home principle. A's decision rationale belongs to Agent Notes. C's type definitions belong to subsystems. D's step-by-step how-tos belong to cookbook/."
+         data-review="sec-bilingual-docs">
+      <div class="prompt"><span class="qnum">Q6.</span> One home per fact: which layer owns the narrative telling of an incident retrospective?</div>
+      <label class="opt"><input type="radio" name="q-25-6" value="a"> A. The root AGENTS.md</label>
+      <label class="opt"><input type="radio" name="q-25-6" value="b"> B. postmortem/ (the only layer allowed narrative war stories)</label>
+      <label class="opt"><input type="radio" name="q-25-6" value="c"> C. subsystems/</label>
+      <label class="opt"><input type="radio" name="q-25-6" value="d"> D. cookbook/</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-7" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A/C/D are all verbatim PR rules. B is wrong: history rewrites use only --force-with-lease and abort on remote movement — never raw --force."
+         data-review="sec-pr-rules">
+      <div class="prompt"><span class="qnum">Q7.</span> Which statements about PRs and stacks are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="a"> A. One PR carries exactly one kind/* label, all material area/*, and the native Issue Type</label>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="b"> B. When rewriting stacked history you can just --force</label>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="c"> C. Split independent changes; fix a bug in the PR that introduced it first</label>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="d"> D. Validate immediately after gh stack sync; do not merge before checks pass</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A — CONTRIBUTING.md says plainly that external PRs are not accepted right now; participation is via Discussions, blog posts, and the dsh-plugin ecosystem."
+         data-rationale="A is correct, and the repository explicitly says official packages are not inherently more important than community ones. B/C/D contradict CONTRIBUTING.md."
+         data-review="sec-pr-rules">
+      <div class="prompt"><span class="qnum">Q8.</span> What does the current CONTRIBUTING.md say about external contributions?</div>
+      <label class="opt"><input type="radio" name="q-25-8" value="a"> A. No external PRs for now; participate through Discussions, content creation, and plugins tagged with the dsh-plugin topic</label>
+      <label class="opt"><input type="radio" name="q-25-8" value="b"> B. Direct PRs are welcome with no extra requirements</label>
+      <label class="opt"><input type="radio" name="q-25-8" value="c"> C. Only core-algorithm PRs are accepted</label>
+      <label class="opt"><input type="radio" name="q-25-8" value="d"> D. External contributions can only come through the Python SDK</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-9" data-type="mcq" data-correct='["d"]'
+         data-answer="D — The persistence format belongs to SessionEventMap and SESSION_FORMAT_VERSION's structural-change rules."
+         data-rationale="D is correct (Chapter 4). A is the UI surface. B is human commands. C is browser slots. Table-lookup skill is exactly getting this row right."
+         data-review="sec-book-map">
+      <div class="prompt"><span class="qnum">Q9.</span> Table lookup: you want to change the session's persistence format. Where is the entry point?</div>
+      <label class="opt"><input type="radio" name="q-25-9" value="a"> A. ui-slots</label>
+      <label class="opt"><input type="radio" name="q-25-9" value="b"> B. ctx.commands</label>
+      <label class="opt"><input type="radio" name="q-25-9" value="c"> C. conversation.chat.node renderers</label>
+      <label class="opt"><input type="radio" name="q-25-9" value="d"> D. SessionEventMap / SESSION_FORMAT_VERSION</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The browser UI's extension surface is ui-slots (packages/client/ui-slots); business rows go through ConversationNodeDefinition."
+         data-rationale="B is correct. A is the protocol gateway. C is LLM vendor integration. D is the tool registry."
+         data-review="sec-book-map">
+      <div class="prompt"><span class="qnum">Q10.</span> Table lookup: you want to add a new UI region to the Web client. What do you look at first?</div>
+      <label class="opt"><input type="radio" name="q-25-10" value="a"> A. The Typert type graph</label>
+      <label class="opt"><input type="radio" name="q-25-10" value="b"> B. ui-slots (packages/client/ui-slots)</label>
+      <label class="opt"><input type="radio" name="q-25-10" value="c"> C. LlmAdapter</label>
+      <label class="opt"><input type="radio" name="q-25-10" value="d"> D. ctx.tools.register</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-11" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B, C, D."
+         data-rationale="B/C/D are all graduation-route steps. A is wrong in changing the loop first thing — Chapters 7 and 23 stress plugins, not loop changes, with new behavior on extension points; the first graduation step is reading architecture.md."
+         data-review="sec-graduation">
+      <div class="prompt"><span class="qnum">Q11.</span> Which steps does the graduation route include? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="a"> A. Change agent-loop directly to implement a new feature</label>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="b"> B. Read docs/architecture.md and docs/capability-seams.md end to end</label>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="c"> C. Read packages/core/agent-loop/src/agent.ts in full</label>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="d"> D. Run pnpm run test:snapshot once, then submit the first PR</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-12" data-type="short"
+         data-key-points='["Behavior-type changes go on documented extension points (events, registries), not into the loop","Data/model-visible changes take a new session event, guaranteeing reconstruction from the log","Swappable-implementation changes go through a provider seam (all three roles present)","Closing obligations: pick checks by evidence surface, add a keyless snapshot in the same PR, carry an Agent Note for non-trivial changes"]'
+         data-answer="First locate with the mnemonic: behavior goes to extension points, data goes to event streams, implementations go to provider seams — failing to find an entry point usually means reading the wrong layer, so return to docs/architecture.md and find the fact's home. After the change, pick the minimal check set by evidence surface, add a keyless snapshot in the same PR for model/user-visible changes, and carry an Agent Note for non-trivial changes."
+         data-rationale="Being able to recite the mnemonic plus the closing obligations means the navigation map has grown into you."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> In your own words: when you take on a new requirement, how do you use this book's navigation method to locate the entry point and finish up?</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check only the points you actually covered — under-checking distorts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">End of book. Return to the <a href="index.html"><strong>table of contents</strong></a>, or go read docs/architecture.md in the repository and start your first real change.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 23 · Quality Gates and Repository Conventions — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 23 · Quality Gates</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/23-gates-and-conventions.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="23">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 23 · Part V · Engineering and Contribution</div>
+    <h1>Quality Gates and Repository Conventions</h1>
+    <p class="lede">
+      What keeps the plugins of dozens of packages from fighting in an everything-is-a-plugin
+      repository? The answer has two layers: one is executable <strong>gates</strong> — the
+      dozens of verification commands scheduled by run-gates.ts plus the lefthook hooks; the
+      other is the hard <strong>conventions</strong> written in AGENTS.md — each one answering
+      why writing it this way keeps the code from rotting. This chapter spreads both layers out:
+      first the command map and the local philosophy of choosing checks by evidence surface, then
+      the twenty conventions one by one. By the end you will have internalized standards for
+      judging whether a given approach is acceptable in this repository.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Reproduce the common command map from memory: clean / test / test:coverage / test:e2e / test:snapshot[:record] / typecheck / lint / duplication / build / hygiene / doc-sync / website:build, and <code>dsh --profile headless</code>.</li>
+      <li>Pick the minimal check set for a change by evidence surface → check, rather than defaulting to the full suite.</li>
+      <li>State what each of the three lefthook hooks checks, what they deliberately do not, and run-gates.ts's CI lane division.</li>
+      <li>Recite AGENTS.md's twenty hard conventions item by item and give the why for each.</li>
+      <li>Distinguish <code>test</code> from <code>test:coverage</code>: only the latter is the CI coverage gate.</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-commands">23.1 The command map</h2>
+
+  <p>
+    The Commands section of AGENTS.md is the single authoritative entry point for commands;
+    package.json owns the script list and scripts/run-gates.ts owns the gate aggregation. The
+    commands you use day to day:
+  </p>
+
+  <table>
+    <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>pnpm install</code></td><td>pnpm workspaces install (Node ^22.19 || &gt;=24); also configures the worktree-local lefthook hooks and the translation-pairing merge driver.</td></tr>
+      <tr><td><code>pnpm run clean</code></td><td>Removes build outputs and safe residue from deleted packages.</td></tr>
+      <tr><td><code>pnpm run test</code></td><td>The vitest unit channel (the unit lane of Section 22.1).</td></tr>
+      <tr><td><code>pnpm run test:coverage</code></td><td><strong>The CI coverage gate</strong>: per-file 100% on <code>packages/*/*/src</code>.</td></tr>
+      <tr><td><code>pnpm run test:e2e</code></td><td>The real-API channel; self-skips without <code>DEEPSEEK_API_KEY</code>.</td></tr>
+      <tr><td><code>pnpm run test:snapshot</code> / <code>:record</code></td><td>Keyless snapshot comparison / keyed re-recording of golden fixtures (Section 22.4); filter snapshots with <code>-t &lt;name&gt;</code>.</td></tr>
+      <tr><td><code>pnpm run typecheck</code></td><td>Completes the Host lib stage first (including Typert contract generation), then runs the Client TypeScript check.</td></tr>
+      <tr><td><code>pnpm run lint</code></td><td>Oxlint; likewise builds the Host lib first so lint contracts are ready.</td></tr>
+      <tr><td><code>pnpm run duplication</code></td><td>jscpd cross-file TypeScript clone detection.</td></tr>
+      <tr><td><code>pnpm run build</code></td><td>tsc emits <code>lib/types</code>; tsdown bundles the runtime (Host face → Client face → Web).</td></tr>
+      <tr><td><code>pnpm run hygiene</code></td><td>knip + publint + workspace constraints + the NodeNext consumer check, plus rescope, license, package-invariant, cordis-config, runtime-closure, vendored-link, and other verifications.</td></tr>
+      <tr><td><code>pnpm run check:windows-wine</code></td><td>Run locally <strong>only</strong> when diagnosing a known Windows failure (needs wine); CI owns this signal.</td></tr>
+      <tr><td><code>pnpm run doc-sync</code></td><td>All documentation gates; the leaf list lives in scripts/run-gates.ts (catalogs, budgets, links, translation pairing, Agent Note classification, and more).</td></tr>
+      <tr><td><code>pnpm run website:build</code></td><td>VitePress build, doubling as a dead-link check.</td></tr>
+      <tr><td><code>pnpm dsh --profile headless "task"</code></td><td>Runs one real task from source (needs <code>DEEPSEEK_API_KEY</code>).</td></tr>
+    </tbody>
+  </table>
+
+  <p class="small">
+    There is also <code>pnpm run check:all</code>: an optional full local gate aggregation,
+    independent of the Git hooks and not an agent instruction. The demo family
+    (<code>demo:cordis</code>, <code>demo:acp</code>) all need a key.
+  </p>
+
+  <h2 id="sec-evidence">23.2 The local checking philosophy: choose checks by evidence surface</h2>
+
+  <p>
+    The repository's attitude toward local checks is one sentence: <strong>match the evidence
+    surface, never default to the full suite</strong>. The Run relevant checks locally section of
+    AGENTS.md lists five mappings — behavior changes get focused tests; model or user output gets
+    snapshots; docs get <code>doc-sync</code>; published paths get build/hygiene plus
+    built-artifact smokes; provider behavior gets e2e. Re-running an already-green check for a
+    commit or push is considered a mistake, not prudence. Exhaustive coverage and the platform
+    matrix (Node 22.19 / 24 / 26, Linux / Windows) are CI's job; only three situations justify
+    rehearsing the full suite locally: an explicit request, CI diagnosis, or an irreducibly
+    repository-wide change.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Decision tree from evidence surface to checks">
+      <rect x="8" y="16" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="98" y="40" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">What did this PR change?</text>
+      <text x="98" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Ask the evidence surface first, then pick the command</text>
+
+      <line x1="188" y1="44" x2="240" y2="44" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="240" y1="44" x2="240" y2="392" style="stroke:var(--muted)" stroke-width="2"/>
+
+      <line x1="240" y1="60" x2="284" y2="60" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="36" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="296" y="55" style="fill:var(--fg)" font-size="12">In-package behavior (logic, event ordering)</text>
+      <text x="296" y="73" style="fill:var(--accent)" font-size="12" font-family="monospace">→ focused tests vitest -t / single file</text>
+
+      <line x1="240" y1="132" x2="284" y2="132" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="108" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="296" y="127" style="fill:var(--fg)" font-size="12">Model- or product-user-visible output</text>
+      <text x="296" y="145" style="fill:var(--accent-2)" font-size="12" font-family="monospace">→ add a keyless snapshot in the same PR</text>
+
+      <line x1="240" y1="204" x2="284" y2="204" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="180" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="296" y="199" style="fill:var(--fg)" font-size="12">Docs / README / JSDoc</text>
+      <text x="296" y="217" style="fill:var(--accent)" font-size="12" font-family="monospace">→ pnpm run doc-sync</text>
+
+      <line x1="240" y1="276" x2="284" y2="276" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="252" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="296" y="271" style="fill:var(--fg)" font-size="12">Published paths (bin / lib / exports)</text>
+      <text x="296" y="289" style="fill:var(--accent)" font-size="12" font-family="monospace">→ build + hygiene + built smoke</text>
+
+      <line x1="240" y1="348" x2="284" y2="348" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="324" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1"/>
+      <text x="296" y="343" style="fill:var(--fg)" font-size="12">Real provider behavior</text>
+      <text x="296" y="361" style="fill:var(--warn)" font-size="12" font-family="monospace">→ test:e2e (key required)</text>
+
+      <rect x="540" y="36" width="232" height="336" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="656" y="64" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">The shared base</text>
+      <text x="556" y="92" style="fill:var(--fg)" font-size="12">• Run dsh-pre-push-checks before pushing;</text>
+      <text x="556" y="116" style="fill:var(--fg)" font-size="12">  the skill picks the minimal check set</text>
+      <text x="556" y="148" style="fill:var(--fg)" font-size="12">• Non-trivial changes carry an Agent Note</text>
+      <text x="556" y="172" style="fill:var(--fg)" font-size="12">  in the same PR</text>
+      <text x="556" y="204" style="fill:var(--fg)" font-size="12">• The coverage gate is test:coverage,</text>
+      <text x="556" y="228" style="fill:var(--fg)" font-size="12">  not test</text>
+      <text x="556" y="260" style="fill:var(--fg)" font-size="12">• Validate immediately after gh stack sync;</text>
+      <text x="556" y="284" style="fill:var(--fg)" font-size="12">  do not merge before checks pass</text>
+      <text x="556" y="316" style="fill:var(--fg-dim)" font-size="12">Never: re-run already-green checks</text>
+      <text x="556" y="340" style="fill:var(--fg-dim)" font-size="12">for a commit/push, or default to the full suite</text>
+      <text x="556" y="372" style="fill:var(--fg-dim)" font-size="12">CI owns exhaustive coverage and the platform matrix</text>
+
+      <rect x="8" y="392" width="764" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="390" y="411" text-anchor="middle" style="fill:var(--fg-dim)" font-size="12">Sandbox-failure exception: when gh/pnpm/build/test fail because of the agent sandbox (credentials, network, IPC, nested sandbox-exec), first retry the command unchanged with the narrowest host escalation, then diagnose a project failure</text>
+    </svg>
+    <figcaption>The evidence surface → check decision tree for a PR. The left asks what changed; the right holds the five mappings; the shared base (minimal check set, Agent Note, coverage-gate ownership) applies to every branch.</figcaption>
+  </figure>
+
+  <h2 id="sec-gates">23.3 The gate family: run-gates, CI lanes, and Git hooks</h2>
+
+  <p>
+    <code>scripts/run-gates.ts</code> is the gate scheduler: it organizes dozens of gates as a
+    directed dependency graph, runs processes under bounded concurrency, and aggregates
+    diagnostics. Its Mode list is exactly the CI lane division — <code>ci-primary</code>
+    (<code>ci-linux-primary</code> additionally adds web browser snapshots),
+    <code>ci-static</code>, <code>ci-coverage</code>, <code>ci-snapshot</code>,
+    <code>ci-artifacts</code>, <code>ci-consumers</code>, three Windows lanes (blocking /
+    complete / observational), <code>node-compat</code>, plus the optional local
+    <code>check-all</code> and the documentation aggregate <code>doc-sync</code>. Within a lane,
+    artifact consumers wait on one build of the same lane instead of each building their own.
+  </p>
+
+  <p>
+    The leaf list of <code>doc-sync</code> gives you a feel for how many executable assertions
+    this repository turns documentation correctness into: cordis/client/tool/config/persistence
+    catalog regeneration and comparison, export JSDoc verification, the documentation graph,
+    scoped events, Markdown wrapping and links, public-repository links, doc references, package
+    paths, config-source ownership, the README model-experience and limitations sections, Agent
+    Note classification/format/freeze checks, type-equiv (types quoted in docs match the source
+    verbatim), translation prompts and pairing, documentation budgets, and the VitePress site
+    build. Change any one of them and a gate goes red.
+  </p>
+
+  <p>
+    On the Git side, lefthook provides three quick checkpoints. <code>pre-commit</code>: validates
+    staged translation-pairing records, lints staged files with the project-agnostic
+    <code>.oxlintrc.staged.json</code> profile and applies Oxlint fixes with one bounded retry,
+    regenerates <code>THIRD_PARTY_NOTICES.md</code> when input files change, checks the staged
+    diff for whitespace errors (<code>git diff --cached --check</code> — this is the enforcer of
+    exactly one trailing newline per file), and runs the vendor manifest guard.
+    <code>pre-merge-commit</code>: runs the same pairing checks. <code>pre-push</code>: runs
+    <code>pnpm run typecheck</code>. Note that the hooks <strong>deliberately do not run</strong>
+    tests, snapshots, documentation checks, builds, or hygiene — those belong to contributors
+    choosing by evidence surface, and to CI for exhaustiveness.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">The retry rule for host sandbox failures</div>
+    <p>
+      When a required <code>gh</code>, <code>pnpm</code>, build, test, or generator command fails
+      because the agent sandbox blocks credentials, network, IPC, file watching, or nested
+      <code>sandbox-exec</code>, first retry the command <strong>unchanged</strong> with the
+      narrowest host escalation, then diagnose an authentication or project failure. Demand
+      sandbox evidence; never bypass a genuine test failure or the product sandbox under test.
+    </p>
+  </div>
+
+  <h2 id="sec-contracts-runtime">23.4 Runtime contracts: five conventions about Cordis and events</h2>
+
+  <p><strong>1) Registrations are effects.</strong> Every contribution goes through <code>ctx.effect()</code> / <code>ctx.on()</code>, and a registry's <code>register()</code> returns the disposer. Why: Cordis fiber lifecycles are the basis of plugin unload/HMR, and any registration that bypasses effects is a leak that cannot be unloaded; the HMR-safety tests of Chapter 3 verify exactly this convention.</p>
+
+  <p><strong>2) Runtime invariants assert owned relationships.</strong> Check authoritative event streams or mutable data, not service or method presence, plugin metadata, effects, or fixed pure examples. Why: the service is still there does not prove the relationship still holds — a presence check goes green on an implementation that registered but never writes the log. When there is no plausible relationship to assert, an explained empty companion is the correct answer; do not fabricate evidence just to have an assertion.</p>
+
+  <p><strong>3) Typed events use declaration merging.</strong> Event interfaces extend merge-extensible maps via declaration merging; event JSDoc needs <code>@mode</code>, payloads need <code>@param</code>, and scoped keys absent from payloads must be marked <code>@dshScopeScan unsupported</code>. <code>SessionEventMap</code> members are required-on-read by default: a build that does not know the event's type refuses the log unless the event carries <code>ignorable: true</code>; only structural format changes bump <code>SESSION_FORMAT_VERSION</code>. Why: this is the type-level insurance that the log can rebuild the runtime; between silently dropping unknown events and refusing to load, the repository chose refusing.</p>
+
+  <p><strong>4) Switch on discriminant tags.</strong> Closed unions end in <code>assertNever</code>; merge-extensible unions fall through a documented default. Why: discriminant tags let the compiler enforce exhaustiveness — add a member to a closed union and every switch that forgot a case immediately goes red; omitting <code>assertNever</code> dismantles that insurance.</p>
+
+  <p><strong>5) Waterfall listeners MUST call <code>next()</code>.</strong> Returning without calling <code>next()</code> short-circuits the whole chain. Why: waterfall semantics are delegation layer by layer (like chained approval of permissions); a listener that forgets to delegate silently hides every downstream listener — the hardest-to-debug kind of suddenly everything is denied.</p>
+
+  <h2 id="sec-contracts-visible">23.5 Model visibility and extension points: three structural conventions</h2>
+
+  <p><strong>6) Model-visible ⟺ logged.</strong> Anything that reaches a model request must be reconstructable from the session log; a new model-visible input requires a new session event. Why: the session log is the single source of truth for replay, auditing, and snapshot golden fixtures (Chapter 4); from <code>llm-replay</code> to ACP snapshots, the entire testing system stands on this equivalence. Content smuggled into a request while bypassing the log vanishes on replay and drifts the snapshots.</p>
+
+  <p><strong>7) Plugins, not loop changes.</strong> New behavior lands on documented extension points; changing the <code>agent-loop</code> itself requires updating docs/architecture.md in step. Why: the loop is the scheduling core shared by all plugins, and stuffing private logic directly into it plants a mine for everyone; extension points are the contract that keeps plugins from stepping on each other.</p>
+
+  <p><strong>8) A capability seam comprises all three roles.</strong> A capability surface consists of the Service Definition / Service Provider / Consumer roles; it is a seam only when complete, and splits only when the roles genuinely evolve at different tempos. Why: a capability missing its Provider cannot swap implementations, one missing its Consumer has no user, and one missing its Definition leaves both ends with their own understanding of the protocol — the three roles are the minimal complete set behind Chapter 11's replaceability.</p>
+
+  <h2 id="sec-contracts-boundary">23.6 Package boundaries and configuration: six engineering conventions</h2>
+
+  <p><strong>9) Prefer maintained dependencies over hand-rolling.</strong> Use a dependency when it genuinely deletes owned code and tests — this carries a policy note (<code>.agents/notes/implemented/process/2026-07-26-dependencies-over-hand-rolling.md</code>). Why: the intuition that writing it ourselves is faster usually ignores the long-term bill of maintenance and tests; but conversely, pulling in a dependency to save three lines is also a loss, so the criterion is genuinely deleting owned code and tests.</p>
+
+  <p><strong>10) Explicit over implicit at package boundaries.</strong> Defaulting is an explicit <code>resolve(request): Spec</code> step in the owning implementation, never a hidden <code>?? default</code> inside <code>run()</code> — the <code>dsh-shell</code> request/spec split is the template. Why: a default hidden in the execution path is invisible to both review and configuration surfaces, and policy drifts silently; an explicit resolve makes who owns the default answerable in one place.</p>
+
+  <p><strong>11) No hardcoded tunables in plugins.</strong> Deployment-varying options are validated <code>Config</code> fields changeable from cordis.yml; a <code>DEFAULT_*</code> constant or test hook is not configurability. Protocol constants, external specs, and security invariants stay fixed. Why: a hardcoded timeout is an outage in some other deployment; and a security invariant made configurable is no longer an invariant.</p>
+
+  <p><strong>12) Misconfiguration fails loud.</strong> Fail at load when self-contained, otherwise at the earliest resolvable point; never silently skip a missing referent. Why: silently skipping defers the error to the most expensive moment of runtime while disguised as normal; fail loud makes bad configuration explode at <code>--dump-config</code> or startup.</p>
+
+  <p><strong>15) The source plane and the artifact plane never mix.</strong> Static gates and tests resolve workspace imports to <code>src</code> through tsconfig <code>paths</code> and pass on a clean tree; gates that consume the built <code>lib/</code> declare that dependency explicitly. Why: mixing installs a second module singleton and lets stale artifacts seep into source verification, at which point neither side can trust what it proves (Section 22.7).</p>
+
+  <p><strong>16) One aggregate compiler face per package.</strong> The sole exception is <code>api/remotes</code> (Host and Client tsconfigs, split because the Host Typert graph and the Client <code>/remote</code> declarations depend on each other in that order). Repo-wide programs seed from <code>tsconfig.host.json</code> or <code>tsconfig.client.json</code>, never the root solution. Why: the two sides declaration-merge different <code>Context</code>s under the same keys, and crushing them into one <code>ts.Program</code> collides in merge conflicts — the compilation-side reflection of the two-aggregate architecture (Chapter 3).</p>
+
+  <h2 id="sec-constraints-discipline">23.7 Type and code discipline: six small hard rules</h2>
+
+  <p><strong>13) Opaque cross-boundary ids are branded.</strong> <code>Branded&lt;B&gt;</code> (from <code>dsh-brand</code>), never a bare <code>string</code>. Why: session ids, turn ids, and goal ids are all strings at runtime, but passing them interchangeably is a real bug class; branded types move that error from runtime to compile time with zero runtime overhead.</p>
+
+  <p><strong>14) Trust TypeScript at typed same-process boundaries.</strong> Do not add runtime validation, fallback behavior, or hostile-input tests for values the static interface already requires; validation happens only at parser/config, queued, model/tool JSON, durable/file, worker, process, and wire boundaries. Why: writing defensive code for what types already guarantee amounts to declaring your own type system untrustworthy — such code cannot be meaningfully triggered by tests and only rots. The boundary list is exactly where distrust begins.</p>
+
+  <p><strong>17) An empty <code>catch</code> names what it swallows and why nothing else can reach it; the <code>try</code> wraps one statement.</strong> Why: an empty catch is a fossil of something once went wrong here and someone smothered it — left unexplained, the next reader cannot tell whether it swallowed an expected branch or a new failure; narrowing <code>try</code> to a single statement leaves what was swallowed no syntactic place to hide.</p>
+
+  <p><strong>18) Keep parallel values symmetric.</strong> Unexplained asymmetry usually signals a missed extraction. Why: when paired values (two providers, two directions, request and response) go asymmetric, it is either a bug or an undocumented design decision; the convention forces the choice: restore symmetry or write the reason down.</p>
+
+  <p><strong>19) Tests describe behavior, not correctness.</strong> When behavior becomes obsolete, change it together with its tests and explain why in the PR. Why: treating tests as correctness headstones locks implementation improvements behind stale assertions; a test's lifetime should equal the lifetime of the behavior it describes.</p>
+
+  <p><strong>20) TODO markers by urgency: <code>FIXME</code> (should block a new release) &lt; <code>TODO</code> (fix soon) &lt; <code>XXX</code> (maybe someday). Files end with exactly one trailing newline</strong>, gated by <code>git diff --cached
+  --check</code> in pre-commit. Why: someone scanning the code must tell release-blocking from someday-maybe at a glance; and the newline convention gives diffs and tooling a definite end of file.</p>
+
+  <div class="box key">
+    <div class="box-title">Reading the twenty conventions as one sentence</div>
+    <p>
+      Cordis layer: registrations are revocable, invariants assert relationships, events are
+      mergeable, unions are exhaustible, waterfalls must delegate. Visibility layer:
+      model-visible means logged, behavior goes on extension points rather than the loop, seams
+      have all three roles. Boundary layer: dependencies first but judge by deletion, defaults
+      resolve explicitly, tunables live in Config, configuration fails loud, source and artifact
+      planes stay separate, one aggregate face per package. Discipline layer: ids are branded,
+      same-process trusts TS, empty catches account for themselves, parallel values stay
+      symmetric, tests change with behavior, TODOs are graded, files end with one trailing
+      newline.
+    </p>
+  </div>
+
+  <h2 id="sec-recap">23.8 Chapter recap</h2>
+  <ul>
+    <li>The command map is in place: clean / test / test:coverage / test:e2e / test:snapshot[:record] / typecheck / lint / duplication / build / hygiene / doc-sync / website:build / <code>dsh --profile headless</code>.</li>
+    <li>Local philosophy: pick the minimal check set by evidence surface (behavior → focused tests, model/user output → snapshots, docs → doc-sync, published paths → build+hygiene+smoke, provider → e2e); CI owns exhaustive coverage and the platform matrix; the coverage gate is test:coverage.</li>
+    <li>run-gates.ts's Mode list is the CI lanes; doc-sync turns documentation correctness into dozens of executable assertions; the three lefthook hooks (pre-commit whitespace/staged lint/vendor guard, pre-merge-commit pairing, pre-push typecheck) deliberately run no tests.</li>
+    <li>Runtime contracts: registrations are effects, invariants assert owned relationships, typed events use declaration merging + required-on-read + the <code>ignorable: true</code> exception, switch + assertNever, waterfalls must call <code>next()</code>.</li>
+    <li>Structural contracts: model-visible ⟺ logged, plugins not loop changes, seams complete with all three roles.</li>
+    <li>Boundaries and discipline: explicit <code>resolve(request): Spec</code>, tunables in Config, fail loud, branded ids, same-process trusts TS, source/artifact plane separation, one aggregate face, empty catches account for themselves, symmetry, tests change with behavior, TODO grading + one trailing newline.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common misconceptions</div>
+    <ul style="margin:0;">
+      <li>Habitually running the full <code>pnpm run test</code> before committing — choose focused checks by evidence surface; re-running green checks is explicitly opposed in this repository.</li>
+      <li>Treating <code>pnpm run test</code> as the coverage gate — the gate is <code>test:coverage</code> (per-file 100%).</li>
+      <li>Filling in request defaults with <code>??</code> inside <code>run()</code> — defaults belong to the owning implementation's explicit <code>resolve(request): Spec</code>.</li>
+      <li>Adding runtime validation to same-process function parameters — trust TS; validation belongs at parser/config, model/tool JSON, durable/file, worker, process, and wire boundaries.</li>
+      <li>A waterfall listener returning right after its own decision — it must call <code>next()</code>, or the whole chain is short-circuited.</li>
+      <li>Writing a default in a closed union's switch instead of ending with <code>assertNever</code> — the compiler can no longer help you.</li>
+      <li>Changing only request assembly for a new model-visible input — without a matching session event it violates model-visible ⟺ logged, and snapshots and replay will drift.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="23">
+    <h2>Chapter 23 Test</h2>
+
+    <div class="q" data-id="23-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — pnpm run doc-sync aggregates all documentation gates (catalogs, budgets, links, translation pairing, Agent Note checks, and more)."
+         data-rationale="B is correct. A is the coverage gate and unrelated to docs. C is a subset of dead-link checking (website:build doubles as one) but covers neither markdown wrap, doc-refs, type-equiv, nor the rest. D confuses the layers: doc-sync's leaf list lives in scripts/run-gates.ts and is executed by that aggregate."
+         data-review="sec-commands">
+      <div class="prompt"><span class="qnum">Q1.</span> You only changed two paragraphs of documentation under docs/. What should you run locally?</div>
+      <label class="opt"><input type="radio" name="q-23-1" value="a"> A. <code>pnpm run test:coverage</code></label>
+      <label class="opt"><input type="radio" name="q-23-1" value="b"> B. <code>pnpm run doc-sync</code></label>
+      <label class="opt"><input type="radio" name="q-23-1" value="c"> C. <code>pnpm run website:build</code> is enough</label>
+      <label class="opt"><input type="radio" name="q-23-1" value="d"> D. Manually run every verify-* in scripts/run-gates.ts one by one</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A/B/D are all mappings from the policy text: model/user output → snapshots (a keyless scenario in the same PR), published paths → build/hygiene plus built-artifact smokes, provider behavior → e2e. C is wrong: the coverage gate is test:coverage, exhaustive coverage belongs to CI, and local runs never default to the full suite."
+         data-review="sec-evidence">
+      <div class="prompt"><span class="qnum">Q2.</span> Which of the evidence-surface-to-check mappings are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="a"> A. Model- or user-visible output → snapshots</label>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="b"> B. Published paths (bin/lib/exports) → build + hygiene + built smokes</label>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="c"> C. Documentation changes → the full pnpm run test suite</label>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="d"> D. provider behavior → e2e (key required)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-3" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B, C, D."
+         data-rationale="B/C/D are the three lefthook hooks' actual division of labor. A is the most important error: the hooks deliberately run no tests, snapshots, documentation checks, builds, or hygiene — those belong to contributors choosing by evidence surface and to CI for exhaustiveness."
+         data-review="sec-gates">
+      <div class="prompt"><span class="qnum">Q3.</span> Which statements about the Git hooks are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="a"> A. pre-commit runs the full test suite</label>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="b"> B. pre-commit guards whitespace and trailing newlines with <code>git diff --cached --check</code></label>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="c"> C. pre-push runs <code>pnpm run typecheck</code></label>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="d"> D. pre-merge-commit does the staged pairing-record check</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Returning without calling next() short-circuits the whole chain; no downstream listener is consulted again."
+         data-rationale="C is correct: waterfall semantics are layer-by-layer delegation. A is wrong (the default is not automatic delegation). B is wrong (this is a correctness contract, not a performance tip). D describes a plain on event, not a waterfall."
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q4.</span> A waterfall listener returns right after its own decision (without calling <code>next()</code>). What is the consequence?</div>
+      <label class="opt"><input type="radio" name="q-23-4" value="a"> A. The chain continues automatically; only this layer's modification is lost</label>
+      <label class="opt"><input type="radio" name="q-23-4" value="b"> B. A warning log fires</label>
+      <label class="opt"><input type="radio" name="q-23-4" value="c"> C. The whole chain is short-circuited and every downstream listener silently stops executing</label>
+      <label class="opt"><input type="radio" name="q-23-4" value="d"> D. It is equivalent to calling next(null)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — A new session event is mandatory: anything that reaches a model request must be reconstructable from the session log."
+         data-rationale="B is correct; this is the model-visible ⟺ logged equivalence. A, changing only request assembly, drifts replay and snapshots. C mistakes a structural change for the default path — only structural changes bump SESSION_FORMAT_VERSION, and a new event type's behavior for older readers under required-on-read is decided by ignorable: true. D is unrelated to event flow."
+         data-review="sec-contracts-visible">
+      <div class="prompt"><span class="qnum">Q5.</span> You want to add a new kind of visible input to model requests (say, a new context injection). What must you do at the same time, by convention?</div>
+      <label class="opt"><input type="radio" name="q-23-5" value="a"> A. Change only the request assembly code and leave the log unchanged</label>
+      <label class="opt"><input type="radio" name="q-23-5" value="b"> B. Add a session event that records it, guaranteeing the request is reconstructable from the log</label>
+      <label class="opt"><input type="radio" name="q-23-5" value="c"> C. bump SESSION_FORMAT_VERSION</label>
+      <label class="opt"><input type="radio" name="q-23-5" value="d"> D. Add a switch in cordis.yml</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Assert owned relationships such as authoritative event streams or mutable data; with no plausible relationship, an explained empty companion is correct."
+         data-rationale="D is correct. A/B/C all check presence, metadata, or fixed examples — an implementation that registered but never writes the log still passes them. Runtime invariants must assert relationships (for example, after the event the log holds the corresponding record)."
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q6.</span> What does runtime invariants assert owned relationships mean?</div>
+      <label class="opt"><input type="radio" name="q-23-6" value="a"> A. Assert that the service exists on the context</label>
+      <label class="opt"><input type="radio" name="q-23-6" value="b"> B. Assert that plugin metadata is correct</label>
+      <label class="opt"><input type="radio" name="q-23-6" value="c"> C. Assert that a method exists and is callable once</label>
+      <label class="opt"><input type="radio" name="q-23-6" value="d"> D. Assert the relationship reflected by authoritative event streams or mutable data; when nothing is assertable, an explained empty companion is the correct answer</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A — required-on-read: a build that does not know the event's type refuses the log unless the event carries ignorable: true."
+         data-rationale="A is correct. B is silent dropping, which the repository explicitly rejects. C is backwards: only structural format changes bump SESSION_FORMAT_VERSION; adding an ignorable event does not. D is not a mechanism that exists."
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q7.</span> What does <code>SessionEventMap</code>'s required-on-read default mean?</div>
+      <label class="opt"><input type="radio" name="q-23-7" value="a"> A. A build that does not know the event's type refuses the log, unless the event carries <code>ignorable: true</code></label>
+      <label class="opt"><input type="radio" name="q-23-7" value="b"> B. Unknown events are silently dropped with a warning</label>
+      <label class="opt"><input type="radio" name="q-23-7" value="c"> C. Every new event type must bump <code>SESSION_FORMAT_VERSION</code></label>
+      <label class="opt"><input type="radio" name="q-23-7" value="d"> D. Events must implement an ignore() method</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Defaulting is an explicit resolve(request): Spec step in the owning implementation; the dsh-shell request/spec split is the template."
+         data-rationale="C is correct. A/B hide defaults in the execution path, invisible to both review and configuration surfaces. D is unrelated to default ownership."
+         data-review="sec-contracts-boundary">
+      <div class="prompt"><span class="qnum">Q8.</span> What does explicit over implicit at package boundaries require of default values?</div>
+      <label class="opt"><input type="radio" name="q-23-8" value="a"> A. Fill in defaults in place with <code>?? default</code> inside run()</label>
+      <label class="opt"><input type="radio" name="q-23-8" value="b"> B. Define DEFAULT_* constants and export them at the entry</label>
+      <label class="opt"><input type="radio" name="q-23-8" value="c"> C. Defaulting is an explicit <code>resolve(request): Spec</code> step in the owning implementation (dsh-shell is the template)</label>
+      <label class="opt"><input type="radio" name="q-23-8" value="d"> D. Each caller decides its own defaults</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — parser/config, queued, model/tool JSON, durable/file, worker, process, and wire boundaries."
+         data-rationale="C is correct; this is the complete list of where distrust begins. A/B/D all cover same-process values the static interface already requires, and adding runtime validation there amounts to declaring the type system untrustworthy."
+         data-review="sec-constraints-discipline">
+      <div class="prompt"><span class="qnum">Q9.</span> Trust TypeScript at typed same-process boundaries: where should runtime validation live?</div>
+      <label class="opt"><input type="radio" name="q-23-9" value="a"> A. At the entry of every exported function</label>
+      <label class="opt"><input type="radio" name="q-23-9" value="b"> B. At call sites between two modules in the same package</label>
+      <label class="opt"><input type="radio" name="q-23-9" value="c"> C. At parser/config, queued, model/tool JSON, durable/file, worker, process, and wire boundaries</label>
+      <label class="opt"><input type="radio" name="q-23-9" value="d"> D. Only in hostile-input test cases</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-10" data-type="fill" data-accepted='["assertnever"]'
+         data-answer="assertNever."
+         data-rationale="A closed union's switch ends with assertNever so the compiler enforces exhaustiveness; a merge-extensible union instead falls through a documented default."
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q10.</span> Fill in the blank: a closed union's switch must end with <code>______</code>, handing exhaustiveness to the compiler.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — An empty catch must name what it swallowed and why nothing else can reach it, and the try wraps one statement."
+         data-rationale="B is correct: an empty catch is a fossil of a smothered error, and left unexplained nobody can tell whether it swallowed an expected branch or a new failure. A/C widen or preserve the vagueness; D is not a rule."
+         data-review="sec-constraints-discipline">
+      <div class="prompt"><span class="qnum">Q11.</span> When you write a <code>catch</code> that swallows an exception, what does the repository convention require?</div>
+      <label class="opt"><input type="radio" name="q-23-11" value="a"> A. Adding one console.warn line is enough</label>
+      <label class="opt"><input type="radio" name="q-23-11" value="b"> B. Name what was swallowed and why nothing else can reach it; the try wraps one statement</label>
+      <label class="opt"><input type="radio" name="q-23-11" value="c"> C. Just change the catch to re-throw</label>
+      <label class="opt"><input type="radio" name="q-23-11" value="d"> D. Adding a TODO inside the catch counts as compliant</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-12" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Static gates and tests resolve to src through tsconfig paths; gates consuming lib/ declare the dependency explicitly."
+         data-rationale="B is correct: mixing lets stale artifacts install a second module singleton and seep into source verification. A describes exactly the forbidden mixing. C is backwards — built artifacts are consumed only where explicitly declared. D is a different convention (compiler face); do not conflate them."
+         data-review="sec-contracts-boundary">
+      <div class="prompt"><span class="qnum">Q12.</span> The source plane and the artifact plane never mix — what does that mean concretely?</div>
+      <label class="opt"><input type="radio" name="q-23-12" value="a"> A. Tests may freely choose resolution targets between src and lib</label>
+      <label class="opt"><input type="radio" name="q-23-12" value="b"> B. Static gates and tests resolve to src through tsconfig paths and pass on a clean tree; gates consuming the built lib/ declare that dependency explicitly</label>
+      <label class="opt"><input type="radio" name="q-23-12" value="c"> C. Every check must build first</label>
+      <label class="opt"><input type="radio" name="q-23-12" value="d"> D. Each package may expose only one compiler face</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-13" data-type="mcq" data-correct='["d"]'
+         data-answer="D — FIXME should block a new release, TODO means fix soon, XXX means maybe someday."
+         data-rationale="D is correct. A/B/C all fail the urgency-graded definitions (FIXME highest, XXX lowest with no commitment)."
+         data-review="sec-constraints-discipline">
+      <div class="prompt"><span class="qnum">Q13.</span> What are the three TODO markers' urgency ordering and meanings?</div>
+      <label class="opt"><input type="radio" name="q-23-13" value="a"> A. XXX is most urgent, FIXME least</label>
+      <label class="opt"><input type="radio" name="q-23-13" value="b"> B. TODO means release-blocking</label>
+      <label class="opt"><input type="radio" name="q-23-13" value="c"> C. All three are equivalent, just stylistic differences</label>
+      <label class="opt"><input type="radio" name="q-23-13" value="d"> D. FIXME should block a new release, TODO means fix soon, XXX means maybe someday with no commitment</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-14" data-type="short"
+         data-key-points='["The loop is the scheduling core shared by all plugins; changing it directly plants a mine for everyone","New behavior should land on documented extension points","Changing agent-loop requires updating docs/architecture.md in step","Extension points are the contract that keeps plugins from stepping on each other"]'
+         data-answer="Because the agent-loop is the scheduling core shared by all plugins, any private change affects every plugin; new behavior should go on documented extension points, and if the loop itself must change, docs/architecture.md must be updated in the same change."
+         data-rationale="Covering the three points — shared core, extension-point contract, architecture-doc update when the loop changes — meets the bar."
+         data-review="sec-contracts-visible">
+      <div class="prompt"><span class="qnum">Q14.</span> In your own words: why is plugins, not loop changes a convention, and where should new behavior go?</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check only the points you actually covered — under-checking distorts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="24-extension-practice.html"><strong>Chapter 24 · Extension Practice: Writing a Plugin from the Cookbook</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

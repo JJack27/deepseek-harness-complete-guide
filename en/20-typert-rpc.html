@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 20 · Typert and the RPC Gateway — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 20 · Typert and RPC</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/20-typert-rpc.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="20">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 20 · Part IV · Product Front Ends and Protocols</div>
+    <h1>Typert and the RPC Gateway</h1>
+    <p class="lede">
+      The previous chapter left a thread hanging: there is an <code>/api</code> channel between
+      the browser and the host. This chapter takes it apart: how does browser↔host RPC achieve
+      end-to-end type safety? The answer is called <strong>Typert</strong> — at build time it
+      generates a “type graph” from types, and at runtime a registry consumes it. Above that, the
+      gateway claims the new-style Remote endpoints, apiproxy carries the legacy surface, and two
+      downstream-only WebSockets carry events. By the end you will know every hop of a method
+      call from the browser to a <code>ctx</code> service.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State the division of labor of the Typert trio: generator (build time) → loader (discovery) → registry (<code>ctx.typert</code>).</li>
+      <li>Describe how a call on <code>/api</code> is claimed by the interceptor or falls back to apiproxy.</li>
+      <li>Explain which policy remotes' <code>createApiRemoteAgentResolver</code> unifies.</li>
+      <li>Draw the full channel picture: POST for unary/respond, the <code>events.mux</code> and <code>events.host</code> downstream pair, and the readiness rule.</li>
+      <li>Explain why the <code>/api</code> browser-trust fence fixates on the Host header (DNS-rebinding protection).</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-problem">20.1 The problem: end-to-end type-safe RPC</h2>
+
+  <p>
+    Web UI RPC has a structural difficulty: the caller lives in the browser (TypeScript, the
+    Client compilation face), the callee lives in Node (TypeScript, the Host compilation face),
+    and between them sits HTTP and JSON. The usual approaches are either handwriting two
+    interfaces and praying they do not drift, or adopting codegen to generate a whole client.
+    dsh's answer is <strong>Typert</strong>: a build-time tool generates a compiler-independent
+    type graph (<code>FaceModel</code>, <code>TypeGraph</code>) from the
+    <strong>source type tree</strong>, and the runtime consumes it as a registry — the calling
+    face the browser side gets (<code>ctx.remote</code>) and the calling face the Node side
+    exposes (<code>ctx.typertGateway</code>) share the same generated
+    <code>InvocationDescriptor</code> contract.
+  </p>
+
+  <p>
+    The design also preserves the boundary discipline that Chapter 23 will unfold: business
+    packages mark methods with <code>@Remote</code> or <code>@RemoteScope</code> on their Host
+    service classes and need no RPC runtime dependency; the generated declaration exposes
+    <code>TYPERT</code> as <code>unknown</code>, so contributing business packages need not
+    depend on the type registry itself.
+  </p>
+
+  <h2 id="sec-typert-pipeline">20.2 The Typert trio: generator → loader → registry</h2>
+
+  <p>
+    The three packages under <code>packages/typert/</code> layer as analysis / discovery /
+    storage:
+  </p>
+
+  <table>
+    <thead><tr><th>Package</th><th>Role</th><th>Cordis key</th></tr></thead>
+    <tbody>
+      <tr><td><code>typert/generator</code></td><td>Build-time library: analyzes a TypeScript project and generates runtime artifacts</td><td>— (no plugin)</td></tr>
+      <tr><td><code>typert/loader</code></td><td>Scans Loader entries, imports and registers the generated Host artifacts</td><td>consumes <code>ctx.loader</code> and <code>ctx.typert</code></td></tr>
+      <tr><td><code>typert/registry</code></td><td>Runtime registry: package reflection and optional live Zod schemas</td><td><code>ctx.typert</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>generator</strong> analyzes the source with a standalone <code>ts.Program</code>
+    (seeded from <code>tsconfig.host.json</code> or <code>tsconfig.client.json</code>), produces
+    a compiler-independent model, and an emitter then renders the artifacts. The repository's
+    Host tsdown runs once carrying the workspace Typert generation: it produces the Host
+    reflection artifact (<code>lib/typert.host.{js,d.ts}</code>, exposed through the
+    <code>package/typert</code> subpath) plus the <code>typert.remote-client.*</code> projection
+    for the Client; the Client tsdown afterwards never starts Typert again. Publishing is
+    <strong>opt-in per package</strong>: a business package without the corresponding public
+    exports needs no Typert artifacts at all. In <code>check</code> mode the analyzer fails on
+    syntax/semantic diagnostics, missing public annotations, and private cross-package
+    references — the type graph is not allowed to quietly miss a piece.
+  </p>
+
+  <p>
+    <strong>loader</strong> is a Node-only plugin: at activation it scans existing Loader
+    entries, follows <code>internal/plugin</code> lifecycle notifications, resolves each entry
+    package's <code>package.json</code>, and when it exports <code>./typert</code> imports and
+    validates the <code>TYPERT</code> manifest and registers the contributions into the
+    registry. Packages without that export are simply skipped; nested plugins hiding behind
+    another Loader entry must be listed explicitly via the <code>packages</code> config.
+    Resolutions and manifests are cached for the process lifetime — a newly added export
+    requires a restart.
+  </p>
+
+  <p>
+    <strong>registry</strong> provides <code>ctx.typert</code>: package reflection is stored
+    under <code>&lt;package&gt;#&lt;face&gt;</code> keys and schemas under
+    <code>&lt;package&gt;#&lt;name&gt;</code> keys (the producer's Zod instance is retained;
+    JSON Schema is projected on demand at the consumer). It also has two separate ownership
+    faces: <code>lookups</code> (business packages register lookup declarations and default
+    resolvers, and Host assemblies override behavior with <code>configure()</code> — swapping
+    the Agent/Session resolution policy of Section 20.4 happens exactly here) and
+    <code>contexts</code> (Context identity for scoped calls). Registration is an effect:
+    contributions are withdrawn together with the calling side's Cordis fiber.
+  </p>
+
+  <h2 id="sec-gateway">20.3 gateway and apiproxy: claim and fallback</h2>
+
+  <p>
+    <code>packages/api/gateway</code> (<code>@deepseek-ai/dsh-api-gateway</code>) is a
+    two-faced plugin: the Host entry provides <code>ctx.typertGateway</code>, and the Client
+    entry (<code>@deepseek-ai/dsh-api-gateway/client</code>) provides <code>ctx.remote</code>.
+    Business services extend <code>TypertRemoteService</code> and mark public methods with
+    <code>@Remote</code> or <code>@RemoteScope</code>; the Host-side call flow is: resolve the
+    current descriptor and Cordis Service → validate <strong>exact named parameters</strong> →
+    resolve object or Context identity via <code>lookups</code> → invoke the business method →
+    validate the return value.
+  </p>
+
+  <p>
+    Two validation modes must be kept apart. <strong>strict mode</strong> reads the generated
+    call descriptors from <code>ctx.typert.local</code> and validates both parameters and return
+    values exactly against the generated codecs; <strong>SRC mode</strong> is a development
+    fallback reserved for endpoints that never had a strict definition — it parses only simple
+    parameter names and, for non-lookup parameters, only checks JSON safety. The key red line:
+    <strong>withdrawing strict validation from an endpoint whose strict definition has already
+    been observed fails outright</strong> rather than silently degrading to SRC — validation
+    strength may only tighten.
+  </p>
+
+  <p>
+    On the Client side, <code>ctx.remote.$mount()</code> validates and registers a generated
+    Host-for-Client contribution, installing concrete methods for the caller's fiber (each
+    namespace is a tracked <code>remote.&lt;ns&gt;</code> sub-Service). A call validates
+    positional parameters, constructs the exact named <code>args</code> the descriptor requires,
+    and goes out via <code>ctx.connection.rpc.call('/api', endpoint, …)</code>; return values
+    pass validation before entering application code. The event face is
+    <code>ctx.remote.$on()</code>: the legal keys are exactly the forwarding selection the Host
+    assembly makes (Section 20.4), and the listener types are the owning package's own Cordis
+    <code>Events</code> declarations — a second signature has nowhere to drift to.
+  </p>
+
+  <p>
+    So what about the <strong>legacy surface</strong>? A composite handler hangs on the Host's
+    <code>/api</code> FetchHandler: the gateway-registered interceptor <strong>claims
+    first</strong>, and what goes unclaimed falls to <code>apiproxy</code>
+    (<code>ctx.apiProxy</code>, <code>@deepseek-ai/dsh-host-apiproxy</code>) — a
+    transport-agnostic gateway holding the four-quadrant wire contracts
+    (<code>ClientRequest</code>/<code>ServerResponse</code>/<code>ServerRequest</code>/
+    <code>ClientResponse</code>) and the large legacy method families
+    (<code>session.*</code>, <code>workspace.*</code>, <code>settings.*</code>…). It registers
+    no routes itself: the HTTP carrier (Chapter 19's connection) is responsible for handing
+    requests over. Migration proceeds method by method: methods moved to Remote are handled by
+    the gateway, unmigrated ones keep going through apiproxy, and both sides share the same
+    Agent/Session resolution policy — exactly the reason remotes exists.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The path of one browser call">
+      <rect x="10" y="30" width="170" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="55" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Browser caller</text>
+      <text x="95" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ctx.remote.goal.…(args)</text>
+      <text x="95" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Constructs exact named args</text>
+
+      <line x1="180" y1="65" x2="220" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="220,65 212,61 212,69" style="fill:var(--muted)"/>
+      <text x="200" y="52" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">HTTP POST</text>
+
+      <rect x="220" y="30" width="180" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="310" y="55" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">/api fence</text>
+      <text x="310" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Host header: loopback or</text>
+      <text x="310" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">trustedHosts (anti DNS-rebinding)</text>
+
+      <line x1="400" y1="65" x2="440" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="440,65 432,61 432,69" style="fill:var(--muted)"/>
+
+      <rect x="440" y="14" width="200" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="540" y="37" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">Claimed? → typertGateway</text>
+      <text x="540" y="54" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ctx.typert.local descriptors · strict validation</text>
+
+      <rect x="440" y="90" width="200" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="2"/>
+      <text x="540" y="112" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">Unclaimed → apiproxy</text>
+      <text x="540" y="129" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Legacy method families (session.* etc.)</text>
+
+      <line x1="640" y1="45" x2="680" y2="45" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="680,45 672,41 672,49" style="fill:var(--muted)"/>
+
+      <rect x="680" y="16" width="210" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="785" y="38" text-anchor="middle" style="fill:var(--accent-2)" font-size="11" font-weight="700">api-remotes (BFF)</text>
+      <text x="785" y="55" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">createApiRemoteAgentResolver:</text>
+      <text x="785" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">agent/session lookup policy</text>
+
+      <line x1="785" y1="74" x2="785" y2="110" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="785,110 781,102 789,102" style="fill:var(--muted)"/>
+
+      <rect x="620" y="110" width="270" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="755" y="133" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">ctx services (business Services)</text>
+      <text x="755" y="150" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Live Agent reuse / cold session resume / subagent ownership fence</text>
+      <text x="755" y="164" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Results validated back to the browser the same way</text>
+
+      <rect x="220" y="230" width="670" height="76" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="555" y="252" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">Both sides share the same generated contract</text>
+      <text x="555" y="270" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">generator (build time: tsconfig.host.json seed → FaceModel/TypeGraph → lib/typert.host.* and typert.remote-client.*)</text>
+      <text x="555" y="286" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">loader (imports ./typert and validates the TYPERT manifest) → registry (ctx.typert: &lt;package&gt;#&lt;face&gt; reflection, &lt;package&gt;#&lt;name&gt; schemas)</text>
+    </svg>
+    <figcaption>The path of one browser call: POST /api first passes the browser-trust fence; endpoints claimed by the interceptor go to typertGateway, unclaimed ones fall to apiproxy; the Agent/Session identity policy is supplied to both gateways uniformly by api-remotes.</figcaption>
+  </figure>
+
+  <h2 id="sec-remotes">20.4 remotes: the Agent/Session lookup policy</h2>
+
+  <p>
+    <code>packages/api/remotes</code> (<code>@deepseek-ai/dsh-api-remotes</code>) is a two-faced
+    BFF. Its core export <code>createApiRemoteAgentResolver()</code> answers “who does this
+    sessionId/agentId refer to” as a single policy: <strong>reuse a live Agent, resume an
+    ordinary cold session, deduplicate concurrent resumes, and preserve the subagent ownership
+    fence</strong>; the same resolver is configured for both the <code>agent</code> and
+    <code>session</code> lookup keys of Typert. After taking Agent defaults and scope assembly,
+    the legacy Web ApiProxy <strong>also</strong> uses this resolver for legacy methods —
+    migrated and unmigrated methods share one identity-policy implementation, which is the key
+    to “swapping the gateway without swapping behavior”.
+  </p>
+
+  <p>
+    Its Client face is the dependency facade for browser business packages: it imports the
+    generated <code>/remote</code> artifact as a runtime value, mounts each contribution via
+    <code>ctx.remote.$mount()</code>, and re-exports the declaration merging; business packages
+    depend on neither the gateway implementation nor any single Remote runtime entry. The
+    current assembly mounts the Goal contribution and a read-only Host plugin-inventory
+    contribution (<code>pluginInventory/list</code>).
+  </p>
+
+  <p>
+    The downstream-event allowlist also lives here: <code>API_REMOTE_FORWARDED_EVENTS</code> in
+    <code>src/remote-events.ts</code> is the list of cordis events the Host forwards to
+    consumers — forwarded verbatim, no projection, no redaction, no renaming — so it is also the
+    legal key set of <code>ctx.remote.$on</code>; the Host face further asserts
+    <code>TypertForwardableEvent</code> against this table: anything not a declared event, bound
+    to an AgentScope, or not one-directional in shape cannot enter the allowlist. Forwarding a
+    new event = adding one entry to the array; the type projection, the consumer key face, and
+    the Host forwarding loop all derive from it.
+  </p>
+
+  <h2 id="sec-channels">20.5 The full channel picture: POST, the downstream pair, and the fence</h2>
+
+  <p>
+    Channels come in three forms. <strong>Upstream goes over HTTP POST</strong>: both unary and
+    respond operations are <code>POST /api/&lt;method&gt;</code>, with respond-style calls
+    (e.g. answering an agent question) using the <code>POST /api/respond</code> receipt. Every
+    POST must declare <code>application/json</code> or it eats a 415 before dispatch —
+    cross-site “simple requests” (the kind the browser sends without preflight) can never
+    execute methods with side effects.
+  </p>
+
+  <p>
+    <strong>Downstream is two downstream-only WebSockets</strong>:
+    <code>/api/events.mux</code> carries session-level mux frames (session events, projection
+    frames, queue and jobs snapshots…), and <code>/api/events.host</code> carries host-level
+    frames (workspace additions and removals, forwarded Remote events…). Both sockets
+    <strong>send only from host to browser</strong>; the client sends no application data on
+    them. Break either one and the current connection generation fails, with both streams
+    rebuilt together; readiness is decided as “both sockets open <em>and</em> the
+    <code>host.describe</code> HTTP call succeeds” — what a successful handshake publishes is
+    exactly the <code>host.describe</code> value. A plain network GET to either path gets a
+    426; there is no SSE fallback in production (the SSE codec serves only in-process carriers).
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The downstream pair and readiness">
+      <rect x="10" y="90" width="180" height="90" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="100" y="122" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">host half</text>
+      <text x="100" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">mux stream fan-out (session-level)</text>
+      <text x="100" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">host stream (workspace, forwarded events)</text>
+
+      <line x1="190" y1="112" x2="560" y2="112" style="stroke:var(--accent-2)" stroke-width="2.5"/>
+      <polygon points="560,112 552,108 552,116" style="fill:var(--accent-2)"/>
+      <text x="375" y="100" text-anchor="middle" style="fill:var(--accent-2)" font-size="10" font-weight="700">WebSocket /api/events.mux (downstream only)</text>
+      <text x="375" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Session events · session/projection · session/queue · session/jobs …</text>
+
+      <line x1="190" y1="170" x2="560" y2="170" style="stroke:var(--accent-2)" stroke-width="2.5"/>
+      <polygon points="560,170 552,166 552,174" style="fill:var(--accent-2)"/>
+      <text x="375" y="194" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">WebSocket /api/events.host (downstream only)</text>
+
+      <rect x="560" y="90" width="180" height="90" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="650" y="118" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">browser half</text>
+      <text x="650" y="138" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">connection's stream loop</text>
+      <text x="650" y="154" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Break one → generation fails</text>
+      <text x="650" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">→ both streams rebuilt</text>
+
+      <rect x="620" y="16" width="270" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="755" y="38" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">readiness = both sockets open + host.describe succeeds</text>
+      <text x="755" y="56" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">the handshake publishes the host.describe value; a plain GET to either path gets 426</text>
+
+      <line x1="650" y1="90" x2="730" y2="72" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4,4"/>
+
+      <rect x="10" y="200" width="880" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="450" y="220" text-anchor="middle" style="fill:var(--warn)" font-size="10" font-weight="700">/api browser-trust fence</text>
+      <text x="450" y="237" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Every request's Host must be a loopback authority or hit trustedHosts; when Origin is present it must equal the Host authority, and an explicit sec-fetch-site: cross-site is refused — Host is the one request header rebinding cannot forge</text>
+    </svg>
+    <figcaption>The downstream pair: the mux and host WebSockets are downstream only, and breaking either rebuilds the whole generation; readiness additionally requires host.describe to succeed. The fence covers all /api requests and WebSocket upgrades.</figcaption>
+  </figure>
+
+  <p>
+    <strong>The fence</strong> is the only gate standing before both WebSocket upgrades and every
+    <code>/api</code> request. Its core comparison is the <strong>Host header</strong>: it must
+    be a loopback authority (or a deployment-derived LAN IP literal), or exactly match a
+    <code>trustedHosts</code> entry (<code>host:port</code> exactly, portless entries any port,
+    both sides compared after WHATWG normalization). Why Host? Because it is the one request
+    header a DNS-rebinding attacker cannot forge: over plain HTTP the browser sends neither
+    <code>Origin</code> nor Fetch-Metadata for image and navigation reads, so an “unmarked”
+    request may still be a rebound browser read; when markers are present, <code>Origin</code>
+    must equal the Host authority and an explicit <code>sec-fetch-site: cross-site</code> is
+    refused outright. Non-canonical entries (something with a path like
+    <code>harness.internal/path</code>) fail loud at plugin load. There is also a set of
+    privileged methods <strong>pinned to loopback</strong> (<code>host.pickDirectory</code>,
+    configuration-surface read/write, the agentPreset read/write family) — a declared
+    <code>trustedHosts</code> authority can reach the other methods but never these; until a
+    real authentication layer exists, these capabilities stay on the local machine. The fence is
+    a reachability policy, <strong>not authentication</strong> — which is also why
+    <code>dsh web --host 0.0.0.0</code> remains deliberately unsupported.
+  </p>
+
+  <h2 id="sec-recap">20.6 Chapter recap</h2>
+  <ul>
+    <li>Typert has three layers: the generator produces artifacts from the type tree at build time (triggered by Host tsdown, opt-in per package), the loader scans Loader entries and imports <code>./typert</code>, and the registry provides <code>ctx.typert</code> (<code>&lt;package&gt;#&lt;face&gt;</code> reflection, <code>&lt;package&gt;#&lt;name&gt;</code> schemas, lookups/contexts).</li>
+    <li>gateway is two-faced: <code>ctx.typertGateway</code> (strict descriptor validation; SRC is only a development fallback, and withdrawing an observed strict definition fails) and <code>ctx.remote</code> ($mount generates methods, $on forwards events).</li>
+    <li>On the <code>/api</code> FetchHandler the interceptor claims Remote endpoints first; unclaimed ones fall to apiproxy's (<code>ctx.apiProxy</code>) legacy method families; both gateways share remotes' <code>createApiRemoteAgentResolver</code> (live Agent reuse, cold-resume dedup, subagent ownership fence).</li>
+    <li>Channels: unary/respond over HTTP POST (application/json required); <code>/api/events.mux</code> and <code>/api/events.host</code> are two downstream-only WebSockets, breaking either rebuilds the whole generation; readiness = both sockets + <code>host.describe</code> succeeding.</li>
+    <li>The fence watches the Host header against DNS-rebinding; <code>trustedHosts</code> declares authorities, privileged methods are pinned to loopback; the fence is a reachability policy, not authentication.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming Typert analyzes types in the browser at runtime — analysis happens at build time (Host tsdown); the browser only consumes the generated codecs and descriptors.</li>
+      <li>Assuming an unclaimed endpoint is a 404 — it falls into apiproxy's legacy surface; apiproxy is the fallback layer, not a ruin.</li>
+      <li>Withdrawing an endpoint's strict definition hoping to fall back to SRC — endpoints whose strict definition has been observed fail outright; validation may only tighten.</li>
+      <li>Assuming the browser sends data back over the two WebSockets — they are downstream only; upstream always goes over HTTP POST.</li>
+      <li>Treating the fence as authentication — it only gates reachability; that is also the root reason <code>--host 0.0.0.0</code> is deliberately refused.</li>
+      <li>Writing an “authority” with a path or zero-padded port into <code>trustedHosts</code> — entries that are not bare host[:port] fail loud at plugin load.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="20">
+    <h2>Chapter 20 Test</h2>
+
+    <div class="q" data-id="20-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The generator analyzes the type tree and produces artifacts at build time; the Host tsdown runs carrying the workspace Typert generation."
+         data-rationale="C is correct. A is wrong — the browser only consumes the generated artifacts. B is wrong — the loader only does discovery and registration. D is wrong — the registry is runtime storage and does no analysis."
+         data-review="sec-typert-pipeline">
+      <div class="prompt"><span class="qnum">Q1.</span> When does Typert's type analysis happen?</div>
+      <label class="opt"><input type="radio" name="q-20-1" value="a"> A. When the browser first loads the page</label>
+      <label class="opt"><input type="radio" name="q-20-1" value="b"> B. When the loader activates and scans entries</label>
+      <label class="opt"><input type="radio" name="q-20-1" value="c"> C. At build time: the generator analyzes seeded from tsconfig.host.json and produces artifacts</label>
+      <label class="opt"><input type="radio" name="q-20-1" value="d"> D. When the ctx.typert registry is first queried</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-2" data-type="fill" data-accepted='["typert","./typert","package/typert"]'
+         data-answer="./typert (the package's typert subpath; the artifact is lib/typert.host.js)."
+         data-rationale="The loader resolves each entry package's package.json and, when it exports ./typert, imports it, validates the TYPERT manifest, and registers; packages without that export are simply skipped."
+         data-review="sec-typert-pipeline">
+      <div class="prompt"><span class="qnum">Q2.</span> Fill in the blank: the typert loader imports only those Loader entry packages whose package.json exports the <code>______</code> subpath.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Package reflection is stored under &lt;package&gt;#&lt;face&gt; keys and schemas under &lt;package&gt;#&lt;name&gt; keys."
+         data-rationale="B is correct: the schema key omits the face because host and client run in different contexts — registering two same-named schemas in one context would be rejected as a duplicate. The key shapes in A/C/D are all wrong."
+         data-review="sec-typert-pipeline">
+      <div class="prompt"><span class="qnum">Q3.</span> Under what keys do package reflection and schemas live in the <code>ctx.typert</code> registry?</div>
+      <label class="opt"><input type="radio" name="q-20-3" value="a"> A. Both under <code>&lt;package&gt;#&lt;face&gt;</code></label>
+      <label class="opt"><input type="radio" name="q-20-3" value="b"> B. Reflection under <code>&lt;package&gt;#&lt;face&gt;</code>, schemas under <code>&lt;package&gt;#&lt;name&gt;</code></label>
+      <label class="opt"><input type="radio" name="q-20-3" value="c"> C. Reflection under <code>&lt;face&gt;#&lt;name&gt;</code>, schemas under <code>&lt;package&gt;#&lt;face&gt;</code></label>
+      <label class="opt"><input type="radio" name="q-20-3" value="d"> D. Both under the bare package name</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A — The gateway-registered interceptor claims Remote endpoints first; the unclaimed go to apiproxy."
+         data-rationale="A is correct: Connection hands the composite FetchHandler to the HTTP bridge; claimed dispatches go to the gateway, unclaimed ones to the API Proxy. B reverses the order. C is wrong — the fallback is a silent layering of responsibilities, not an error. D is wrong — the carrier does dispatch, but the dispatch logic belongs to the composite handler."
+         data-review="sec-gateway">
+      <div class="prompt"><span class="qnum">Q4.</span> After a Remote endpoint's request arrives at <code>/api</code>, how is it routed?</div>
+      <label class="opt"><input type="radio" name="q-20-4" value="a"> A. The registered Typert interceptor claims first; the unclaimed fall to apiproxy</label>
+      <label class="opt"><input type="radio" name="q-20-4" value="b"> B. apiproxy handles it first and forwards the unknown ones to typertGateway</label>
+      <label class="opt"><input type="radio" name="q-20-4" value="c"> C. Unclaimed endpoints return 404</label>
+      <label class="opt"><input type="radio" name="q-20-4" value="d"> D. The webserver dispatches by hardcoded URL prefix</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — strict reads the generated descriptors from ctx.typert.local for exact validation; SRC is a development fallback for endpoints that never had a strict definition, parsing only simple parameter names and checking JSON safety; withdrawing an observed strict definition fails outright."
+         data-rationale="D is correct. A is wrong — SRC is the fallback, not the main path. B is wrong — this red line is precisely what keeps validation from quietly weakening. C is wrong — both modes are host-face behavior of the gateway."
+         data-review="sec-gateway">
+      <div class="prompt"><span class="qnum">Q5.</span> What is the relationship between strict mode and SRC mode?</div>
+      <label class="opt"><input type="radio" name="q-20-5" value="a"> A. SRC is the production recommendation; strict is development-only</label>
+      <label class="opt"><input type="radio" name="q-20-5" value="b"> B. An endpoint can go strict then SRC, downgrading freely</label>
+      <label class="opt"><input type="radio" name="q-20-5" value="c"> C. Both modes execute on the browser side</label>
+      <label class="opt"><input type="radio" name="q-20-5" value="d"> D. strict validates exactly with generated descriptors; SRC covers only endpoints that never had a strict definition, and withdrawing the definition of an endpoint observed under strict fails</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, and C."
+         data-rationale="A/B/C are three of the resolver's four jobs (the fourth is deduplicating concurrent resumes). D is wrong: the subagent ownership fence is precisely preserved, not bypassed."
+         data-review="sec-remotes">
+      <div class="prompt"><span class="qnum">Q6.</span> Which behaviors does <code>createApiRemoteAgentResolver()</code> own? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="a"> A. Reusing a live Agent</label>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="b"> B. Resuming an ordinary cold session</label>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="c"> C. Deduplicating concurrent resumes</label>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="d"> D. Bypassing the subagent ownership fence to simplify routing</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A/B/D are correct. C is wrong: the client sends no application data on the downstream sockets — upstream goes over HTTP POST; breaking either socket fails the current generation and rebuilds both streams."
+         data-review="sec-channels">
+      <div class="prompt"><span class="qnum">Q7.</span> Which statements about the channels are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="a"> A. Unary and respond operations both go over HTTP POST</label>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="b"> B. Readiness requires both downstream sockets open and a successful <code>host.describe</code> HTTP call</label>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="c"> C. The browser sends acknowledgment frames back over /api/events.mux</label>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="d"> D. A plain GET to events.mux/events.host returns 426, with no SSE fallback in production</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Over plain HTTP the browser sends neither Origin nor Fetch-Metadata for image/navigation reads, so an unmarked request may still be a rebound read; Host is the one request header rebinding cannot forge."
+         data-rationale="B is correct. A is wrong — the Host header is client-controllable, but a rebinding attacker cannot make the browser carry the correct value for him. C is wrong — the fence also compares Origin when present. D is wrong — performance has nothing to do with it."
+         data-review="sec-channels">
+      <div class="prompt"><span class="qnum">Q8.</span> Why does the fence make the Host header its core comparison?</div>
+      <label class="opt"><input type="radio" name="q-20-8" value="a"> A. Because the Host header cannot be forged by the client</label>
+      <label class="opt"><input type="radio" name="q-20-8" value="b"> B. Because unmarked browser reads (image/navigation) carry neither Origin nor Fetch-Metadata, and Host is the one request header DNS-rebinding cannot forge</label>
+      <label class="opt"><input type="radio" name="q-20-8" value="c"> C. Because the browser never sends the Origin header</label>
+      <label class="opt"><input type="radio" name="q-20-8" value="d"> D. Because the Host comparison is cheapest</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — API_REMOTE_FORWARDED_EVENTS is the forwarding allowlist: the Host forwards verbatim (no projection, no redaction, no renaming), and it is also exactly the legal key set of ctx.remote.$on."
+         data-rationale="C is correct: the key face, type projection, and Host forwarding loop all derive from that one array. A is wrong — the Host face also asserts TypertForwardableEvent (rejecting AgentScope-bound and non-one-directional events). B is wrong — verbatim forwarding is precisely the design. D is wrong — event forwarding has nothing to do with the ready state."
+         data-review="sec-remotes">
+      <div class="prompt"><span class="qnum">Q9.</span> What determines the legal keys of <code>ctx.remote.$on()</code>?</div>
+      <label class="opt"><input type="radio" name="q-20-9" value="a"> A. The browser runtime introspecting Host events</label>
+      <label class="opt"><input type="radio" name="q-20-9" value="b"> B. Any cordis event name, since everything is forwarded verbatim anyway</label>
+      <label class="opt"><input type="radio" name="q-20-9" value="c"> C. remotes' API_REMOTE_FORWARDED_EVENTS allowlist, asserted through TypertForwardableEvent before the Host forwards</label>
+      <label class="opt"><input type="radio" name="q-20-9" value="d"> D. Negotiated by connection's readiness handshake</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The privileged method set (host.pickDirectory, the configuration surface, agentPreset read/write, etc.) is pinned to loopback: a trustedHosts authority can reach the other methods but never these."
+         data-rationale="B is correct: until a real authentication layer exists, these capabilities stay on the local machine. A/C are wrong — the fence is a reachability policy, not authentication, and it covers reads too. D is wrong — the webserver has no special-casing for /api; the fence lives in the connection layer."
+         data-review="sec-channels">
+      <div class="prompt"><span class="qnum">Q10.</span> In a LAN deployment with <code>trustedHosts</code> declared, which class of methods remains out of reach?</div>
+      <label class="opt"><input type="radio" name="q-20-10" value="a"> A. All GET-style methods</label>
+      <label class="opt"><input type="radio" name="q-20-10" value="b"> B. The privileged method set pinned to loopback (directory picking, the configuration surface, agentPreset read/write, etc.)</label>
+      <label class="opt"><input type="radio" name="q-20-10" value="c"> C. All of them — the fence is an authentication layer</label>
+      <label class="opt"><input type="radio" name="q-20-10" value="d"> D. None; trustedHosts equals administrator authorization</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-11" data-type="short"
+         data-key-points='["The client constructs exact named args via ctx.remote generated methods and sends POST /api through ctx.connection.rpc.call","The fence first validates Host: loopback or trustedHosts, with optional Origin/sec-fetch-site checks","The composite FetchHandler dispatches: endpoints claimed by the interceptor go to typertGateway, the rest fall to apiproxy","typertGateway resolves the call with ctx.typert.local descriptors and resolves agent/session identity via lookups (remotes resolver)","After the business Service method runs, results are validated and returned the same way; downstream changes are pushed over the mux/host WebSockets"]'
+         data-answer="A browser plugin calls a generated method on ctx.remote: positional parameters are validated and assembled into the descriptor's exact named args, then sent as POST /api via ctx.connection.rpc. The request first passes the browser-trust fence (Host is loopback or hits trustedHosts), then goes to the composite FetchHandler: endpoints claimed by the Typert interceptor enter typertGateway, which validates parameters against the ctx.typert.local descriptors and resolves the sessionId — via lookups (supplied by api-remotes' resolver) — into a live Agent or a resumed cold session, then invokes the business Service method and validates the return value; unclaimed endpoints fall to apiproxy's legacy method families, but the identity policy is the same one. Subsequent session changes are pushed back to the browser over the two downstream-only WebSockets, events.mux/events.host."
+         data-rationale="All five hops are there: construct args → fence → claimed dispatch → identity lookup → invoke and return, plus the downstream push."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> Walk through every hop, from initiating a Remote method call in the browser to receiving the result.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a key point you actually covered — under-checking hurts your calibration; over-checking just fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="21-acp-sdk-python.html"><strong>Chapter 21 · ACP, SDK, and Python</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

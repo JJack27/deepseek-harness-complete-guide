@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 1 · What Is dsh: Product and Repository Landscape — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 1 · Landscape</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/01-dsh-overview.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="1">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 1 · Part I · Landscape and Mental Models</div>
+    <h1>What Is dsh: Product and Repository Landscape</h1>
+    <p class="lede">
+      Before you write a single line of dsh-related code, build two maps: a layered map of how a
+      model that can only talk becomes an assistant that gets work done, and a physical map of
+      where the code lives in the repository. This chapter gives you both; every later chapter
+      zooms into a region of one of them.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State the responsibility boundary of each of the four layers: LLM, agent harness, frontend UI, operating system</li>
+      <li>Identify which layer decides whether a shell command may run, and why</li>
+      <li>List dsh's four product forms (Web, headless, ACP, JSON-RPC SDK) and who each serves</li>
+      <li>Locate things by directory in the repository: where the bash tool lives, what the core spine is, what sits in vendor/</li>
+      <li>Avoid treating developer-preview interfaces as stable contracts</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-llm-agent">1.1 How a model that can only talk becomes an assistant that gets work done</h2>
+
+  <p>
+    Start with the starting point. When you call DeepSeek's model API directly, what do you get?
+    You send over a sequence of messages and it returns a sequence of text — more precisely, it
+    generates text one token at a time. That is all. It has no hands: it cannot start a process,
+    read or write your files, or fetch a page from the web. And every call is independent: once
+    this conversation ends, it remembers nothing the next time.
+  </p>
+
+  <p>
+    An <strong>LLM agent</strong> is exactly the project of turning such a talking-only brain into
+    an assistant that gets work done. The formula:
+  </p>
+
+  <p><strong>agent = model + tool-calling loop</strong></p>
+
+  <p>
+    The loop looks roughly like this: the model reads the current conversation and says 「please
+    run the bash command <code>ls -la</code> for me」; a program outside the model <strong>actually
+    executes</strong> the command and inserts the output back into the conversation; the model
+    reads the output and decides the next step; repeat until the model considers the task done.
+    Note the division of labor: the model only <strong>decides</strong> what to do; the program
+    outside is what acts. That outside program is the <strong>agent harness</strong>.
+    DeepSeek Harness (command name <code>dsh</code>) is such a harness.
+  </p>
+
+  <p>Break the loop open and the harness is responsible for far more than 「executing commands」:</p>
+
+  <ul>
+    <li><strong>Loop driving</strong> — when to call the model again, whether more tools need to run, when the task counts as done;</li>
+    <li><strong>Tool execution and guards</strong> — actually run commands, but with guardrails such as timeouts, sandboxing, and output truncation;</li>
+    <li><strong>Permission</strong> — when a command touches a dangerous operation: allow, deny, or ask the user first;</li>
+    <li><strong>Session persistence</strong> — record everything that happened as a log, so the scene can be restored after a process restart;</li>
+    <li><strong>Prompt assembly</strong> — assemble the system prompt, tool list, and conversation history into each model request;</li>
+    <li><strong>Multi-surface UI</strong> — the same loop serves the browser, the terminal, and automation protocols.</li>
+  </ul>
+
+  <p>
+    This list is a preview of the whole book's table of contents: dsh implements each item as a
+    set of replaceable plugins. The rest of the book walks into them one by one.
+  </p>
+
+  <h2 id="sec-layers">1.2 The four layers: who owns what</h2>
+
+  <p>
+    Draw the journey of one 「you ask the agent to run the tests」 request as a picture and you
+    get four layers. Top down: you type in the <strong>frontend UI</strong>; the
+    <strong>agent harness (dsh)</strong> organizes everything; its two downward arms reach the
+    <strong>LLM API</strong> for the model's next decision and the <strong>operating system</strong>
+    to actually execute processes and read or write files.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Agent four-layer responsibility diagram">
+      <rect x="120" y="16" width="440" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="2"/>
+      <text x="340" y="40" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">Frontend UI (browser Web UI / terminal)</text>
+      <text x="340" y="60" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Renders only: chat bubbles, tool cards — makes no decisions</text>
+
+      <line x1="340" y1="74" x2="340" y2="130" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="340,130 335,121 345,121" style="fill:var(--muted)"/>
+      <line x1="352" y1="130" x2="352" y2="74" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="352,74 347,83 357,83" style="fill:var(--muted)"/>
+      <text x="380" y="106" style="fill:var(--fg-dim)" font-size="11">User input ↓ / session events ↑</text>
+
+      <rect x="120" y="132" width="440" height="96" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="3"/>
+      <text x="340" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="15" font-weight="700">agent harness (dsh)</text>
+      <text x="340" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Loop driving · tool execution &amp; guards · permission · session persistence · prompt assembly</text>
+      <text x="340" y="198" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Whether a shell command may run is decided at this layer</text>
+      <rect x="150" y="206" width="120" height="16" rx="4" style="fill:var(--accent);fill-opacity:0.18"/>
+      <text x="210" y="218" text-anchor="middle" style="fill:var(--accent)" font-size="10" font-weight="700">The decision point is here</text>
+
+      <line x1="220" y1="228" x2="220" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="220,300 215,291 225,291" style="fill:var(--muted)"/>
+      <line x1="232" y1="300" x2="232" y2="228" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="232,228 227,237 237,237" style="fill:var(--muted)"/>
+      <text x="150" y="270" style="fill:var(--fg-dim)" font-size="11">Model requests ↓ / token stream ↑</text>
+
+      <line x1="470" y1="228" x2="470" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="470,300 465,291 475,291" style="fill:var(--muted)"/>
+      <text x="430" y="270" style="fill:var(--fg-dim)" font-size="11">Executes processes behind a sandbox · reads/writes files · network</text>
+
+      <rect x="120" y="302" width="200" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="2"/>
+      <text x="220" y="326" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">LLM API (DeepSeek etc.)</text>
+      <text x="220" y="346" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Only generates the next token</text>
+
+      <rect x="360" y="302" width="200" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="2"/>
+      <text x="460" y="326" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">Operating system</text>
+      <text x="460" y="346" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Processes · files · network</text>
+
+      <text x="340" y="400" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">The model can only 「request」 a command run; whether to allow it, how to guard it, and how its result is logged are all the harness's responsibility</text>
+    </svg>
+    <figcaption>The four layers of an agent. Whether a shell command may run is decided at the agent harness (dsh) layer — not by the model and not by the UI.</figcaption>
+  </figure>
+
+  <p>Three sentences to remember, one per layer, and no dsh code will lose you later:</p>
+
+  <ul>
+    <li>The <strong>LLM API layer</strong> does not know tools, sessions, or permission exist. It takes messages and emits tokens. All you can do at this layer is swap models and tune parameters.</li>
+    <li>The <strong>agent harness layer</strong> (dsh) is this book's protagonist. The tool execution pipeline, permission, logging, and prompt assembly all live here.</li>
+    <li>The <strong>frontend UI layer</strong> consumes the session state the harness projects and paints it as an interface. Replacing the UI does not affect decision logic; conversely, the UI never makes security decisions on the harness's behalf.</li>
+  </ul>
+
+  <p>The operating system layer holds no mystery: the harness uses it through subprocesses and filesystem calls, with a sandbox and policy in between (Chapter 12 covers this in detail).</p>
+
+  <div class="demo" data-demo="layerMapper">
+    <div class="demo-title">Try it — which layer owns this?</div>
+    <p>Pick a responsibility and see which layer it falls under:</p>
+    <label><input type="radio" name="d1" value="a"> Generate the next token</label>
+    <label><input type="radio" name="d1" value="b"> Decide whether a shell command may run</label>
+    <label><input type="radio" name="d1" value="c"> Render the conversation as chat bubbles</label>
+    <label><input type="radio" name="d1" value="d"> Write session events to disk</label>
+    <div class="demo-output empty">Pick one to try.</div>
+  </div>
+
+  <h2 id="sec-product-forms">1.3 dsh's product forms: one skeleton, four shells</h2>
+
+  <p>
+    dsh is not a single program but different outlets of the same plugin tree. The four forms you
+    meet first:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Form</th><th>Command / entry</th><th>Who it's for</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Web app</td>
+        <td><code>npx @deepseek-ai/dsh web</code></td>
+        <td>People. Starts at <code>http://127.0.0.1:3080</code> by default; you chat in a browser</td>
+      </tr>
+      <tr>
+        <td>One-shot task</td>
+        <td><code>dsh --profile headless "task"</code></td>
+        <td>Scripts / CI. Runs one fresh session, prints the final answer, exits — no server at any point</td>
+      </tr>
+      <tr>
+        <td>ACP server</td>
+        <td><code>packages/acp/</code></td>
+        <td>Automation clients (editors and the like). Speaks only Agent Client Protocol; no human-facing interface</td>
+      </tr>
+      <tr>
+        <td>JSON-RPC SDK</td>
+        <td><code>packages/sdk/</code> (TS) + <code>python/</code> (Python)</td>
+        <td>Programs that drive dsh as a subprocess. The Python side ships two distributions: <code>deepseek-harness-sdk</code> and <code>deepseek-harness-runtime-bin</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Switching form switches the shell — frontend, entry point, process shape; what stays is the
+    core of the plugin tree underneath (model adapters, tools, persistence). How that tree grows
+    is exactly the subject of Chapter 3 — a thread picked up soon.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">developer preview: breaking changes will come</div>
+    <p>
+      dsh is currently in <strong>developer preview</strong>: it iterates fast, and the project
+      explicitly says there will be compatibility-breaking changes. When reading or writing its
+      code, treat no interface as a permanent contract. The flip side is why the repository can
+      afford aggressive refactoring — the contribution guide states the position: prefer fixing
+      the foundation properly over leaving compatibility shims.
+    </p>
+  </div>
+
+  <h2 id="sec-repo-map">1.4 The repository map</h2>
+
+  <p>
+    After cloning, look at the root first. The most important fact: this is a pnpm monorepo;
+    under <code>packages/</code>, work is divided by <strong>capability</strong> into 49 package
+    groups and 200+ <code>@deepseek-ai/dsh-*</code> packages (the numbers keep growing — remember
+    the principle, grouped by capability with each package small, not the numbers).
+    <strong>Everything is a plugin</strong> — every package is one block on the plugin tree.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Repository root map">
+      <rect x="16" y="16" width="648" height="298" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="40" y="44" style="fill:var(--fg)" font-size="13" font-weight="700">deepseek-harness/ (pnpm monorepo)</text>
+
+      <rect x="40" y="60" width="280" height="150" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2.5"/>
+      <text x="180" y="86" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">packages/</text>
+      <text x="180" y="106" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">49 package groups · 200+ @deepseek-ai/dsh-* packages</text>
+      <text x="180" y="126" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Grouped by capability: shell / fs / web / subagent / session …</text>
+      <text x="180" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">core/ is the spine; the rest are capability plugins</text>
+      <text x="180" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Everything is a plugin</text>
+
+      <rect x="360" y="60" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="430" y="79" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">vendor/</text>
+      <text x="430" y="96" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">The pinned Cordis framework source</text>
+
+      <rect x="520" y="60" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="580" y="79" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">apps/</text>
+      <text x="580" y="96" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">cli + web</text>
+
+      <rect x="40" y="230" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">examples/</text>
+      <text x="110" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Runnable cordis.yml leaves</text>
+
+      <rect x="200" y="230" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="260" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">docs/</text>
+      <text x="260" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Architecture and catalog docs</text>
+
+      <rect x="340" y="230" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="400" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">python/</text>
+      <text x="400" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Python SDK + runtime</text>
+
+      <rect x="480" y="230" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="550" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">native/</text>
+      <text x="550" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Landlock node addon</text>
+
+      <rect x="360" y="120" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="430" y="139" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">scripts/</text>
+      <text x="430" y="156" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Repo gates and generators</text>
+
+      <rect x="520" y="120" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="580" y="139" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">website/</text>
+      <text x="580" y="156" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Documentation site</text>
+    </svg>
+    <figcaption>Repository root map. packages/ takes the center: 49 capability groups, 200+ plugin packages.</figcaption>
+  </figure>
+
+  <p>Each directory's role, one by one:</p>
+
+  <table>
+    <thead>
+      <tr><th>Directory</th><th>What's inside</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>packages/</code></td>
+        <td>All <code>@deepseek-ai/dsh-*</code> workspace packages, grouped by capability: core, api, typert, llm, shell, subprocess, terminal, fs, lsp, skill, web, compaction, context, subagent, bundle, workflow, todo, plan, preset, guard, extensions, hooks, session, session-query, settings, credentials, storage, workspace, sdk, acp, interaction, boot, host, client, examples, test-support, util, attachment, code-runtime, feedback, goal, jobs, mcp, runtime-diagnostics, sandbox, schedule, spill, e2b…</td></tr>
+      <tr><td><code>vendor/</code></td>
+        <td>The vendored Cordis framework source: a pinned upstream copy, rescoped to <code>@deepseek-ai/cordis</code> (Chapter 2's protagonist)</td></tr>
+      <tr><td><code>apps/</code></td>
+        <td><code>cli/</code> (the dsh command itself) and <code>web/</code> (the browser frontend app)</td></tr>
+      <tr><td><code>examples/</code></td>
+        <td>Runnable <code>cordis.yml</code> leaf examples (agent-spine + CLI/ACP/JSON-RPC demos)</td></tr>
+      <tr><td><code>docs/</code></td>
+        <td>Architecture docs (architecture.md, cordis-primer.md), generated catalogs, cookbook</td></tr>
+      <tr><td><code>python/</code></td>
+        <td>The Python SDK and bundled runtime: <code>deepseek-harness-sdk</code> and <code>deepseek-harness-runtime-bin</code></td></tr>
+      <tr><td><code>native/</code></td>
+        <td><code>@deepseek-ai/node-addon-landlock-run</code>: a Node native module for the Linux Landlock sandbox</td></tr>
+      <tr><td><code>scripts/</code></td>
+        <td>Repository quality-gate scripts and generators (the machinery behind <code>pnpm run hygiene</code> and <code>doc-sync</code>)</td></tr>
+      <tr><td><code>website/</code></td>
+        <td>VitePress source for the documentation site</td></tr>
+    </tbody>
+  </table>
+
+  <div class="box key">
+    <div class="box-title">Key insight: grouped by capability</div>
+    <p>
+      <code>packages/</code> is not split into frontend / backend; it is split by
+      <strong>capability</strong>: the shell group owns command execution, fs owns files, web owns
+      search and fetch, subagent owns delegation, session owns persistence, and so on. Each group
+      usually contains finer-grained roles (interface, implementation, model-visible tool) —
+      Chapter 11 covers that in depth. For now remember one thing: to find a feature, first find
+      its capability group.
+    </p>
+  </div>
+
+  <h2 id="sec-finding-bash">1.5 First hands-on lesson: where the bash tool lives</h2>
+
+  <p>
+    Practice with one concrete question: where is the code for the bash tool the model sees and
+    calls? A beginner's instinct is to dig through <code>packages/core/</code> — after all, that
+    is the core. But by the group-by-capability principle, bash belongs to the
+    <strong>shell capability</strong>, so it lives in <code>packages/shell/</code>:
+  </p>
+
+  <pre><code><span class="code-comment"># Layout under packages/shell/ (bash-related parts)</span>
+packages/shell/shell/          <span class="code-comment"># shell capability interface (Service Definition): executor seam</span>
+packages/shell/shell-local/    <span class="code-comment"># local implementation (Provider): actually starts processes on this machine</span>
+packages/shell/tool-bash/      <span class="code-comment"># the model-visible bash tool (Consumer) ← this is what you're looking for</span>
+packages/shell/tool-pwsh/      <span class="code-comment"># the PowerShell twin for Windows</span></code></pre>
+
+  <p>
+    The model-visible tool (<code>tool-bash</code>), the local implementation that executes
+    commands (<code>shell-local</code>), and the interface between them (<code>shell</code>) are
+    three distinct packages. This interface / implementation / consumer trichotomy is one of dsh's
+    core designs; Chapter 11 expands it into the full capability seam model.
+  </p>
+
+  <p>So what is <code>core/</code>? The <strong>spine</strong> — a set of foundation services that every capability hangs from:</p>
+
+  <table>
+    <thead>
+      <tr><th>core package</th><th>What it owns</th><th>Service entry</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>core/session</code></td><td>append-only session event log and in-memory store</td><td><code>ctx.sessions</code></td></tr>
+      <tr><td><code>core/system-prompt</code></td><td>assembly of prompt sections and tool schemas</td><td><code>ctx.systemPrompt</code></td></tr>
+      <tr><td><code>core/tools</code></td><td>scoped tool registry + guarded execution pipeline</td><td><code>ctx.tools</code></td></tr>
+      <tr><td><code>core/agent</code></td><td>Agent interface and live registry, <code>agent/*</code> events</td><td><code>ctx.agents</code></td></tr>
+      <tr><td><code>core/agent-loop</code></td><td>the default driving loop implementing that interface</td><td><code>ctx.agentLoop</code></td></tr>
+      <tr><td><code>core/scope</code></td><td>primitives for scoping registrations per agent</td><td>library, no ctx key</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Note the last column — names like <code>ctx.tools</code> and <code>ctx.sessions</code>. They
+    are the keys plugins use to find one another's services, and they are the protagonists of the
+    next chapter. Even the loop itself (<code>agent-loop</code>) is just one mounted plugin and
+    can be replaced.
+  </p>
+
+  <h2 id="sec-recap">1.6 Chapter recap</h2>
+
+  <ul>
+    <li>A bare LLM API only generates tokens; <strong>agent = model + tool-calling loop</strong>. Loop driving, tool execution and guards, permission, persistence, prompt assembly, and the multi-surface UI are all the harness's work.</li>
+    <li>Four-layer division: LLM API (generation) ↔ agent harness (dsh, decisions and execution) ↔ frontend UI (rendering) ↔ operating system (the actual processes/files/network). 「May this command run」 belongs to the harness.</li>
+    <li>dsh's four forms: Web (<code>npx @deepseek-ai/dsh web</code>, default <code>127.0.0.1:3080</code>), the headless one-shot task, the ACP automation server, and the TS + Python JSON-RPC SDK. Developer preview; there will be breaking changes.</li>
+    <li>The repository is a pnpm monorepo: <code>packages/</code> grouped by capability (49 groups, 200+ packages), <code>vendor/</code> the pinned Cordis, <code>apps/</code> the cli + web, plus <code>python/</code>, <code>native/</code>, <code>examples/</code>, <code>docs/</code>, <code>scripts/</code>, <code>website/</code>.</li>
+    <li>The bash tool lives in <code>packages/shell/tool-bash</code> (its capability group), not in core; core/ is the spine: session, system-prompt, tools, agent, agent-loop, scope.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Believing the model 「executed」 the command — the model only requests execution; the harness both acts and checks.</li>
+      <li>Believing dsh is one big program — it is a plugin tree assembled at startup; Chapter 3 shows the assembly.</li>
+      <li>Looking for the bash tool in <code>packages/core/</code> — core is the spine; concrete capabilities live in their capability groups (<code>packages/shell/</code>).</li>
+      <li>Believing permission decisions happen in the UI layer — the UI only renders; replacing it changes no decision logic.</li>
+      <li>Treating any developer-preview interface as a stable contract — an upgrade can replace it wholesale.</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="1">
+    <h2>Chapter 1 Test</h2>
+
+    <div class="q" data-id="1-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — A bare LLM API only does conditional generation: messages in, tokens out."
+         data-rationale="B is correct — that is the model API's entire job. A and D require local execution and policy judgment, which are the harness's responsibilities; C requires session persistence, while the API itself is stateless and every call is independent."
+         data-review="sec-llm-agent">
+      <div class="prompt"><span class="qnum">Q1.</span> With no harness at all, calling the LLM API directly, what can it do?</div>
+      <label class="opt"><input type="radio" name="q-1-1" value="a"> A. Execute a bash command and return its output</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="b"> B. Generate tokens (text) from the input messages</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="c"> C. Remember what the last conversation said</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="d"> D. Judge whether a command is safe</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Decided at the agent harness (dsh) layer."
+         data-rationale="C is correct: the model can only request execution; allowing, denying, sandboxing, and logging all live in the harness's tool pipeline and permission layer. A is wrong: the model API does not know tools exist. B is wrong: the UI only renders state. D is wrong: the OS passively executes whatever it is called with; policy is not its business."
+         data-review="sec-layers">
+      <div class="prompt"><span class="qnum">Q2.</span> Which of the four layers decides 「may this shell command run」?</div>
+      <label class="opt"><input type="radio" name="q-1-2" value="a"> A. LLM API</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="b"> B. Frontend UI</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="c"> C. agent harness (dsh)</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="d"> D. Operating system</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-3" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, and C."
+         data-rationale="A, B, and C are all harness responsibilities: loop driving, tool execution and guards, session persistence. D is frontend rendering — the UI consumes state projected by the harness and makes no decisions."
+         data-review="sec-llm-agent">
+      <div class="prompt"><span class="qnum">Q3.</span> Which of the following are agent harness responsibilities? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="a"> A. Loop driving: decide when to call the model again and when to stop</label>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="b"> B. Tool execution and guards: permission, timeout, sandbox</label>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="c"> C. Session persistence: write events to disk, recoverable after restart</label>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="d"> D. Render the conversation as chat bubbles</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-4" data-type="fill" data-accepted='["127.0.0.1:3080","http://127.0.0.1:3080"]'
+         data-answer="127.0.0.1:3080 (that is, http://127.0.0.1:3080)."
+         data-rationale="The README is explicit: the Web UI started by npx @deepseek-ai/dsh web serves at http://127.0.0.1:3080 by default. Writing localhost:3080 is semantically equivalent, but the default output prints this literal address."
+         data-review="sec-product-forms">
+      <div class="prompt"><span class="qnum">Q4.</span> Fill in the blank: after <code>npx @deepseek-ai/dsh web</code> starts, the Web UI listens on <code>______</code> by default.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Run one fresh persisted session, print the final answer, then exit; open no listening port."
+         data-rationale="B is correct — that is exactly the headless bundle's design: a one-shot runner with no Host, no HTTP server, no browser plugins. A is web-form behavior; C likewise; D is not a mode that exists."
+         data-review="sec-product-forms">
+      <div class="prompt"><span class="qnum">Q5.</span> What does <code>dsh --profile headless "run the tests"</code> do?</div>
+      <label class="opt"><input type="radio" name="q-1-5" value="a"> A. Start a long-lived web service and wait for tasks</label>
+      <label class="opt"><input type="radio" name="q-1-5" value="b"> B. Run a fresh session, print the final answer, exit — no listening port at any point</label>
+      <label class="opt"><input type="radio" name="q-1-5" value="c"> C. Open a browser interface for a person to chat</label>
+      <label class="opt"><input type="radio" name="q-1-5" value="d"> D. Only typecheck; never actually run</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — packages/shell/tool-bash/."
+         data-rationale="B is correct: the repository groups by capability, and the bash tool is the model-visible Consumer plugin in the shell capability group. A is the tool registry and execution pipeline (the spine), not a specific tool; C is the dsh command launcher; D is a demo bundle."
+         data-review="sec-finding-bash">
+      <div class="prompt"><span class="qnum">Q6.</span> Where in the repository is the code for the model-visible bash tool?</div>
+      <label class="opt"><input type="radio" name="q-1-6" value="a"> A. <code>packages/core/tools/</code></label>
+      <label class="opt"><input type="radio" name="q-1-6" value="b"> B. <code>packages/shell/tool-bash/</code></label>
+      <label class="opt"><input type="radio" name="q-1-6" value="c"> C. <code>apps/cli/</code></label>
+      <label class="opt"><input type="radio" name="q-1-6" value="d"> D. <code>packages/examples/</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A, B, and D are all correct. C gets the grouping dimension wrong: packages/ is grouped by capability (shell, fs, web, subagent…), not by frontend/backend technology layer — exactly the principle to remember when hunting for code."
+         data-review="sec-repo-map">
+      <div class="prompt"><span class="qnum">Q7.</span> Which of the following statements about the repository layout are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="a"> A. <code>vendor/</code> is a pinned copy of the Cordis framework source, rescoped to <code>@deepseek-ai/cordis</code></label>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="b"> B. <code>apps/</code> holds cli (the dsh command itself) and web (the frontend app)</label>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="c"> C. <code>packages/</code> is grouped into frontend / backend technology layers</label>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="d"> D. <code>examples/</code> holds runnable cordis.yml leaf examples</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A — The product API spine: session, system-prompt, tools, agent, agent-loop (plus scope)."
+         data-rationale="A is correct — these are the foundation services every capability hooks into. B is wrong: concrete tool implementations live in capability groups (e.g. packages/shell/tool-bash). C is wrong: the web frontend lives in apps/web and the client group. D is wrong: test infrastructure is the test-support group."
+         data-review="sec-finding-bash">
+      <div class="prompt"><span class="qnum">Q8.</span> What is the role of the <code>packages/core/</code> group?</div>
+      <label class="opt"><input type="radio" name="q-1-8" value="a"> A. The product API spine: session, system-prompt, tools, agent, agent-loop (plus scope)</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="b"> B. Holds the concrete implementations of all model-visible tools</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="c"> C. The web frontend code</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="d"> D. Test support infrastructure</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-9" data-type="fill" data-accepted='["@deepseek-ai/dsh-tool-bash","dsh-tool-bash"]'
+         data-answer="@deepseek-ai/dsh-tool-bash."
+         data-rationale="The package-name rule is @deepseek-ai/dsh-&lt;name&gt;: packages/shell/tool-bash maps to @deepseek-ai/dsh-tool-bash. Writing @deepseek-ai/dsh-bash or dsh-shell is wrong — the latter is the capability interface package."
+         data-review="sec-finding-bash">
+      <div class="prompt"><span class="qnum">Q9.</span> Fill in the blank: the npm package name of the model-visible bash tool plugin is <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — There will be compatibility-breaking changes; do not treat interfaces as long-term stable contracts."
+         data-rationale="B is correct: the README states developer preview and THERE WILL BE COMPATIBILITY-BREAKING CHANGES. A is wrong: it is open and usable; C is wrong: it is in fact iterating fast; D is wrong: docs/ is public."
+         data-review="sec-product-forms">
+      <div class="prompt"><span class="qnum">Q10.</span> dsh is currently in developer preview. What does that mean?</div>
+      <label class="opt"><input type="radio" name="q-1-10" value="a"> A. Internal use only, not open to the public</label>
+      <label class="opt"><input type="radio" name="q-1-10" value="b"> B. There will be compatibility-breaking changes; do not treat interfaces as long-term stable contracts</label>
+      <label class="opt"><input type="radio" name="q-1-10" value="c"> C. Features are frozen; only bug fixes</label>
+      <label class="opt"><input type="radio" name="q-1-10" value="d"> D. The documentation is not public</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-11" data-type="mcq" data-correct='["a"]'
+         data-answer="A — packages/mcp/."
+         data-rationale="A is correct: packages/mcp/ holds bridge plugins such as dsh-mcp-client that register external MCP servers' tools on ctx.tools. B is the language-server capability; C is the web search/fetch capability; D is wrong — vendor/ holds only the Cordis family of framework packages."
+         data-review="sec-repo-map">
+      <div class="prompt"><span class="qnum">Q11.</span> You want to study how dsh integrates external MCP (Model Context Protocol) servers. Which package group do you look in?</div>
+      <label class="opt"><input type="radio" name="q-1-11" value="a"> A. <code>packages/mcp/</code></label>
+      <label class="opt"><input type="radio" name="q-1-11" value="b"> B. <code>packages/lsp/</code></label>
+      <label class="opt"><input type="radio" name="q-1-11" value="c"> C. <code>packages/web/</code></label>
+      <label class="opt"><input type="radio" name="q-1-11" value="d"> D. <code>vendor/mcp/</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-12" data-type="short"
+         data-key-points='["The LLM API only generates tokens and does not know tools, sessions, or permission exist","The agent harness (dsh) owns loop driving, tool execution and guards, permission, persistence, prompt assembly","The frontend UI only renders the session state projected by the harness and makes no decisions","The operating system provides the real processes, files, and network, invoked by the harness through a sandbox","Whether a command is allowed is a local policy decision: the model can only request and the UI only displays, so it belongs to the harness"]'
+         data-answer="Four-layer division: the LLM API takes messages and emits tokens; the agent harness (dsh) organizes the loop, executes and guards tools, owns permission and persistence, assembles the prompt; the frontend UI only renders projected state; the operating system layer provides real processes, files, and network. 「May this command run」 is a local policy decision — the model can only request execution and the UI only displays, and the only position connected both to the model's decisions and to local execution is the harness."
+         data-rationale="Grasp the four verbs — generate / decide and execute / render / be invoked — plus the point that allowing is a local decision, and the layering will never mislead you."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> In your own words, describe the four-layer division and explain why 「can this command run」 belongs to the harness rather than to the model or the UI.</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check the points you actually made — checking fewer hurts your calibration; checking more only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="02-cordis-mind-model.html"><strong>Chapter 2 · The Cordis Mental Model</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 9 · System Prompt Assembly — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 9 · System Prompt Assembly</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/09-system-prompt.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="9">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 9 · Part II · The Core Spine</div>
+    <h1>System Prompt Assembly</h1>
+    <p class="lede">
+      The system block and runtime context the model sees at each step are not a hardcoded
+      string; they are assembled fresh every time: plugins register sections, dynamic contexts,
+      variables, and tool schemas into <code>ctx.systemPrompt</code>, and the agent loop calls
+      assembly after claiming input to obtain this round's complete input. This chapter lays out
+      all the parts of assembly, how scoped registrations produce per-agent personas, and why the
+      model-visible content contributed by the context group's plugins all travels the
+      'reconstructible from the log' path.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Name the four kinds of registrations on <code>ctx.systemPrompt</code>: section, context, variable, tools provider</li>
+      <li>Recite the merge rules of <code>assemble()</code>: scoped shadowing, order sorting, toolOrder validation, the waterfall, complete sections</li>
+      <li>Distinguish the two model-visible channels, 'system section' versus 'runtime context' (the latter lands in the durable log)</li>
+      <li>Implement a per-agent persona by shadowing <code>deployment:persona</code> with a scoped section</li>
+      <li>State what each of the context group's four plugins contributes and with which events it lands in the log</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-registry">9.1 The registry: four kinds of input</h2>
+
+  <p>
+    The <code>SystemPrompt</code> service (<code>ctx.systemPrompt</code>) from
+    <code>packages/core/system-prompt/</code> is a registry of 'ordered prompt inputs'. Exactly
+    four kinds of things can be registered; each returns an effect disposer, and each supports
+    scoped registration (registering via <code>agent.ctx</code> takes effect for that agent
+    only):
+  </p>
+  <table>
+    <thead>
+      <tr><th>API</th><th>What it is</th><th>Which channel it enters</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>section({name, order, text, complete?})</code></td>
+        <td>a piece of the system block; <code>text</code> is a static string or a function evaluated at each assembly; may reference <code>{{variable}}</code></td>
+        <td>the system prompt proper</td>
+      </tr>
+      <tr>
+        <td><code>context({name, order, text})</code></td>
+        <td>dynamic runtime context (facts-of-now such as time, environment, location)</td>
+        <td>runtime-context snapshot → durable user-role message</td>
+      </tr>
+      <tr>
+        <td><code>variable(name, provider)</code></td>
+        <td>an evaluator for a <code>{{name}}</code> variable (e.g. <code>cwd</code>, <code>provider</code>, <code>model</code>)</td>
+        <td>interpolation into section/context text</td>
+      </tr>
+      <tr>
+        <td><code>tools(provider)</code></td>
+        <td>a tool schema provider (Chapter 8's registry hangs here)</td>
+        <td>the request's tools field</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Two built-in sections are worth remembering: <strong>order <code>-100</code></strong> is the
+    harness identity (<code class="small">You are an AI agent powered by DeepSeek Harness.</code>,
+    which can be turned off with the <code>includeHarnessIdentity: false</code> config);
+    <strong>order <code>0</code></strong> is the deployment persona slot
+    <code>deployment:persona</code> (filled from the <code>persona</code> configuration).
+    Conventional numbering bands: the negative range comes before the persona, and tool
+    self-descriptions use 100–199. Additionally <code>suppressRuntimeContext()</code> can turn
+    off all dynamic context contributions within a scope, without touching the services that own
+    those facts.
+  </p>
+
+  <h2 id="sec-assembly">9.2 Assembly: assembled fresh at every step</h2>
+
+  <p>
+    Recall Chapter 7: after <code>preStep()</code> claims input it immediately calls
+    <code class="small">ctx.systemPrompt.assemble({scope, signal})</code>. Assembly happens in a
+    fixed order:
+  </p>
+  <ol>
+    <li>
+      <strong>Merge the scope chain</strong>: variables resolve by 'most specific scope wins';
+      in sections / contexts, scoped same-name entries shadow global entries; tool providers
+      participate both globally and along the chain.
+    </li>
+    <li>
+      <strong>Sort</strong>: sections and contexts each sort by <code>order</code> ascending;
+      tool schemas sort by the <code>toolOrder</code> config (which must contain the
+      <code>&lt;unlisted-tools&gt;</code> placeholder exactly once; without config,
+      lexicographic order); configuring a nonexistent tool name throws at assembly time.
+    </li>
+    <li>
+      <strong>Waterfall</strong>: <code>system-prompt/assemble</code> is an expert waterfall —
+      listeners may rewrite the assembly result wholesale, and the return value is authoritative
+      — with one exception: sections marked <code>complete: true</code>. After assembly, such a
+      section is restored as the <strong>only</strong> prompt section (two complete sections
+      coexisting fails the assembly).
+    </li>
+    <li>
+      <strong>Render</strong>: <code>renderPrompt(assembly)</code> does strict interpolation —
+      <code>{{name}}</code> references must be registered and have values; malformed or unknown
+      references throw immediately; sections rendering empty are dropped, and the rest are
+      joined with blank lines. Tool schemas enter the request's tools field.
+    </li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="system prompt assembly flow">
+      <rect x="20" y="24" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="46" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">sections (ordered by order)</text>
+      <text x="110" y="63" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">-100 identity · 0 persona · 100-199 tools</text>
+      <rect x="20" y="100" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">contexts (dynamic context)</text>
+      <text x="110" y="139" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">time / environment / tmux location</text>
+      <rect x="20" y="176" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="198" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">tools providers</text>
+      <text x="110" y="215" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">ctx.tools schemas (Chapter 8)</text>
+      <rect x="20" y="252" width="180" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="276" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">variables ({{…}} evaluators)</text>
+
+      <line x1="200" y1="52" x2="255" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="200" y1="128" x2="255" y2="150" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="200" y1="204" x2="255" y2="160" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="200" y1="272" x2="255" y2="170" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="260,150 251,146 251,156" style="fill:var(--muted)"/>
+
+      <rect x="260" y="105" width="180" height="90" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="350" y="135" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">assemble()</text>
+      <text x="350" y="155" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">scoped shadowing · order sorting</text>
+      <text x="350" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">toolOrder validation · waterfall</text>
+      <text x="350" y="185" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">complete-section restore</text>
+
+      <line x1="440" y1="128" x2="510" y2="70" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="510,70 501,72 507,79" style="fill:var(--muted)"/>
+      <line x1="440" y1="172" x2="510" y2="235" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="510,235 501,231 507,224" style="fill:var(--muted)"/>
+
+      <rect x="510" y="35" width="270" height="62" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="645" y="57" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">renderPrompt → the request's system</text>
+      <text x="645" y="74" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">strict {{var}} interpolation; empty sections dropped</text>
+      <text x="645" y="88" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">tool schemas → the request's tools field</text>
+
+      <rect x="510" y="205" width="270" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="645" y="227" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">contexts → runtime-context snapshot</text>
+      <text x="645" y="244" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">agent-loop projects the snapshot into a user message</text>
+      <text x="645" y="259" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">lands as user/message with the enter batch (durable)</text>
+      <text x="645" y="272" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">the message opens by declaring the new snapshot replaces the old</text>
+    </svg>
+    <figcaption>
+      Assembly flow. The four kinds of registrations converge on <code>assemble()</code>; sections and tool schemas enter the request body,
+      while contexts take a different channel — becoming durable user-role snapshot messages (the var(--warn) box).
+    </figcaption>
+  </figure>
+
+  <p>
+    <strong>Why don't contexts go into the system prompt?</strong> Because the system prompt is
+    'identity and rules' — identical each round (or changed only by configuration) — while
+    runtime context is 'facts of now': time moves, tmux windows shift. Making it a durable
+    user-role message lets the log faithfully record 'what the model knew then', and the
+    replacement relationship between snapshots ('this snapshot replaces the earlier
+    runtime-context snapshot') is written into the message text itself. This is another
+    application of the Chapter 4 invariant: <strong>model-visible input must be reconstructible
+    from the log</strong> — sections travel via the system in <code>request/header</code>,
+    contexts via <code>user/message</code>, each in its proper place.
+  </p>
+
+  <div class="demo" data-demo="promptAssembly">
+    <div class="demo-title">Try it — assemble a system prompt</div>
+    <p>Check the sections registered by plugins and see how this round's system block comes together:</p>
+    <label><input type="checkbox" checked> Identity and rules (the system-prompt plugin)</label>
+    <label><input type="checkbox" checked> Environment info: cwd / platform</label>
+    <label><input type="checkbox"> Time context (the time-context plugin)</label>
+    <label><input type="checkbox" checked> Tool schemas: bash / fs / web</label>
+    <div class="demo-output empty">Try checking or unchecking.</div>
+  </div>
+
+  <h2 id="sec-persona">9.3 Scoped sections and per-agent personas</h2>
+
+  <p>
+    The registry is scoped, which directly yields the per-agent persona recipe: register a
+    <strong>same-name</strong> section <code>deployment:persona</code> in some agent's
+    <code>agent.ctx</code>, and it shadows the deployment layer's persona slot, taking effect for
+    that agent only. Persona-style preset packages use exactly this: same-name shadowing rather
+    than appending, so an agent always has exactly one persona section and never two personas
+    fighting each other. <code>packages/core/system-prompt/src/index.ts</code> deliberately
+    exports the <code>PERSONA_SECTION</code> constant so the 'deployment side' and the
+    'shadowing side' reference the same name — each side writing its own magic string is the
+    easiest place to drift; the shared constant makes replacement hold by construction.
+  </p>
+  <pre><code><span class="code-comment">// Inside some agent's agent.ctx (pseudocode illustrating the shadowing mechanism)</span>
+agent.ctx.systemPrompt.<span class="code-fn">section</span>({
+  name: PERSONA_SECTION,        <span class="code-comment">// 'deployment:persona': same-name shadowing of the deployment persona</span>
+  order: PERSONA_ORDER,         <span class="code-comment">// 0: the persona slot stays unchanged</span>
+  text: <span class="code-str">'You are a read-only reviewer; never modify files. Current directory {{cwd}}.'</span>,
+})</code></pre>
+  <p>
+    The same mechanism covers variables and tools: scoped variables shadow global ones, and
+    Chapter 8's scoped tools shadow global tools. Chapter 6's shadowing mental model needs no new
+    concepts on the prompt side.
+  </p>
+
+  <h2 id="sec-context-plugins">9.4 The context group: four real sources of model-visible content</h2>
+
+  <p>
+    The four plugins of the <code>packages/context/</code> group are the official
+    implementations of 'add context for the model'. Let's walk through them, watching in
+    particular <strong>how each plugin's content lands in the log</strong>:
+  </p>
+  <ul>
+    <li>
+      <strong><code>dsh-agent-instructions</code> (the AGENTS.md instruction chain)</strong>:
+      loads <code>$DSH_HOME/AGENTS.md</code> plus the instruction files of every directory from
+      the project root down to cwd (candidates such as AGENTS.md/CLAUDE.md, deduplicating
+      byte-identical ones). The baseline is synthesized at the session's first qualifying
+      <code>agent/pre-step</code> and folded into the enter batch — landing as a durable
+      user-role message (a <code>&lt;system-reminder&gt;</code> frame) right after the user's
+      direct prompt; afterwards it observes successful read/write/edit tool results, and on
+      discovering a new directory's instruction file it queues add/change/remove notices into
+      the inbox, likewise landing in the log as sourced <code>user/message</code> events.
+    </li>
+    <li>
+      <strong><code>dsh-time-context</code> (time context, opt-in)</strong>: appends a listener
+      at the head of the <code>agent/pre-step</code> chain; when due, it <strong>appends</strong>
+      to the returned batch a sourced UserMessage
+      (<code class="small">source: {kind:'plugin', plugin:'time-context', form:'snapshot', …}</code>),
+      which agent-loop persists after <code>step/start</code> and before request derivation. The
+      browser timezone comes from the current turn's user-rpc message origin; the default
+      composition does not load it (only the Schedule Web overlay mounts it).
+    </li>
+    <li>
+      <strong><code>dsh-tmux-context</code> (tmux location, opt-in)</strong>: at the first step
+      of every turn, it runs a read-only probe command via <code>ctx.shell</code> to confirm it
+      really runs inside a tmux pane (having <code>$TMUX_PANE</code> alone does not count —
+      environment variables get inherited); only on a hit does it insert, at the
+      <strong>head</strong> of the enter batch, a UserMessage with
+      <code class="small">source {kind:'plugin', plugin:'tmux-context'}</code>, likewise landing
+      in the log after <code>step/start</code>.
+    </li>
+    <li>
+      <strong><code>dsh-session-reference</code> (cross-session references)</strong>: provides
+      <code>ctx.sessionReferenceResolver</code>; <code>prepare()</code> projects other sessions
+      mentioned via @ into bounded read-only snapshots and returns one sourced UserMessage. When
+      the agent is idle, it is wrapped through a one-shot <code>agent/pre-step</code> into the
+      enter batch; while running, <code>inject()</code> follows <code>steer()</code>, and both
+      messages wait together for the next claim. Snapshots are pinned at capture time — later
+      changes in the source session do not affect the target log's replay.
+    </li>
+  </ul>
+  <p>
+    Four plugins, four entry styles (folded into the batch at pre-step, appended at pre-step,
+    inserted at the head at pre-step, inject+steer) — but all roads converge:
+    <strong>none of them quietly slips text into the system prompt</strong>. Model-visible
+    content all exists as sourced durable user messages; the log records both 'what the model
+    saw' and 'who gave it'. If you write a fifth context plugin, follow this pattern — this is
+    not a style suggestion but a direct corollary of the repository-level rule that 'a new
+    model-visible input requires a new session event'.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Connection to Chapter 7</div>
+    <p style="margin:.4rem 0 0;">
+      Assembly happens inside <code>preStep()</code>, <strong>before</strong> the
+      <code>agent/pre-step</code> waterfall; the assembly result (<code>PromptAssembly</code>)
+      then follows the enter decision into <code>step()</code>:
+      sections render into the request's system, and contexts are projected by
+      <code>RuntimeContextProjection</code> into context messages in the enter batch. In other
+      words: <strong>assembly runs once per step</strong> — tool registration changes and
+      variable value changes take effect on the very next step.
+    </p>
+  </div>
+
+  <h2 id="sec-recap">9.5 Chapter recap</h2>
+  <ul>
+    <li><code>ctx.systemPrompt</code> takes four kinds of registrations: section (the system proper), context (dynamic snapshots), variable ({{}} interpolation), tools provider (tool schemas).</li>
+    <li><code>assemble()</code>: merge the scope chain (scoped shadows global) → order / toolOrder sorting and validation → the <code>system-prompt/assemble</code> waterfall → complete-section restore; <code>renderPrompt</code> does strict interpolation and drops empty sections.</li>
+    <li>Sections and tool schemas enter the request body; contexts take a different channel — durable user-role snapshot messages carrying the 'replaces the old snapshot' declaration.</li>
+    <li>A per-agent persona = registering a same-name <code>deployment:persona</code> section in <code>agent.ctx</code> to shadow the deployment slot; the shared <code>PERSONA_SECTION</code> constant guarantees both sides use the same name.</li>
+    <li>The context group's four plugins: agent-instructions (the AGENTS.md chain), time-context, tmux-context, session-reference — content all travels as sourced durable user/message events, reconstructible from the log.</li>
+    <li>Assembly happens before pre-step of every step, assembled fresh each step; registration changes take effect on the next step.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming runtime context gets spliced into the system prompt — it is a separate durable user-message channel; stuffing 'facts of now' into system breaks the log's reconstructibility.</li>
+      <li>Writing each agent its own persona but forgetting same-name shadowing — you get two stacked personas; the correct way is same-name <code>deployment:persona</code> shadowing.</li>
+      <li>Writing <code>{{var}}</code> in a section without registering the variable — rendering throws immediately (strict interpolation, no silent blanks).</li>
+      <li>Configuring <code>toolOrder</code> that omits <code>&lt;unlisted-tools&gt;</code> or names a nonexistent tool — assembly fails; nothing is silently ignored.</li>
+      <li>Writing a context plugin that edits the system prompt directly or bypasses the log — it violates model-visible ⟺ logged; follow the context group's pattern and land user/message via pre-step / inject.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="9">
+    <h2>Chapter 9 Test</h2>
+
+    <div class="q" data-id="9-1" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A, B, D are legitimate registrations. C is wrong: tool schemas are not registered as a section but as a tools provider (ctx.systemPrompt.tools), which enters the request's tools field rather than the system text — that is exactly how Chapter 8's registry hooks in."
+         data-review="sec-registry">
+      <div class="prompt"><span class="qnum">Q1.</span> Which of the following can be registered on <code>ctx.systemPrompt</code>? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="a"> A. An ordered section (name / order / text)</label>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="b"> B. Dynamic contexts and {{variable}} evaluators</label>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="c"> C. Tool schemas, in the form of a system text block</label>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="d"> D. A tool schema provider (tools provider)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — contexts are projected into durable user-role snapshot messages that land as user/message events with the enter batch."
+         data-rationale="C is correct. A and B both stuff dynamic facts into the per-round system, leaving the log unable to reconstruct 'what the model knew then'. D is wrong: contexts are normal model-visible input and must be logged."
+         data-review="sec-assembly">
+      <div class="prompt"><span class="qnum">Q2.</span> How does a registered dynamic <code>context</code> (say, the time context) finally reach the model?</div>
+      <label class="opt"><input type="radio" name="q-9-2" value="a"> A. Spliced onto the end of the system prompt</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="b"> B. It replaces the deployment:persona section</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="c"> C. Projected into a user-role snapshot message (declaring it replaces the old snapshot) that lands as a user/message event with the enter batch</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="d"> D. Kept in memory only, never entering the log</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — register a same-name deployment:persona section in that agent's agent.ctx, shadowing the deployment persona."
+         data-rationale="B is correct; it is what the persona package actually does. A would stack two personas (the wrong direction). C rewrites the request every round, which exceeds systemPrompt's responsibilities and bypasses the assembled facts. D is wrong: a variable can only shadow a variable, not a section."
+         data-review="sec-persona">
+      <div class="prompt"><span class="qnum">Q3.</span> What is the correct way to give a single agent its own persona?</div>
+      <label class="opt"><input type="radio" name="q-9-3" value="a"> A. Register another global persona section with order 1</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="b"> B. Register a same-name deployment:persona section in that agent's agent.ctx (sharing the PERSONA_SECTION constant)</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="c"> C. Hang a system-prompt/assemble listener that rewrites the system text every round</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="d"> D. Register a same-name variable that shadows the persona configuration</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-4" data-type="fill" data-accepted='["deployment:persona","persona"]'
+         data-answer="deployment:persona (the order-0 persona slot)."
+         data-rationale="The value of the PERSONA_SECTION constant; the deployment config's persona fills it, and a scoped same-name registration shadows it. Answering harness:identity is wrong — that is the -100 identity section."
+         data-review="sec-persona">
+      <div class="prompt"><span class="qnum">Q4.</span> Fill in the blank: the deployment persona's section name is <code>______</code> (order 0).</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — strict interpolation: a malformed, unregistered, or valueless {{var}} reference makes rendering throw."
+         data-rationale="D is correct. The silent tolerances described in A, B, and C do not exist — misconfiguration must fail loudly at assembly (the repository's fail-loud rule)."
+         data-review="sec-assembly">
+      <div class="prompt"><span class="qnum">Q5.</span> When a section's text contains <code>{{cwd}}</code> but nobody registered a cwd variable, what does <code>renderPrompt</code> do?</div>
+      <label class="opt"><input type="radio" name="q-9-5" value="a"> A. Leaves {{cwd}} as-is and sends it to the model</label>
+      <label class="opt"><input type="radio" name="q-9-5" value="b"> B. Replaces it with an empty string</label>
+      <label class="opt"><input type="radio" name="q-9-5" value="c"> C. Drops the whole section</label>
+      <label class="opt"><input type="radio" name="q-9-5" value="d"> D. Throws: unknown prompt variable</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-6" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B and C."
+         data-rationale="B, C are correct: time-context and tmux-context are both opt-in and absent from the default composition (they hang in the Schedule Web overlay / specific deployments). A and D are described correctly but do not fit the question (which asks what the default does not load)."
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q6.</span> Which of the context group's plugins are <strong>opt-in</strong> (not loaded by the default composition)? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="a"> A. agent-instructions (the AGENTS.md chain)</label>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="b"> B. time-context (time context)</label>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="c"> C. tmux-context (tmux location)</label>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="d"> D. session-reference (the cross-session reference resolver)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A — the agent-instructions baseline folds into the first enter batch, landing as a durable user message right after the user's direct prompt; later changes are observed via tool results and queue inbox notices."
+         data-rationale="A is correct. B is wrong: it does not write the system prompt. C is wrong: it observes successful read/write/edit tool results, not shell cd. D is wrong: what lands is a user-role system-reminder-framed message."
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q7.</span> How does <code>dsh-agent-instructions</code> land in the log?</div>
+      <label class="opt"><input type="radio" name="q-9-7" value="a"> A. The baseline is folded into the first enter batch (right after the direct prompt) and lands as a durable user message in a system-reminder frame; afterwards, tool-reach discovery of new files injects add/change/remove notices</label>
+      <label class="opt"><input type="radio" name="q-9-7" value="b"> B. The whole instruction chain is rewritten into the system prompt every round</label>
+      <label class="opt"><input type="radio" name="q-9-7" value="c"> C. It parses each bash cd output to discover new directories</label>
+      <label class="opt"><input type="radio" name="q-9-7" value="d"> D. It inserts into history in the guise of an assistant message</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — because the probe command also compares the pane's tty with this process's controlling terminal, preventing false positives from inherited environment variables."
+         data-rationale="C is correct; the README states explicitly that $TMUX_PANE is inherited by non-pane processes (e.g. terminals launched from a tmux shell). A, B, and D all miss the point."
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q8.</span> Why is looking only at <code>$TMUX_PANE</code> not enough for tmux-context — why also compare ttys?</div>
+      <label class="opt"><input type="radio" name="q-9-8" value="a"> A. To obtain the window's pixel size</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="b"> B. For compatibility with screen sessions</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="c"> C. Because a terminal may inherit $TMUX/$TMUX_PANE from a tmux shell without actually being in that pane; comparing pane_tty with its own tty is the only confirmation</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="d"> D. To probe the contents of sibling panes</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B — assembly happens inside every step's preStep, before the agent/pre-step waterfall."
+         data-rationale="B is correct (Chapter 7's preStep order: claim → assemble → agent/pre-step). A is wrong: every step re-assembles. C is wrong: at process startup the agent may not exist yet. D is wrong: the direction is reversed."
+         data-review="sec-assembly">
+      <div class="prompt"><span class="qnum">Q9.</span> When does assembly happen?</div>
+      <label class="opt"><input type="radio" name="q-9-9" value="a"> A. Once per session, then cached</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="b"> B. For every candidate step: after claiming input, before the agent/pre-step waterfall</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="c"> C. Once at process startup; tool changes need a restart</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="d"> D. After assistant/message lands in the log</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-10" data-type="short"
+         data-key-points='["assembly is assembled fresh each step: merge the scope chain (scoped shadowing), sort by order/toolOrder, pass through the system-prompt/assemble waterfall, restore complete sections","sections + tool schemas enter the request body; contexts take the separate durable user-role snapshot-message channel","per-agent personas register a same-name deployment:persona in agent.ctx to shadow the deployment slot","the context group plugins (agent-instructions/time-context/tmux-context/session-reference) all land their content as sourced user/message events","a new model-visible input requires a corresponding session event (model-visible ⟺ logged); never quietly edit the system prompt"]'
+         data-answer="At every step, the agent loop calls ctx.systemPrompt.assemble() after claiming input: merge the scope chain (scoped sections/variables shadow global ones), sort and validate by order and toolOrder, pass through the system-prompt/assemble waterfall (a complete section is afterwards restored as the only section), then renderPrompt strictly interpolates into the request's system, and tool schemas enter the request's tools. Contexts do not go into system: they are projected into durable user-role snapshot messages that land as user/message with the enter batch. A per-agent persona registers a same-name deployment:persona in agent.ctx to shadow the deployment slot. The context group's four plugins all land their content as sourced user/message events — because a new model-visible input must have a session event (model-visible ⟺ logged)."
+         data-rationale="Five key points: per-step assembly and the waterfall, the division between the two channels, persona shadowing, the context group's logging pattern, and the invariant's constraint. With all present, the answer is complete."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q10.</span> Explain in your own words the complete system prompt assembly flow, and why runtime context and context-plugin content must land in the durable log.</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a point you actually covered — under-checking hurts the book's calibration of you; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    Next chapter: <a href="10-llm-layer.html"><strong>Chapter 10 · The LLM Capability Layer</strong></a>.
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

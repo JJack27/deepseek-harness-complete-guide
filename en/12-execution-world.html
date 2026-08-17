@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 12 · The Execution World: shell, subprocess, terminal, sandbox — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 12 · The Execution World</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/12-execution-world.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="12">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 12 · Part III · Capability Seams in Depth</div>
+    <h1>The Execution World: shell, subprocess, terminal, sandbox</h1>
+    <p class="lede">
+      Last chapter you learned the seam methodology; this chapter enters its heaviest application site. The
+      <strong>execution world</strong> is where model commands actually happen — a coherent environment formed
+      jointly by processes, the filesystem, and terminals. dsh organizes it with a set of interlocking seams:
+      <code>ctx.shell</code> executes commands, <code>ctx.subprocess</code> spawns process trees,
+      <code>ctx.terminals</code> holds persistent PTYs, <code>ctx.sandbox</code> constrains processes, and
+      <code>ctx.e2b</code> moves the whole world to the cloud. After this chapter, the three deployment routes
+      (local direct / local sandbox / E2B cloud sandbox) will look to you like three provider choices over one
+      and the same diagram.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Draw the execution world's layering: model tools → shell / terminals seams → providers → the subprocess / sandbox foundation</li>
+      <li>Explain <code>ShellExecutor</code>'s vocabulary and the request/spec split, and why default resolution must be an explicit <code>resolve()</code> step</li>
+      <li>Describe <code>ctx.subprocess</code>'s process-tree semantics (tree-scoped termination, the three stdio dispositions, environment scrubbing) and the PTY primitive</li>
+      <li>Explain <code>ctx.sandbox.confine(argv, policy)</code>'s wrapping model, why the three modes govern file effects only, the fail-closed semantics, and why <code>sandbox-policy</code> is the single policy home</li>
+      <li>Distinguish one-shot bash from persistent terminal sessions, and place the E2B and pwsh families on the map</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-execution-world">12.1 Panorama: one execution world, three routes</h2>
+
+  <p>
+    Take in the whole diagram first, then take it apart layer by layer. The model-visible tools sit at the top —
+    they are all Consumers as defined in Chapter 11. The middle is the seam layer: one-shot commands go through
+    <code>ctx.shell</code>, persistent sessions through <code>ctx.terminals</code>, and both stand on the same
+    <code>ctx.subprocess</code> process foundation; the sandbox is not a fourth parallel world but a wrapping
+    inserted by the provider before spawn (<code>ctx.sandbox</code> + <code>ctx.sandboxPolicy</code>). The
+    bottom holds the three switchable routes.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Execution world panorama">
+      <rect x="20" y="15" width="660" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="350" y="38" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Model-visible tools (Consumers)</text>
+      <text x="350" y="56" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool-bash · tool-pwsh · tool-terminal · tool-bash-persistent · tool-fs-search · tool-lsp</text>
+
+      <line x1="350" y1="67" x2="350" y2="88" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="350,91 346,83 354,83" style="fill:var(--muted)"/>
+
+      <rect x="20" y="93" width="320" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="180" y="116" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.shell (one-shot command seam)</text>
+      <text x="180" y="134" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">run(spec) / start(spec) / sandboxMode</text>
+
+      <rect x="360" y="93" width="320" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="520" y="116" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.terminals (persistent PTY seam)</text>
+      <text x="520" y="134" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">owner-scoped session registry · named backends</text>
+
+      <rect x="20" y="170" width="660" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="350" y="190" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.subprocess (process foundation seam)</text>
+      <text x="350" y="207" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">spawn / spawnTerminal / resolveExecutable / scrubbedParentEnv</text>
+
+      <rect x="20" y="228" width="660" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="350" y="248" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">ctx.sandbox + ctx.sandboxPolicy (pre-spawn constraint wrapping)</text>
+      <text x="350" y="265" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">confine(argv, policy) returns the argv to run instead · mode + workspaceRoot travel with each call</text>
+
+      <line x1="180" y1="145" x2="180" y2="167" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="180,170 176,162 184,162" style="fill:var(--muted)"/>
+      <line x1="520" y1="145" x2="520" y2="167" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="520,170 516,162 524,162" style="fill:var(--muted)"/>
+
+      <line x1="120" y1="276" x2="120" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="120,303 116,295 124,295" style="fill:var(--muted)"/>
+      <line x1="350" y1="276" x2="350" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="350,303 346,295 354,295" style="fill:var(--muted)"/>
+      <line x1="580" y1="276" x2="580" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="580,303 576,295 584,295" style="fill:var(--muted)"/>
+
+      <rect x="20" y="305" width="200" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="120" y="328" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Route 1: local direct run</text>
+      <text x="120" y="347" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">bash-local / pwsh-local + subprocess-local</text>
+
+      <rect x="250" y="305" width="200" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="350" y="328" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Route 2: local sandbox</text>
+      <text x="350" y="347" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">bash-sandbox + sandbox-local (bwrap/Landlock/Seatbelt/ACL)</text>
+
+      <rect x="480" y="305" width="200" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="580" y="328" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Route 3: E2B cloud sandbox</text>
+      <text x="580" y="347" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">fs-e2b + subprocess-e2b ← ctx.e2b</text>
+    </svg>
+    <figcaption>Execution world panorama: tools → shell/terminals seams → the subprocess foundation; three provider routes switch at the bottom while the tool layer stays put.</figcaption>
+  </figure>
+
+  <div class="demo" data-demo="execWorld">
+    <div class="demo-title">Try it — comparing three execution environments</div>
+    <label><input type="radio" name="d12" value="local" checked> Local direct run</label>
+    <label><input type="radio" name="d12" value="sandbox"> Local sandbox</label>
+    <label><input type="radio" name="d12" value="e2b"> E2B cloud sandbox</label>
+    <div class="demo-output empty">Choose an execution environment.</div>
+  </div>
+
+  <div class="box note">
+    <div class="box-title">The sandbox is not a replacement for the execution world</div>
+    <p>
+      The <code>dsh-sandbox</code> README states a boundary that is easy to misread: <strong>same-world
+      confinement only</strong>. The bwrap/Landlock/Seatbelt/ACL backends share the filesystem and kernel with
+      the host; they merely wrap the spawned argv with constraints. Containers, micro-VMs, and remote executors
+      are <strong>not</strong> backends of this seam — they replace the entire provider group behind
+      <code>ctx.shell</code> / <code>ctx.fs</code> (a world-consistent group). Keep this in mind and the confine
+      model below will not lead you astray.
+    </p>
+  </div>
+
+  <h2 id="sec-shell-seam">12.2 ctx.shell: the execution seam and the request/spec split</h2>
+
+  <p>
+    <code>ShellExecutor</code> (<code>ctx.shell</code>) defines what a bash backend does — run a foreground
+    command, start a background process — without saying how. Its API is small:
+  </p>
+  <table>
+    <thead><tr><th>Member</th><th>Semantics</th></tr></thead>
+    <tbody>
+      <tr><td><code>run(spec)</code></td><td>Foreground execution; resolves when the command ends. <strong>Only infrastructure failures reject</strong> (unusable working directory, missing shell, pre-abort signal); non-zero exits, timeout kills, and abort kills all resolve with a descriptive <code>ShellRunResult</code>.</td></tr>
+      <tr><td><code>start(spec)</code></td><td>Background execution; returns a <code>ShellProcess</code> handle without a Task immediately, with <strong>no timeout set</strong>; the caller may adapt it into <code>ctx.jobs</code>.</td></tr>
+      <tr><td><code>sandboxMode</code></td><td>Capability fact: SANDBOXING executors report their default constraint mode; the base class leaves it <code>undefined</code> (does not sandbox).</td></tr>
+      <tr><td><code>ShellProcess.readOutput()</code></td><td>Incremental reads — successive reads never redeliver the same bytes; a read that lost data to the buffer cap is marked <code>lossy</code> and points at the full spill file.</td></tr>
+      <tr><td><code>ShellProcess.kill()</code></td><td>Kills the whole process group; returns <code>false</code> if already exited.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The rule a non-zero exit is not an error deserves a pause: when the model writes a command that fails, that
+    is an <strong>outcome</strong>, not an <strong>incident</strong>. That is why <code>tool-bash</code> raises
+    <code>isError</code> only on spawn errors and aborts, leaving the exit code for the model to interpret (the
+    tool's <code>tool:bash</code> prompt section exists precisely to remind the model to check the
+    <code>[exit code: N]</code> marker).
+  </p>
+
+  <p>
+    On vocabulary: <code>ShellExecRequest</code> (command, workdir?, timeoutMs?, stdoutMaxBytes?, signal?,
+    stdin?, env?, dshEnv?, sandboxPolicy?) is resolved before execution into <code>ShellExecSpec</code> (all
+    required or explicitly nullable). This is the <strong>request/spec split template</strong> that AGENTS.md
+    names:
+  </p>
+  <div class="box key">
+    <div class="box-title">request/spec split</div>
+    <p>
+      <strong>Explicit &gt; implicit at package boundaries</strong>: default resolution is an explicit
+      <code>resolve(request): Spec</code> step in the owning implementation, never a <code>?? default</code>
+      hidden inside <code>run()</code>. dsh-shell is the template for this convention:
+      <code>sandboxPolicy</code> is optional on the request and required-nullable on the spec — after
+      resolution, the executor receives a fully explicit spec with no hidden path where an omitted field
+      silently becomes some default. Deployment-varying choices (timeouts, output caps) are supplied by the
+      provider's <code>Config</code>, validated in from cordis.yml.
+    </p>
+  </div>
+
+  <p>
+    The behavioral outline of the local provider <code>dsh-bash-local</code> (details beyond the Chapter 8 tool
+    pipeline — here we look at the executor side):
+  </p>
+  <ul>
+    <li>Each invocation spawns a <strong>brand-new non-login <code>bash -c</code></strong>, no rc files, no shell state — pass <code>workdir</code> when you need a directory; don't expect <code>cd</code> to survive.</li>
+    <li>Configured budgets: default foreground timeout <code>timeoutMs: 120000</code>, ceiling <code>maxTimeoutMs: 600000</code>, in-memory per-stream cap <code>maxOutputBytes: 64000</code> (overflow spills to disk), <code>graceMs: 3000</code> kill grace.</li>
+    <li>Timeout/cancel classification: only the executor's own timeout reports <code>timedOut</code>, upstream cancellation reports <code>aborted</code>, and a command that receives a signal on its own reports neither.</li>
+    <li>Model-friendly terminal environment: <code>NO_COLOR=1 TERM=dumb PAGER=cat GIT_PAGER=cat</code>, keeping pagers and ANSI colors from dirtying results.</li>
+  </ul>
+
+  <h2 id="sec-subprocess">12.3 ctx.subprocess: the process-tree foundation</h2>
+
+  <p>
+    The first sentence of the <code>dsh-subprocess</code> README states its position: <strong>the subprocess
+    seam is the process half of one execution world</strong>. The abstract <code>SubprocessRuntime</code>
+    exposes executable lookup, ordinary managed <code>spawn</code>, and the single terminal primitive
+    <code>spawnTerminal</code>. Its direct-consumer list explains the word foundation: the two bash executors,
+    the PTY backend <code>terminal-bash</code>, the LSP host <code>lsp-stdio</code>, and the three
+    out-of-process subagent backends (acp, codex, claude-code) — every capability that starts a process goes
+    through this one seam.
+  </p>
+
+  <p>Contract highlights (<code>packages/subprocess/subprocess/README.md</code>):</p>
+  <ul>
+    <li>
+      <strong>Fully explicit spec</strong> — argv, cwd, per-stream stdio disposition, and grace are all given by
+      the caller; <code>argv</code> is never shell-interpreted, and consumers that want a shell pass
+      <code>['bash', '-c', command]</code> themselves. Working directories and executable paths belong to the
+      provider's execution world: <code>resolveExecutable</code> resolves PATH in that world.
+    </li>
+    <li>
+      <strong>Three stdio dispositions</strong>: <code>'pipe'</code> hands the raw stream to the caller to do
+      its own protocol framing (LSP's JSON-RPC, ACP's ndjson); <code>'inherit'</code> passes through the
+      parent's descriptors; the collect mode <code>{ maxBytes, spill? }</code> keeps a bounded tail plus an
+      optional full spill file. Collect reads are keyed by whole-stream byte offset and never consume —
+      multiple independent readers never steal each other's increments; a read whose offset slid out of the
+      in-memory tail is marked <code>lossy</code> and pointed at the spill.
+    </li>
+    <li>
+      <strong>Termination is tree-scoped</strong> (on all platforms): POSIX uses <code>detached</code> process
+      groups with a direct-child fallback; Windows goes through <code>taskkill /T</code>. The single termination
+      verb <code>terminate()</code> escalates SIGTERM → grace → SIGKILL; <code>waitForExit()</code> watches the
+      liveness of the whole tree so the consumer's teardown ladder ends on true silence. The manager only
+      reacts and never classifies causes — deadlines, ladders, and cause classification all belong to the
+      caller.
+    </li>
+    <li>
+      <strong>Single-source environment scrubbing</strong>: <code>scrubbedParentEnv()</code> /
+      <code>SENSITIVE_ENV_PATTERN</code> is the one shared scrubbing definition — credential-shaped names and
+      <code>DSH_*</code> names in the environment are dropped, and an explicit <code>env</code> is merged after
+      scrubbing. Service disposal terminates every still-running managed process and waits for exit.
+    </li>
+  </ul>
+
+  <p>
+    The local implementation <code>dsh-subprocess-local</code> (<code>LocalSubprocessRuntime</code>) has a
+    counter-intuitive property: <strong>it has no config at all</strong>. Every disposition, cap, terminal size,
+    grace, and directory comes from the capability seam calling it (bash-local, lsp-stdio, terminal-bash). The
+    PTY is allocated by <code>node-pty</code>, paired with a platform process check; spill files carry
+    <code>0600</code> permissions inside a <code>0700</code> per-process private directory. This continues the
+    request/spec philosophy: deployment variance belongs to the upper capability's Config; the foundation only
+    provides mechanism.
+  </p>
+
+  <h2 id="sec-sandbox">12.4 ctx.sandbox: the pre-spawn constraint wrapper</h2>
+
+  <p>
+    The sandbox seam's contract compresses into one line: <strong><code>ctx.sandbox.confine(argv, policy)</code>
+    returns the argv to run instead</strong> — the consumer hands the provider the exact argv it was about to
+    spawn and gets back a wrapped argv to spawn directly, plus the backend's enforcement completeness
+    (<code>enforcement</code>), denial dialect signatures (<code>denialSignatures</code>), and structured runner
+    failure evidence. When no backend is available it <strong>throws</strong> rather than letting unconstrained
+    execution through — fail closed.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The confine argv wrapping model">
+      <rect x="20" y="20" width="240" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="140" y="45" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Consumer (bash-sandbox)</text>
+      <text x="140" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">argv ready: [bash, -c, make test]</text>
+
+      <rect x="20" y="150" width="240" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="140" y="173" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">policy travels with the call</text>
+      <text x="140" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">mode + workspaceRoot (sandboxPolicy.resolve)</text>
+
+      <rect x="310" y="80" width="170" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="395" y="108" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">ctx.sandbox</text>
+      <text x="395" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">confine(argv, policy)</text>
+
+      <rect x="520" y="20" width="140" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="590" y="45" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">wrapped argv</text>
+      <text x="590" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">runner prefix + original argv</text>
+
+      <rect x="520" y="150" width="140" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="590" y="173" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.subprocess</text>
+      <text x="590" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">spawn the wrapped argv</text>
+
+      <line x1="262" y1="45" x2="307" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="310,93 302,88 307,84" style="fill:var(--muted)"/>
+      <line x1="262" y1="180" x2="307" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="310,137 302,142 307,146" style="fill:var(--muted)"/>
+      <line x1="482" y1="95" x2="517" y2="60" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="520,57 512,62 517,66" style="fill:var(--muted)"/>
+      <line x1="590" y1="92" x2="590" y2="147" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="590,150 586,142 594,142" style="fill:var(--muted)"/>
+
+      <text x="395" y="228" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">The consumer never implements confinement itself, nor parses the runner — it hands over an argv and gets an argv back</text>
+    </svg>
+    <figcaption>The confine model: policy travels with each call, so at the same instant two consumers can confine their own subprocesses under different policies.</figcaption>
+  </figure>
+
+  <p>Three hard facts:</p>
+  <ul>
+    <li>
+      <strong>The mode vocabulary covers file effects only</strong>: <code>read-only</code> (default, forbids
+      all writes with <code>/dev/null</code> as the sole exception), <code>workspace-write</code> (writes
+      allowed only inside workspaceRoot and temp areas), <code>danger-full-access</code> (no constraints, no
+      provider consultation). Network and process visibility are <strong>deliberately absent from the
+      vocabulary</strong> — the modes do not pretend to cover what backends do not enforce.
+    </li>
+    <li>
+      <strong>Platform backends are selected inside sandbox-local</strong>: Linux first probes for an available
+      <code>bwrap</code>, otherwise the Landlock launcher; macOS uses Seatbelt (<code>sandbox-exec</code>,
+      allow-default + <code>(deny file-write*)</code> plus write allowlists); Windows uses the ACL
+      restricted-token runner chain (<code>dsh-sandbox-windows-acl</code>, a <code>WRITE_RESTRICTED</code>
+      token + a workspace-derived SID). When an old kernel ABI covers only some access classes, it honestly
+      reports <code>enforcement: 'partial'</code>. The Landlock launcher's source of record lives in
+      <code>native/landlock-run/</code> — the npm package
+      <code>@deepseek-ai/node-addon-landlock-run</code> (a self-restrict-then-exec launcher + capability probes
+      + CLI argument vocabulary); the harness shares its repository and lockfile with it, so contract changes
+      and consumer updates land together.
+    </li>
+    <li>
+      <strong><code>sandbox-policy</code> is the single policy home</strong>. The deployment default
+      <code>mode</code> (default <code>read-only</code>) and the fallback <code>workspaceRoot</code> (default
+      <code>process.cwd()</code>) live here; <code>ctx.sandboxPolicy.resolve({ session, mode })</code> resolves
+      the full policy for each call — explicit approval &gt; the session's last <code>sandbox/mode</code> event
+      (the <code>effectiveSandboxMode</code> fold) &gt; the deployment default; the session-immutable
+      <code>SessionHeader.cwd</code>, normalized through filesystem semantics, becomes the workspaceRoot. The
+      three enforcing families — bash, fs, terminal — all read this same resolution, so <strong>no one can
+      fence bash and fs to different roots</strong>. Switching itself is a log-only <code>sandbox/mode</code>
+      event — recovered after restart by replay, and two sessions never see each other's state.
+    </li>
+  </ul>
+
+  <p>
+    The presentation path for a sandbox denial is also worth walking through: when a confined command fails,
+    stderr carries the chosen backend's own denial dialect (bwrap's EROFS, Landlock's EACCES, Seatbelt's
+    EPERM); the executor conservatively classifies it against the signatures as
+    <code>ShellRunResult.sandbox.denied: true</code> — <strong>denial is an outcome fact, not an
+    exception</strong>. The tool layer renders it as <code>[sandbox: file access denied under &lt;mode&gt;
+    mode]</code> and, where the composition supports escalation, appends a hint: within the same turn you may
+    retry once with <code>sandbox_permissions</code> (a strictly wider mode) + <code>justification</code>, with
+    the approval question going to the user through <code>ctx.approval</code>. When no backend is available at
+    all it throws <code>SANDBOX_UNAVAILABLE</code> (with platform installation guidance), never silently
+    degrading.
+  </p>
+
+  <h2 id="sec-terminal">12.5 ctx.terminals: persistent PTY sessions</h2>
+
+  <p>
+    One-shot bash is a brand-new <code>bash -c</code> every time, but some work needs <strong>persistent
+    terminal state</strong>: exported environment variables, an activated virtualenv, a service running in the
+    foreground. <code>ctx.terminals</code> (<code>dsh-terminal</code>) is the owner-scoped persistent PTY seam:
+    it mints opaque session ids, creates sessions through named backends, and fences every operation to the
+    exact live <code>Agent</code>. <code>dsh-terminal-bash</code> is the local backend, built on
+    <code>ctx.subprocess.spawnTerminal</code> — PTY allocation, environment scrubbing, foreground process
+    groups, signals, and full terminal-session cleanup all belong to the subprocess provider, so <strong>the
+    same PTY backend fits both the local and the remote execution world</strong>.
+  </p>
+
+  <p>Compared with one-shot bash:</p>
+  <table>
+    <thead><tr><th></th><th>tool-bash (one-shot)</th><th>tool-terminal (persistent sessions)</th></tr></thead>
+    <tbody>
+      <tr><td>State</td><td>Brand-new <code>bash -c</code> each time, nothing persists</td><td>cwd, exported variables, and foreground processes persist across calls</td></tr>
+      <tr><td>Process shape</td><td>Managed process tree with plain pipes</td><td>A real PTY (the <code>spawnTerminal</code> primitive), UTF-8 text I/O</td></tr>
+      <tr><td>Tool surface</td><td><code>bash</code> (+ background-job adaptation)</td><td>Six tools: <code>terminal_open / send / read / signal / close / list</code></td></tr>
+      <tr><td>Ownership</td><td>Background processes register into <code>ctx.jobs</code> and are controlled as jobs</td><td>Every operation requires the exact originating <code>Agent</code> — a model that learned someone else's id still cannot operate</td></tr>
+      <tr><td>Readiness</td><td>No readiness concept needed</td><td>Private PS1 marker + foreground stdin-wait fact + silent fallback + absolute timeout</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The family has one more variant, <code>dsh-tool-bash-persistent</code>: the model-visible
+    <code>bash(command)</code> tool, but backed by <strong>an owner-scoped <code>ctx.terminals</code> shell per
+    Agent</strong> — commands share one shell, so cwd, exported variables, activated environments, functions,
+    and background jobs all persist across calls. It demonstrates the decoupling of the tool contract from the
+    execution surface: a bash tool of the same name can stand on the one-shot seam or on a persistent session.
+  </p>
+
+  <h2 id="sec-e2b-pwsh-env">12.6 E2B, the pwsh family, and shell-env</h2>
+
+  <p>
+    <strong>E2B is the third route</strong> (POC positioning). <code>dsh-e2b</code> owns <code>ctx.e2b</code> —
+    the shared lifecycle owner of an E2B sandbox: construction opens the sandbox (pinned <code>e2b@2.29.1</code>),
+    sets up the <code>cwd</code> (default <code>/home/user/workspace</code>, which must be an absolute POSIX
+    path) and the private <code>cwd/.dsh-e2b</code> state directory; <code>timeoutMs</code> (default five
+minutes) governs the sandbox's lifetime, and expiry deletes it. <code>fs-e2b</code> and
+<code>subprocess-e2b</code> inject it and await the same SDK handle, so the file tools and the
+    bash/PTY/LSP consumers land in the same remote Linux world — the instantiation of Chapter 11's swap a
+    provider, move the execution world. Note its boundary (stated plainly in the README): Cordis services,
+    session state, the session log, and LLM requests all stay in the host process; sandbox state is volatile
+    with no host synchronization.
+  </p>
+
+  <p>
+    <strong>The pwsh family is the symmetric design for Windows</strong>. <code>dsh-pwsh-local</code> mirrors
+    bash-local item by item: a brand-new <code>pwsh -NoLogo -NoProfile -NonInteractive -Command
+    &lt;command&gt;</code> each time, with the command string passed to <code>-Command</code> as a
+    <strong>single argv element</strong> (parsed by PowerShell itself; no intermediate shell, hence no escaping
+    layer); UTF-8 output encoding is pinned up front; Windows tree termination goes through
+    <code>taskkill</code>, and a forced kill settles as exit 1 with no signal. <code>dsh-pwsh-sandbox</code>
+    mirrors bash-sandbox, and the substance of the constraint is platform-neutral: on Windows it resolves to
+    the ACL runner chain; on Linux/macOS it is bwrap/Landlock/Seatbelt as usual. <code>dsh-tool-pwsh</code>
+    aligns with tool-bash call for call (foreground/background, <code>DSH_*</code> environment, denial
+    rendering, and the escalation surface).
+  </p>
+
+  <p>
+    <strong><code>shell-env</code> fills in the last piece of the managed environment</strong>: it owns the
+    <code>ctx.shellEnv</code> registry — every model shell call gets a freshly captured, trusted
+    <code>DSH_*</code> snapshot (the built-in facts <code>DSH_HOME</code>, <code>DSH_SHELL=1</code>,
+    <code>DSH_SESSION_ID</code>, plus <code>DSH_SESSION_JSONL</code> when the persistence layer lands on JSONL).
+    The snapshot travels the dedicated channel <code>ShellExecRequest.dshEnv</code>; the local executor first
+    <strong>strips every inherited <code>DSH_*</code></strong> and then merges the snapshot — so nested
+    harnesses and concurrent parent/child agents cannot leak stale identities into subprocesses;
+    <code>process.env</code> is never modified. Other plugins register their own managed facts through effect
+    scopes; duplicate names or undeclared runtime keys fail loud.
+  </p>
+
+  <h2 id="sec-recap">12.7 Chapter recap</h2>
+  <ul>
+    <li>The execution world = the coherent environment formed by processes + filesystem + terminals; the three routes (local / local sandbox / E2B) are just provider choices.</li>
+    <li><code>ctx.shell</code>: run/start/sandboxMode; only infrastructure failures reject; request → explicit <code>resolve()</code> → spec is the repo-wide template.</li>
+    <li><code>ctx.subprocess</code>: argv is never shell-interpreted; stdio pipe/inherit/collect; tree-scoped termination (SIGTERM→grace→SIGKILL, <code>taskkill /T</code>); <code>scrubbedParentEnv</code> single-source scrubbing; the local implementation has zero config.</li>
+    <li><code>ctx.sandbox.confine(argv, policy)</code> returns the argv to run instead; the three modes govern file effects only; fail closed throws <code>SANDBOX_UNAVAILABLE</code>; the Landlock launcher's source lives in <code>native/landlock-run/</code>.</li>
+    <li><code>ctx.sandboxPolicy</code> is the single policy home: <code>sandbox/mode</code> events + the session-immutable cwd, shared by the three enforcing families as one resolution.</li>
+    <li><code>ctx.terminals</code> persistent PTYs: owner fencing, six tools, readiness inference; terminal-bash stands on <code>spawnTerminal</code> and migrates with the execution world.</li>
+    <li>E2B (<code>ctx.e2b</code> + fs-e2b + subprocess-e2b) is the POC of a cloud execution world; the pwsh family mirrors bash call for call; shell-env governs the <code>DSH_*</code> managed environment.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Treating a non-zero exit code as <code>isError</code> — only infrastructure failures (spawn errors, aborts) are errors; the exit code is an outcome for the model to interpret.</li>
+      <li>Expecting <code>cd</code> or exported variables to survive a bash call — every call is a brand-new <code>bash -c</code>; for state use <code>workdir</code>, env, or a persistent terminal.</li>
+      <li>Hiding a <code>?? default</code> inside <code>run()</code> — default resolution must go through the owning implementation's explicit <code>resolve(request): Spec</code>.</li>
+      <li>Assuming sandbox modes govern network/processes — the vocabulary covers file effects only; containers and micro-VMs are not sandbox backends but whole-group provider replacements.</li>
+      <li>Spawning on your own, bypassing <code>ctx.subprocess</code> — process-tree termination, environment scrubbing, spill, and dispose cleanup are all lost with it.</li>
+      <li>Expecting E2B to sync the host workspace — the remote cwd starts as an empty directory; upload/write-back are out of the POC's scope.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="12">
+    <h2>Chapter 12 Test</h2>
+
+    <div class="q" data-id="12-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Only infrastructure failures (unusable workdir, missing shell, pre-abort) reject; non-zero exits, timeout kills, and abort kills all resolve with a ShellRunResult."
+         data-rationale="C is correct. A confuses the model-visible error classification (isError) with the executor contract, and a non-zero exit is not isError at the tool layer either. B is wrong — a timeout kill is a descriptive outcome. D is wrong — background start never sets a timeout; timeouts belong to foreground run only."
+         data-review="sec-shell-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> When does <code>ctx.shell.run(spec)</code> reject?</div>
+      <label class="opt"><input type="radio" name="q-12-1" value="a"> A. When the command ends with a non-zero exit code</label>
+      <label class="opt"><input type="radio" name="q-12-1" value="b"> B. When the command is killed on timeout</label>
+      <label class="opt"><input type="radio" name="q-12-1" value="c"> C. On infrastructure failure: unusable working directory, missing shell, pre-abort signal, and the like</label>
+      <label class="opt"><input type="radio" name="q-12-1" value="d"> D. When a start() background process times out</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B — resolve is an explicit resolution step in the owning implementation, with no hidden defaults in the spec; this is the AGENTS.md convention that uses dsh-shell as its template."
+         data-rationale="B is correct. A pushes defaults back inside run(), exactly the forbidden shape. C inverts it: model-facing parameters are resolved through the tool layer, but the provider's Config participates too (timeout ceilings, output budgets). D describes no such mechanism — config is validated at load time, not backstopped at runtime."
+         data-review="sec-shell-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> What is the core requirement of the request/spec split?</div>
+      <label class="opt"><input type="radio" name="q-12-2" value="a"> A. request and spec must have exactly the same fields</label>
+      <label class="opt"><input type="radio" name="q-12-2" value="b"> B. Default resolution is an explicit resolve(request): Spec step, with no ?? defaults hidden in run()</label>
+      <label class="opt"><input type="radio" name="q-12-2" value="c"> C. Defaults may only come from model-visible tool parameters</label>
+      <label class="opt"><input type="radio" name="q-12-2" value="d"> D. Missing spec fields are auto-filled from Config by the Cordis loader</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A, C, and D all come from the contract: argv is never shell-interpreted, collect reads are keyed by whole-stream offset and non-consuming, and termination is tree-scoped with terminate() as the single verb. B is wrong — cause classification (timeout vs cancel vs suicide) belongs to the caller; the manager only reacts, it does not classify."
+         data-review="sec-subprocess">
+      <div class="prompt"><span class="qnum">Q3.</span> Which of the following hold for the ctx.subprocess contract? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="a"> A. argv is never shell-interpreted; consumers wanting a shell pass [bash, -c, command] themselves</label>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="b"> B. terminate() tells you why the process died: timeout, cancellation, or suicide</label>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="c"> C. collect reads use whole-stream byte offsets, so multiple independent readers never steal each other's increments</label>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="d"> D. Termination is tree-scoped: POSIX process-group signals, Windows goes through taskkill /T</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The consumer hands over its exact argv and gets back the wrapped argv to run instead, spawning that directly."
+         data-rationale="B is correct: confine's return value is the replacement. A is wrong — there is no sandbox-specific spawn verb; spawn still goes through subprocess. C is wrong — that is the policy home's job (sandboxPolicy), and policy travels with the call. D reverses the direction — the consumer never implements confinement; it consumes outcome facts."
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q4.</span> What does <code>ctx.sandbox.confine(argv, policy)</code> return?</div>
+      <label class="opt"><input type="radio" name="q-12-4" value="a"> A. A sandbox-specific spawn handle</label>
+      <label class="opt"><input type="radio" name="q-12-4" value="b"> B. A wrapped argv — the consumer spawns it in place of its own argv</label>
+      <label class="opt"><input type="radio" name="q-12-4" value="c"> C. A resolved mode + workspaceRoot policy</label>
+      <label class="opt"><input type="radio" name="q-12-4" value="d"> D. A boolean: whether the command is allowed</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-5" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A, B, and D are correct: the modes cover file effects only, the Landlock launcher's source of record is in native/ (@deepseek-ai/node-addon-landlock-run), and unavailability throws SANDBOX_UNAVAILABLE. C is wrong — containers/micro-VMs/remote executors are not backends of this seam; they replace the capability seam's whole provider group."
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q5.</span> About the sandbox seam, which statements are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="a"> A. read-only / workspace-write / danger-full-access constrain file effects only</label>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="b"> B. The Landlock launcher is provided by @deepseek-ai/node-addon-landlock-run, with its source of record in native/</label>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="c"> C. E2B micro-VMs can register as a ctx.sandbox backend</label>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="d"> D. With no available backend it throws SANDBOX_UNAVAILABLE, never letting unconstrained execution through</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C — sandbox-policy is the single home: resolve() produces mode + workspaceRoot per call, and the three enforcing families bash/fs/terminal read the same one."
+         data-rationale="C is correct. A is wrong — policy is deliberately single-source; independent resolutions would drift into split worlds. B is wrong — the mode resolution order is explicit approval &gt; the session's sandbox/mode event fold &gt; the deployment default. D describes no such event: workspace identity comes from the immutable SessionHeader.cwd recorded at session creation."
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q6.</span> Why can't bash, fs, and terminal fence commands and files to different roots?</div>
+      <label class="opt"><input type="radio" name="q-12-6" value="a"> A. Each family resolves its own policy, but reads the same config file</label>
+      <label class="opt"><input type="radio" name="q-12-6" value="b"> B. After a session mode switch, a global event is broadcast immediately to all families</label>
+      <label class="opt"><input type="radio" name="q-12-6" value="c"> C. ctx.sandboxPolicy is the single policy home; all enforcing families consume the per-call policy it resolves</label>
+      <label class="opt"><input type="radio" name="q-12-6" value="d"> D. workspaceRoot is written into every tool call's SessionEvent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-7" data-type="fill"
+         data-accepted='["spawnTerminal","spawnterminal","ctx.subprocess.spawnTerminal"]'
+         data-answer="spawnTerminal (the single non-pipe primitive on ctx.subprocess)."
+         data-rationale="spawnTerminal allocates a real PTY, bridges UTF-8 text I/O, and supports foreground process-group checks and signals; it is the primitive under the terminal-bash backend. An ordinary spawn only has pipes and cannot allocate a controlling terminal."
+         data-review="sec-terminal">
+      <div class="prompt"><span class="qnum">Q7.</span> Fill in the blank: the PTY backend dsh-terminal-bash stands on the ______ primitive of ctx.subprocess.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Every operation requires the exact originating Agent; even a model that learned someone else's id cannot address another agent's terminal."
+         data-rationale="D is correct: the owner-scoped fence is the seam's core contract. A contradicts the facts (cross-agent sharing is deliberately excluded). B is wrong — sessions are process-local and a harness restart does not restore them. C is wrong — readOutput is a method on the bash background handle; the terminal family has its own read tool and buffering policy."
+         data-review="sec-terminal">
+      <div class="prompt"><span class="qnum">Q8.</span> The model obtains another agent's terminal session id. What happens?</div>
+      <label class="opt"><input type="radio" name="q-12-8" value="a"> A. It can read but not write, due to a shared read-only policy</label>
+      <label class="opt"><input type="radio" name="q-12-8" value="b"> B. It can operate it — terminal sessions are shared across agents</label>
+      <label class="opt"><input type="radio" name="q-12-8" value="c"> C. After a harness restart the session is automatically restored and continues</label>
+      <label class="opt"><input type="radio" name="q-12-8" value="d"> D. The operation is refused: every operation is fenced to the exact originating Agent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A — fs-e2b and subprocess-e2b inject ctx.e2b and share the same SDK handle and remote cwd; bash/PTY/LSP consumers enter the remote world with it, no E2B-specific capability packages needed."
+         data-rationale="A is correct. B is wrong — E2B does no host synchronization, and the remote cwd starts empty. C is wrong — the session log, LLM requests, and Cordis services stay in the host process. D reverses the direction — sandbox-local is local confinement (same-world only), while E2B is a whole-group provider replacement."
+         data-review="sec-e2b-pwsh-env">
+      <div class="prompt"><span class="qnum">Q9.</span> After assembling the E2B execution world (dsh-e2b + fs-e2b + subprocess-e2b), which description is correct?</div>
+      <label class="opt"><input type="radio" name="q-12-9" value="a"> A. bash, terminal, LSP, and file tools execute in the same remote Linux world, with no tool packages changed</label>
+      <label class="opt"><input type="radio" name="q-12-9" value="b"> B. The host workspace syncs bidirectionally to the remote automatically</label>
+      <label class="opt"><input type="radio" name="q-12-9" value="c"> C. The session log and LLM requests also moved into the remote sandbox</label>
+      <label class="opt"><input type="radio" name="q-12-9" value="d"> D. E2B registers as a fourth platform backend of sandbox-local</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-10" data-type="fill"
+         data-accepted='["dshEnv","dshenv","ShellExecRequest.dshEnv"]'
+         data-answer="dshEnv (the dedicated managed channel on ShellExecRequest)."
+         data-rationale="The DSH_* snapshot travels the dshEnv channel; the executor removes every inherited DSH_* before merging the snapshot, so nested harnesses and concurrent parent/child agents cannot leak stale identities, and process.env is never modified. The ordinary env channel is for plugins feeding stdin/CLAUDE_* and does not carry this duty."
+         data-review="sec-e2b-pwsh-env">
+      <div class="prompt"><span class="qnum">Q10.</span> Fill in the blank: the DSH_* managed environment snapshot captured by shell-env reaches the executor through the ______ channel of ShellExecRequest.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The command string is a single argv element parsed by PowerShell itself; with no intermediate shell there is no quote-escaping layer."
+         data-rationale="B is correct (verbatim from the pwsh-local README). A is wrong — the local executor spawns brand-new each time. C is wrong — a forced kill on Windows settles as exit 1 with no signal marker, which the pwsh tool guidance explicitly teaches the model. D is wrong — the settings namespace is deliberately shared (both are named bash), so settings.yaml stays resolvable across platforms."
+         data-review="sec-e2b-pwsh-env">
+      <div class="prompt"><span class="qnum">Q11.</span> What is one key difference between the pwsh family and the bash family?</div>
+      <label class="opt"><input type="radio" name="q-12-11" value="a"> A. pwsh keeps a resident shell process reused across calls</label>
+      <label class="opt"><input type="radio" name="q-12-11" value="b"> B. The command string is passed to -Command as a single argv element, with no shell quote-escaping layer</label>
+      <label class="opt"><input type="radio" name="q-12-11" value="c"> C. The pwsh tool's settings namespace is completely different from bash's, to avoid conflicts</label>
+      <label class="opt"><input type="radio" name="q-12-11" value="d"> D. On Windows, force-killed processes carry a [killed by signal: …] marker</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-12" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B, C."
+         data-rationale="B and C are correct: a denial is the outcome fact ShellRunResult.sandbox.denied (inferred from stderr dialect signatures), and escalation goes through ctx.approval with a strictly wider mode. A is wrong — deny-only: escalation negotiation happens in the tool layer; the executor never negotiates permissions. D is wrong — escalation must be paired with a justification and retried once within the same turn; it is never an automatic relaxation."
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q12.</span> About the path after a sandbox denial, which statements hold? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="a"> A. bash-sandbox itself pops an approval asking the user for permission</label>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="b"> B. The denial appears as an outcome fact: result.sandbox.denied = true, rendered as [sandbox: file access denied under … mode]</label>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="c"> C. The model may retry once within the same turn with sandbox_permissions + justification, with approval going through ctx.approval</label>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="d"> D. After two denials the executor automatically switches to danger-full-access</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-13" data-type="short"
+         data-key-points='["Layering: model tools → ctx.shell/ctx.terminals → providers → the ctx.subprocess foundation, with the sandbox wrapping argv before spawn","The three provider routes (local / local sandbox / E2B) switch the execution world while the tool layer stays put","request/spec split: an explicit resolve(request): Spec, with no ?? defaults hidden","sandboxPolicy single-source resolution of mode + workspaceRoot, shared by the three enforcing families","The sandbox fails closed (SANDBOX_UNAVAILABLE) and covers file effects only"]'
+         data-answer="Draw it by layers: the tools (tool-bash/tool-terminal and friends) consume ctx.shell and ctx.terminals; local providers spawn process trees through ctx.subprocess; on the sandbox route the provider wraps argv through ctx.sandbox.confine before spawn, with the policy resolved per call by ctx.sandboxPolicy (mode + workspaceRoot), shared by the three enforcing families; the E2B route swaps the fs and subprocess providers for remote implementations (sharing ctx.e2b). When the three routes switch, the tool layer changes nothing."
+         data-rationale="If you can draw this diagram from memory, you hold the full structure of the execution world; later chapters (fs, subagents) hang off this diagram's nodes."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> In your own words, draw (or write out) the execution world's layered structure, explain where the three routes switch, and why the policy is single-source.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check a point only if your answer truly covers it — under-checking hurts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="13-fs-capability.html"><strong>Chapter 13 · The Filesystem Capability</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

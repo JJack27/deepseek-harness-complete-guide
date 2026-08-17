@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 10 · The LLM Capability Layer: The Adapter Seam and Streaming Vocabulary — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 10 · The LLM Capability Layer</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/10-llm-layer.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="10">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 10 · Part II · The Core Spine</div>
+    <h1>The LLM Capability Layer: The Adapter Seam and Streaming Vocabulary</h1>
+    <p class="lede">
+      The last two chapters both ended at the same call:
+      <code class="small">ctx.llm.stream(request)</code>.
+      This chapter covers the world behind it — how <code>packages/llm/</code> defines a
+      vendor-neutral message and streaming vocabulary, how adapters swap in and out like plugs,
+      how streaming chunks become <code>assistant/message</code> in the log, and how much code
+      it really takes to switch model vendors (the answer: one new adapter plugin).
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State the dual identity of <code>ctx.llm</code>: adapter registry + unified streaming call API</li>
+      <li>Recite the message vocabulary: <code>Message</code>, content blocks, the <code>StreamChunk</code> protocol, and <code>BlockAssembler</code></li>
+      <li>Describe how a streaming reply enters the log via <code>llm/stream</code> → <code>assistant/chunk</code>* → <code>assistant/message</code></li>
+      <li>State the division of labor among the llm group's five packages: llm / llm-deepseek / llm-pi-ai / llm-retry / token-meter</li>
+      <li>Explain how <code>ctx.agentDefaultModel</code> relates to <code>prepareCall()</code> / <code>request/header</code></li>
+    </ul>
+  </div>
+
+  <h2 id="sec-adapter-seam">10.1 ctx.llm: an adapter seam</h2>
+
+  <p>
+    The <code>LlmRuntime</code> service from <code>packages/llm/llm</code> hangs on
+    <code>ctx.llm</code>. It is the LLM-domain instance of the capability seam that Chapter 11
+    will formally name: a <strong>vendor-neutral message and streaming vocabulary</strong> (the
+    language all packages speak) plus an <strong>adapter registry</strong> (replaceable
+    implementations).
+  </p>
+  <p>
+    There is exactly one core registration API:
+  </p>
+  <pre><code><span class="code-key">const</span> handle = ctx.llm.<span class="code-fn">registerAdapter</span>([<span class="code-str">'deepseek-official'</span>], adapter)
+<span class="code-comment">// all-or-nothing: one provider route has at most one adapter at a time (a duplicate name throws DUPLICATE_ADAPTER)</span>
+<span class="code-comment">// handle.dispose() unregisters; handle.replace(providers) swaps the route atomically, with no gap</span></code></pre>
+  <p>
+    Requests select the adapter via <code>GenerateOptions.provider</code>; <code>model</code> is
+    interpreted by the adapter itself (the catalog is advisory — unlisted model ids pass through
+    as-is). The companion query surface:
+    <code class="small">listProviders()</code> / <code class="small">listModels(provider)</code> /
+    <code class="small">resolveModelInfo(provider, model)</code> (to get an exact model's context
+    window, output defaults, and reasoning tiers) — these are discovery surfaces for picker UIs,
+    not routing whitelists.
+  </p>
+  <p>
+    <strong>Switching model vendors = writing one new adapter plugin</strong> (extend
+    <code>LlmAdapter</code>, implement <code>stream()</code>, optionally implement the metadata
+    methods), registering a few provider routes, done. Not one line of the loop, session, tools,
+    or UI changes — this is precisely where Chapter 3's assembly and Chapter 11's seam pay off.
+  </p>
+
+  <h2 id="sec-streaming">10.2 The message and streaming vocabulary</h2>
+
+  <p>
+    <code>docs/subsystems/llm-streaming.md</code> is this layer's dictionary. Three levels of
+    vocabulary, coarse to fine:
+  </p>
+  <ul>
+    <li>
+      <strong><code>Message</code></strong>: an immutable value with a stable
+      <code>MessageId</code>, a role (system/user/assistant), and an array of content blocks. A
+      model-produced assistant message carries <code>provider</code>, <code>model</code>, and
+      the optional adapter-private <code>replayState</code> in its source. The constructors
+      (<code class="small">createUserMessage / createAssistantMessage / createToolResultMessage</code>)
+      produce deep-frozen values — messages are immutable from birth.
+    </li>
+    <li>
+      <strong>content blocks</strong>: message content is an array of typed blocks —
+      <code>text</code>, <code>reasoning</code> (thinking, distinct from visible text),
+      <code>tool-call</code> (carrying a <code>CallId</code>, a name, and the raw JSON argument
+      string), <code>tool-result</code> (nested content + <code>isError</code>).
+      The block union comes from the merge-extensible <code>ContentBlockMap</code> — a new
+      modality (images and the like) enters the core map only when the
+      adapter/UI/compaction/replay paths all support it.
+    </li>
+    <li>
+      <strong>The <code>StreamChunk</code> raw stream protocol</strong>: adapters emit not
+      messages but seven raw block kinds — <code>block-start</code> / <code>text-delta</code> /
+      <code>reasoning-delta</code> / <code>tool-call-delta</code> / <code>block-end</code> /
+      <code>usage</code> / <code>finish</code> (usage precedes finish). Each stream has exactly
+      one terminal <code>finish</code>; operational failures end with a finish of
+      <code>{kind:'error'|'aborted', failure}</code> and <strong>never throw across the stream
+      API</strong> — the consistent convention at service boundaries.
+    </li>
+  </ul>
+  <p>
+    <code>BlockAssembler</code> is what assembles chunks back into messages — the repository's
+    single assembly implementation, shared with the agent loop. This design of 'raw chunk
+    protocol + shared assembler' means: any new adapter that can speak the chunk language gets
+    UI token-by-token rendering, chunk-faithful logging, and message finalization all working
+    automatically.
+  </p>
+
+  <h2 id="sec-stream-to-log">10.3 How streaming enters the log</h2>
+
+  <p>
+    Zoom the Chapter 7 call chain into the LLM layer (<code>step()</code> in
+    <code>agent.ts</code>):
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="the path of a streaming reply into the log">
+      <rect x="30" y="30" width="200" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="130" y="52" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">agent loop (inside step)</text>
+      <text x="130" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">the frozen request (provider/model/messages/tools)</text>
+      <line x1="230" y1="58" x2="290" y2="58" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="290,58 283,54 283,62" style="fill:var(--muted)"/>
+
+      <rect x="290" y="30" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="380" y="52" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">llm/stream waterfall</text>
+      <text x="380" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">cache/log/routing can intercept here</text>
+      <line x1="470" y1="58" x2="530" y2="58" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="530,58 523,54 523,62" style="fill:var(--muted)"/>
+
+      <rect x="530" y="30" width="240" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="650" y="52" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">adapter (the selected registration)</text>
+      <text x="650" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">llm-deepseek or llm-pi-ai …</text>
+
+      <line x1="650" y1="86" x2="650" y2="130" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="650,130 646,123 654,123" style="fill:var(--muted)"/>
+      <rect x="500" y="130" width="300" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="650" y="152" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">StreamChunk stream</text>
+      <text x="650" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">block-start · text-delta · … · usage · finish</text>
+
+      <line x1="500" y1="160" x2="330" y2="160" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="330,160 337,156 337,164" style="fill:var(--muted)"/>
+      <rect x="90" y="128" width="240" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="210" y="150" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">each chunk lands as assistant/chunk</text>
+      <text x="210" y="168" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">while feeding BlockAssembler (dual track)</text>
+      <text x="210" y="183" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">stream failure → agent/request-error → keep/retry</text>
+
+      <line x1="210" y1="192" x2="210" y2="240" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="210,240 206,233 214,233" style="fill:var(--muted)"/>
+      <rect x="60" y="240" width="300" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2.5"/>
+      <text x="210" y="263" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">stream ends normally: assistant/message</text>
+      <text x="210" y="281" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">carrying usage, source (provider/model),</text>
+      <text x="210" y="296" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">sourceEventSeqs = all referenced chunk seqs</text>
+
+      <line x1="360" y1="275" x2="440" y2="275" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="440,275 433,271 433,279" style="fill:var(--muted)"/>
+      <rect x="440" y="240" width="320" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="600" y="263" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">deriveMessages() takes only message events</text>
+      <text x="600" y="281" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">chunks serve only UI token-by-token rendering and faithful replay</text>
+      <text x="600" y="296" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Chapter 4's chunk/message division lands here</text>
+
+      <text x="400" y="345" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Next step: deriveMessages derives history from the log → the request prefix always matches the log (invariant assertion)</text>
+    </svg>
+    <figcaption>
+      The complete path of one streaming reply: frozen request → llm/stream waterfall → adapter → StreamChunk stream;
+      each chunk lands as <code>assistant/chunk</code> (the var(--accent) box), and when the stream terminates, one
+      <code>assistant/message</code> is finalized, referencing all the chunks.
+    </figcaption>
+  </figure>
+
+  <p>
+    Three key points:
+  </p>
+  <ul>
+    <li>
+      <strong>Dual-track consumption</strong>: the loop logs each chunk as
+      <code>assistant/chunk</code> (preserving streaming fidelity and UI replay) while feeding
+      <code>BlockAssembler</code> to accumulate blocks. Only when the stream reaches
+      <code>finish</code> normally is one <code>assistant/message</code> event assembled — it is
+      the <strong>only</strong> assistant surface that participates in
+      <code>deriveMessages()</code>.
+    </li>
+    <li>
+      <strong>Failure produces no message</strong>: when the terminal finish is error/aborted,
+      the <code>agent/request-error</code> waterfall comes first (Chapter 7: keep the original
+      error by default; returning <code>{kind:'retry'}</code> re-issues within the same step).
+      The failed attempt's chunks stay in the log but are never assembled into a message, so the
+      model history is unpolluted. Even a max-tokens-truncated reply with empty content still
+      gets a message event (recording usage and an empty chunk-reference list).
+    </li>
+    <li>
+      <strong><code>llm/stream</code> is a waterfall</strong>: cache, logging, and routing
+      plugins wrap here; listeners must call <code>next()</code>. The request object is
+      deep-frozen and marked with <code>sessionId</code> by the loop
+      (<code class="small">markAgentLoopRequest()</code>); Chapter 7's invariant validates
+      'request ⟺ log-derived' consistency at exactly this gate.
+    </li>
+  </ul>
+
+  <div class="demo" data-demo="streamChunks">
+    <div class="demo-title">Try it — the chunk stream and the message event</div>
+    <p>Step through one streaming reply:</p>
+    <button data-run>One more chunk</button>
+    <div class="demo-output empty">Click to start.</div>
+  </div>
+
+  <h2 id="sec-adapters">10.4 The llm group's five packages</h2>
+
+  <table>
+    <thead>
+      <tr><th>Package</th><th>Role</th><th>Key points</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>dsh-llm</code></td>
+        <td>vocabulary + service</td>
+        <td>the Message / StreamChunk / BlockAssembler / HarnessError families; the <code>ctx.llm</code> registry and streaming API</td>
+      </tr>
+      <tr>
+        <td><code>dsh-llm-deepseek</code></td>
+        <td>the official DeepSeek adapter</td>
+        <td>exclusively owns the <code>deepseek-official</code> route; direct fetch + SSE (eventsource-parser frame decoding);
+        credentials read <code>apiKeyEnv</code> via <code>ctx.credentials</code> (default <code>DEEPSEEK_API_KEY</code>),
+        <code>baseURL</code> defaults to <code>DEEPSEEK_BASE_URL</code> then falls back to the public endpoint;
+        thinking/reasoningEffort, maxTokens (default 256000), idle read timeout, and more are all config</td>
+      </tr>
+      <tr>
+        <td><code>dsh-llm-pi-ai</code></td>
+        <td>the multi-provider adapter</td>
+        <td>turns any provider/profile (including OpenAI-compatible gateways and self-hosted endpoints)
+        into a configuration declaration via <code>@earendil-works/pi-ai</code> — route names deliberately differ
+        from the official ones (e.g. pi-ai's <code>deepseek</code>) so both adapters can coexist</td>
+      </tr>
+      <tr>
+        <td><code>dsh-llm-retry</code></td>
+        <td>the retry executor</td>
+        <td>does not wrap <code>ctx.llm.stream()</code>; hangs on <code>agent/request-error</code> and retries
+        with backoff per each provider's retryPolicy, landing <code>llm/retry</code> /
+        <code>llm/retry-started</code> durable events around the wait</td>
+      </tr>
+      <tr>
+        <td><code>dsh-token-meter</code></td>
+        <td>token metering</td>
+        <td><code>ctx.tokenMeter</code> folds usage per session from the log (a fixed 4-chars/token heuristic),
+        shared by pressure-sensitive plugins like compaction; optionally exposes tokenUsage /
+        contextPressure / contextBreakdown projections</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    The two designs — 'retry does not wrap stream' and 'metering folds from the log' — embody
+    the same principle: <strong>every cross-boundary observable fact takes the log as its source
+    of truth</strong>; in-process wrapping only does policy. Note also the pairings: llm-retry
+    consumes the retryPolicy carried by the adapter registration; token-meter reuses the
+    provider-reported usage (the usage field in assistant/message), falling back to heuristic
+    estimation only when they cannot be aligned.
+  </p>
+
+  <h2 id="sec-default-model">10.5 Request configuration: from default model to request/header</h2>
+
+  <p>
+    Where does an agent's provider/model come from? Entry points (such as
+    <code class="small">dsh --profile headless</code>, or the Host-side ApiProxy), when creating
+    an Agent with no session-local selection, read <code>ctx.agentDefaultModel</code> provided by
+    <code>packages/core/agent-default-model</code>: the plugin config requires
+    <code>{provider, model}</code>;
+    <code class="small">currentSelection()</code> returns the current selection (a settings
+    provider may layer user choice on top of it);
+    <code class="small">saveSelection()</code> persists the full user selection. It does not
+    validate catalog membership — 'is this model available' is diagnosed by whichever party
+    actually opens the request.
+  </p>
+  <p>
+    Once chosen, how does the configuration become a request? Chapter 7 already showed the
+    <code>buildRequest()</code> skeleton; here are the LLM-side details:
+  </p>
+  <ol>
+    <li>
+      The <code>agent/request</code> waterfall proposes an <code>LlmCallConfig</code>
+      (provider/model/reasoningEffort/temperature/maxTokens/stop — session-level state, not
+      knobs to tweak casually).
+    </li>
+    <li>
+      <code class="small">ctx.llm.prepareCall(config)</code> performs an exact-model lookup:
+      validates explicit effort, materializes adapter defaults (which fields came from defaults
+      is recorded in the <code>adapterDefaults</code> marker), and binds the current adapter
+      registration and immutable retryPolicy into a one-shot <code>PreparedLlmCall</code> —
+      afterwards, even an HMR adapter swap cannot splice vendor A's capability query with
+      vendor B's request.
+    </li>
+    <li>
+      The loop lands the effective configuration in the log as a <code>request/header</code>
+      event (the first entry's reason is <code>initial</code>/<code>resume</code>; afterwards
+      <code>change</code> lands only on actual change); provider/model/context-window changes
+      additionally land a <code>request/context</code> event.
+      The next proposal omits fields marked as adapter defaults — after a route switch, each
+      field is resolved fresh, unpolluted by stale defaults.
+    </li>
+  </ol>
+  <p>
+    So 'how the model was called at the time', like 'what the model saw at the time', is fully
+    reconstructible from the log. A side note on the test channel: real-API e2e tests read
+    <code>DEEPSEEK_API_KEY</code> (optionally <code>DEEPSEEK_BASE_URL</code>) and self-skip
+    without a key — credentials never enter configuration files; they resolve by reference
+    through <code>ctx.credentials</code>.
+  </p>
+
+  <div class="box key">
+    <div class="box-title">The key intuition of this chapter</div>
+    <p style="margin:.4rem 0 0;">
+      The LLM layer compresses 'vendor differences' into the single point of the adapter,
+      'streaming facts' into the two events chunk and message, and 'call configuration' into
+      the single log line request/header. With those three done, the rest of the system can be
+      completely oblivious to 'which model, which vendor'.
+    </p>
+  </div>
+
+  <h2 id="sec-recap">10.6 Chapter recap</h2>
+  <ul>
+    <li><code>ctx.llm</code> = vendor-neutral vocabulary + adapter registry; <code>registerAdapter(providers, adapter)</code> allows one adapter per provider route — switching vendors is switching plugins.</li>
+    <li>Three vocabulary levels: Message (immutable, with id/role/source) → content blocks (text/reasoning/tool-call/tool-result, merge-extensible) → the StreamChunk raw stream protocol (seven block kinds, exactly one terminal finish; failures also go through finish instead of throwing).</li>
+    <li><code>BlockAssembler</code> is the single assembler; chunks are consumed on two tracks: landing <code>assistant/chunk</code> for fidelity + accumulating blocks; only on stream termination does one <code>assistant/message</code> land, and deriveMessages recognizes only message.</li>
+    <li>llm group division of labor: llm (vocabulary/service), llm-deepseek (the deepseek-official route), llm-pi-ai (multi-provider), llm-retry (hangs on agent/request-error, lands llm/retry events), token-meter (folds usage from the log).</li>
+    <li><code>ctx.agentDefaultModel</code> gives entry points the deployment default; <code>prepareCall()</code> binds exact-model defaults and the retryPolicy; effective configuration lands in the log as <code>request/header</code>, with adapter-default fields marked and re-resolved on route switches.</li>
+    <li>e2e tests read <code>DEEPSEEK_API_KEY</code> / <code>DEEPSEEK_BASE_URL</code> and self-skip without a key; credentials resolve by reference via <code>ctx.credentials</code>.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming an adapter failure throws across the boundary — it does not: all failures are normalized into the stream's terminal finish (error/aborted), and consumers discard the unfinished blocks.</li>
+      <li>Treating <code>listModels()</code> as a routing whitelist — the catalog is an advisory discovery surface; unlisted model ids pass through as-is.</li>
+      <li>Mutating the request inside an <code>llm/stream</code> listener or forgetting <code>next()</code> — requests are deep-frozen (loop requests are additionally invariant-checked), and forgetting next() short-circuits the whole chain.</li>
+      <li>Assuming retry is a resend loop wrapped around stream — llm-retry hangs on <code>agent/request-error</code>; every adapter call is exactly one vendor attempt.</li>
+      <li>Assuming <code>request/header</code> lands every step — it lands only on the first entry (initial/resume) and on actual change (change); sampling configuration is session-level state, not a per-step knob.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="10">
+    <h2>Chapter 10 Test</h2>
+
+    <div class="q" data-id="10-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — write a new LlmAdapter subclass and register its provider route with registerAdapter; loop/session/UI need no changes."
+         data-rationale="C is correct. A is wrong: the llm layer exists precisely to confine vendor differences to the adapter; changing nothing elsewhere is the norm. B is wrong: that is the generic path llm-pi-ai already provides, but not the only option. D is wrong: the model discovery surface is advisory and carries no onboarding duty."
+         data-review="sec-adapter-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> What is the right way to onboard a new model vendor?</div>
+      <label class="opt"><input type="radio" name="q-10-1" value="a"> A. Modify the agent-loop and session packages to adapt to the new API</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="b"> B. You must use llm-pi-ai and write provider configuration for it</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="c"> C. Write an LlmAdapter subclass implementing stream() and register its provider route with registerAdapter</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="d"> D. Just register the new model in the listModels catalog</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A, B, D are correct. C is wrong: message content is an array of typed blocks, not a single string; 'one blob of plain text' is just one possible value of a text block."
+         data-review="sec-streaming">
+      <div class="prompt"><span class="qnum">Q2.</span> Which statements about the message and streaming vocabulary are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="a"> A. A Message carries a stable id from construction and is deep-frozen immutable</label>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="b"> B. An assistant message's source carries provider/model and optional replayState</label>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="c"> C. Message content is one plain-text string, split into blocks by line during streaming</label>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="d"> D. The StreamChunk protocol includes block-start/text-delta/…/usage/finish, with usage before finish</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-3" data-type="fill" data-accepted='["assistant/message","assistant message","message"]'
+         data-answer="assistant/message."
+         data-rationale="Chunks serve only UI rendering and faithful replay; deriveMessages takes only message events — Chapter 4's division landed on the streaming path."
+         data-review="sec-stream-to-log">
+      <div class="prompt"><span class="qnum">Q3.</span> Fill in the blank: when <code>deriveMessages()</code> derives the model history, the assistant side recognizes only ______ events.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B — the failed attempt's chunks stay in the log but are never assembled into a message, so the model history stays unpolluted."
+         data-rationale="B is correct. A is wrong about 'rollback/deletion' — the log is append-only and failure traces are kept. C is wrong: no such synthetic replay exists. D is wrong: a failed stream precisely produces no message event."
+         data-review="sec-stream-to-log">
+      <div class="prompt"><span class="qnum">Q4.</span> After a model request fails mid-stream (finish is error), what happens to the <code>assistant/chunk</code> events already landed?</div>
+      <label class="opt"><input type="radio" name="q-10-4" value="a"> A. They are rolled back and deleted; the log returns to its pre-request state</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="b"> B. They stay in the log but are never assembled into an assistant/message and never enter the model history</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="c"> C. They are synthesized into a truncated assistant/message for UI replay</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="d"> D. They are automatically replaced with placeholder text of equal length</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-5" data-type="mcq" data-correct='["a"]'
+         data-answer="A — deepseek-official; deliberately distinct from pi-ai's route name, and the two can coexist."
+         data-rationale="A is correct. B is the catalog route name on the llm-pi-ai side. C and D are not real route names. Registering a duplicate name on the same route throws DUPLICATE_ADAPTER."
+         data-review="sec-adapters">
+      <div class="prompt"><span class="qnum">Q5.</span> Which provider route name does <code>dsh-llm-deepseek</code> own exclusively?</div>
+      <label class="opt"><input type="radio" name="q-10-5" value="a"> A. deepseek-official</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="b"> B. deepseek</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="c"> C. dsk</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="d"> D. official-deepseek</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C — llm-retry hangs on the agent/request-error waterfall, retrying with backoff per the provider's retryPolicy; every adapter call remains a single attempt."
+         data-rationale="C is correct. A is exactly what it does not do (the README says it does not wrap ctx.llm.stream). B is wrong: dsh is vendor-neutral and retry is brand-agnostic. D is wrong: both the wait and the start land durable events."
+         data-review="sec-adapters">
+      <div class="prompt"><span class="qnum">Q6.</span> How does <code>dsh-llm-retry</code> implement retries?</div>
+      <label class="opt"><input type="radio" name="q-10-6" value="a"> A. It wraps ctx.llm.stream(), resending inside the stream</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="b"> B. It works only for the DeepSeek vendor</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="c"> C. It listens on agent/request-error, backs off per the retryPolicy each provider carried at registration, and lands llm/retry and llm/retry-started events around the wait</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="d"> D. It retries silently, producing no log events</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-7" data-type="mcq" data-multiselect="true" data-correct='["a","d"]'
+         data-answer="A and D."
+         data-rationale="A, D are correct: prepareCall materializes adapter defaults and marks their origin, and the bound registration keeps HMR from mixing vendors. B is wrong: prepareCall rejects its own reuse or field mutation (INVALID_PREPARED_CALL), unrelated to whether the loop's request is frozen. C is wrong: explicit request values win; defaults materialize only when the request omits them."
+         data-review="sec-default-model">
+      <div class="prompt"><span class="qnum">Q7.</span> Which statements about <code>prepareCall()</code> and request configuration are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="a"> A. It performs an exact-model lookup, materializes adapter defaults, and marks which fields came from defaults</label>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="b"> B. It rejects every frozen request</label>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="c"> C. An adapter-default maxTokens overrides the user's explicitly requested value</label>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="d"> D. It binds the current adapter registration and retryPolicy into a one-shot PreparedLlmCall, preventing HMR from splicing results from two vendors</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B — the first is initial/resume; afterwards change lands only on actual change."
+         data-rationale="B is correct. A would flood the log for no reason (configuration is session-level state). C and D confuse durable and live events (request/header is durable)."
+         data-review="sec-default-model">
+      <div class="prompt"><span class="qnum">Q8.</span> What is the landing cadence of <code>request/header</code> events?</div>
+      <label class="opt"><input type="radio" name="q-10-8" value="a"> A. One per step</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="b"> B. The first carries initial/resume; afterwards change lands only on actual change</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="c"> C. Only one at process startup, never again</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="d"> D. It is a live event and never enters the log</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-9" data-type="mcq" data-correct='["d"]'
+         data-answer="D — token-meter folds usage per session from the log, preferring the provider-reported usage and falling back to the heuristic only when they cannot be aligned."
+         data-rationale="D is correct. A is wrong: token-meter does not intercept on the stream path. B is wrong: there is no config option; the heuristic is deliberately fixed. C is wrong: 'calling a provider counting API' is invented."
+         data-review="sec-adapters">
+      <div class="prompt"><span class="qnum">Q9.</span> How does <code>dsh-token-meter</code> do its metering?</div>
+      <label class="opt"><input type="radio" name="q-10-9" value="a"> A. It intercepts every request inside the llm/stream waterfall and counts on the spot</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="b"> B. It calls each provider's official counting API, with configurable parameters</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="c"> C. Each adapter reports by itself; token-meter only aggregates for display</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="d"> D. It folds per session from the durable log: when request envelopes line up it reuses the provider usage in assistant/message, otherwise it falls back to the 4-chars/token heuristic</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-10" data-type="fill" data-accepted='["DEEPSEEK_API_KEY","deepseek_api_key"]'
+         data-answer="DEEPSEEK_API_KEY (optionally DEEPSEEK_BASE_URL; e2e self-skips without a key)."
+         data-rationale="The real-API e2e channel reads these two environment variables; credentials never enter configuration files and resolve by reference through ctx.credentials."
+         data-review="sec-default-model">
+      <div class="prompt"><span class="qnum">Q10.</span> Fill in the blank: real-API e2e tests read the environment variable <code>______</code> (and self-skip when it is missing).</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-11" data-type="short"
+         data-key-points='["llm/stream is a waterfall: cache/log/routing plugins wrap here, must call next(); the request is deep-frozen and carries the sessionId mark","every chunk lands as an assistant/chunk event and simultaneously feeds BlockAssembler (dual track)","only a normally terminating stream lands assistant/message (usage/source/sourceEventSeqs); deriveMessages recognizes only message","failed streams go through agent/request-error: keep the error by default, the retry action re-issues within the same step; failed chunks never become a message","call configuration is proposed via agent/request, bound by prepareCall with adapter defaults and retryPolicy, and landed in request/header for reconstruction"]'
+         data-answer="The loop builds a frozen request marked with sessionId, enters the llm/stream waterfall (cache/log/routing plugins live here; they must call next()), reaches the adapter bound by that call's prepareCall, and the adapter emits a StreamChunk stream. The loop consumes on two tracks: every chunk lands as an assistant/chunk event and feeds BlockAssembler; only when the stream terminates normally is one assistant/message assembled (carrying usage, the provider/model source, and sourceEventSeqs referencing all chunks), and deriveMessages recognizes only message events, so the next step's request prefix stays consistent with the log-derived history. A failed stream terminates with an error/aborted finish and goes through agent/request-error (keep the error by default; retry re-issues within the same step), with failed chunks staying in the log but never becoming a message. Call configuration is proposed by agent/request, bound by prepareCall, and its effective values land in request/header — the call side is equally reconstructible from the log."
+         data-rationale="Check against the diagram in 10.3: waterfall, dual-track chunks, message finalization and derivation, the failure path, and configuration landing — with all five blocks present, it is complete."
+         data-review="sec-stream-to-log">
+      <div class="prompt"><span class="qnum">Q11.</span> Describe in your own words the complete path of a streaming reply, from the agent loop issuing it to its entry into the session log, including how failed streams are handled. To connect: why is the call configuration also reconstructible from the log?</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a point you actually covered — under-checking hurts the book's calibration of you; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    Next chapter: <a href="11-capability-seams.html"><strong>Chapter 11 · The Capability Seam Pattern</strong></a>.
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

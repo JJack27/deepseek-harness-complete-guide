@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 21 · ACP, the SDKs, and Python — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 21 · ACP, the SDKs, and Python</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/21-acp-sdk-python.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="21">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 21 · Part IV · Product Surface and Protocols</div>
+    <h1>ACP, the SDKs, and Python</h1>
+    <p class="lede">
+      The Web UI is only one way for a human to drive. When the driver is another program — an
+      orchestrator, a test framework, another agent harness — dsh offers three out-of-process
+      paths: the ACP server, the TypeScript SDK, and the Python SDK. The three differ in form but
+      share one foundation: each drives a complete harness process over JSON-RPC on stdio, and none
+      needs a browser. This chapter lays them out side by side and gives you the criteria for
+      choosing.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State the shared foundation of the three out-of-process drive paths and the form each takes.</li>
+      <li>Describe ACP's automation-only positioning, its method surface, and the trade-off of putting only committed messages on the wire.</li>
+      <li>Distinguish the roles of the SDK's three packages: protocol (the wire contract), server (the plugin), client (the TS client).</li>
+      <li>Explain the division of labor between the two Python distributions, and why zero configuration is explicit parameter injection rather than a hidden fallback.</li>
+      <li>Choose a path for a caller by situation: a standard-protocol client, repo-adjacent TS automation, or pip-install-and-go.</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-three-paths">21.1 Three out-of-process drive paths</h2>
+
+  <p>
+    Remove the entire browser half of Chapters 19 and 20, and the remaining host process is still
+    a complete harness: agents, the session log, the tool pipeline, and the full capability
+    surface are all there. So a program acting as the client needs exactly one thing — an
+    inter-process protocol. dsh provides three:
+  </p>
+
+  <ul>
+    <li><strong>ACP</strong> (<code>packages/acp/acp</code>): implements the external
+        <a href="https://agentclientprotocol.com">Agent Client Protocol</a>, JSON-RPC over
+        stdio, for any client that speaks that standard protocol; the typical in-repo client is
+        <code>dsh-subagent-acp</code> (Chapter 14).</li>
+    <li><strong>TypeScript SDK</strong> (<code>packages/sdk/</code>): a TS client plus a server
+        plugin for the in-house deepseek-harness-style protocol — newline-delimited JSON-RPC 2.0
+        over stdio; the example bin is <code>dsh-jsonrpc-agent</code>.</li>
+    <li><strong>Python SDK</strong> (<code>python/</code>): a Python client for the same protocol,
+        plus a distribution that bundles the runtime binary — usable straight after pip install.</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Comparison of the three out-of-process drive paths">
+      <rect x="10" y="20" width="270" height="96" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="145" y="46" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Path 1: ACP client</text>
+      <text x="145" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Standard Agent Client Protocol</text>
+      <text x="145" y="82" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Typical: dsh-subagent-acp (Ch. 14)</text>
+      <text x="145" y="98" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Other dsh instances use it as a subagent backend</text>
+
+      <rect x="10" y="128" width="270" height="96" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="145" y="154" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Path 2: TypeScript SDK</text>
+      <text x="145" y="174" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">dsh-sdk-client (DeepSeekHarness /</text>
+      <text x="145" y="188" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">HarnessClient), fully explicit launch</text>
+      <text x="145" y="204" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">bin: dsh-jsonrpc-agent</text>
+
+      <rect x="10" y="236" width="270" height="96" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="145" y="262" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Path 3: Python SDK</text>
+      <text x="145" y="282" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">deepseek-harness-sdk (deepseek_harness)</text>
+      <text x="145" y="296" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">+ deepseek-harness-runtime-bin</text>
+      <text x="145" y="312" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Auto-starts bundled runtime when no channel is pinned</text>
+
+      <rect x="330" y="110" width="200" height="132" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="430" y="138" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">JSON-RPC over stdio</text>
+      <text x="430" y="160" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ACP: JSON-RPC over stdio</text>
+      <text x="430" y="176" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">SDK: newline-delimited JSON-RPC 2.0</text>
+      <text x="430" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">One frame per line, ends with \n</text>
+      <text x="430" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9" font-style="italic">stdout is the protocol;</text>
+      <text x="430" y="228" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9" font-style="italic">diagnostics go to stderr</text>
+
+      <line x1="280" y1="68" x2="328" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="328,140 319,138 322,146" style="fill:var(--muted)"/>
+      <line x1="280" y1="176" x2="328" y2="176" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="328,176 320,172 320,180" style="fill:var(--muted)"/>
+      <line x1="280" y1="284" x2="328" y2="212" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="328,212 320,215 326,221" style="fill:var(--muted)"/>
+
+      <line x1="530" y1="176" x2="578" y2="176" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="578,176 570,172 570,180" style="fill:var(--muted)"/>
+
+      <rect x="578" y="110" width="312" height="132" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="734" y="138" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">dsh subprocess (full harness)</text>
+      <text x="734" y="160" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ACP face: dsh-acp-demo (pnpm run demo:acp)</text>
+      <text x="734" y="176" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">SDK face: jsonrpc plugin (inject: agents)</text>
+      <text x="734" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Python bundle: dsh-jsonrpc-agent-pkg-*</text>
+      <text x="734" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">In-process: ctx.agents + session log + tool pipeline</text>
+      <text x="734" y="230" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">(the full capability surface of Ch. 3–17)</text>
+
+      <text x="450" y="60" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10" font-style="italic">Shared by all three paths: none needs a browser</text>
+      <text x="450" y="330" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10" font-style="italic">They differ in upstream ecosystem (standard protocol vs in-house SDK) and distribution form (npm packages vs pip packages + bundled binaries)</text>
+    </svg>
+    <figcaption>The three drive paths compared: ACP, the TS SDK, and the Python SDK all drive a complete dsh subprocess over stdio JSON-RPC; the differences are protocol ownership, the client ecosystem, and how the runtime is obtained.</figcaption>
+  </figure>
+
+  <h2 id="sec-acp">21.2 ACP: the automation-only Agent Client Protocol</h2>
+
+  <p>
+    <code>packages/acp/acp</code> (<code>@deepseek-ai/dsh-acp</code>) is the
+    <strong>automation-only</strong> ACP server on stdio. Read its positioning precisely: it is a
+    <strong>transport adapter</strong>, not a UI integration and not a capability seam — it
+    provides no editor navigation, transcript replay, commands, modes, configuration selector,
+    elicitation, reasoning display, plans, titles, or tool presentation; interactive rendering and
+    human-facing questions belong to the Web host and client modules (Chapter 19). The plugin's
+    <code>apply</code> opens an <code>AgentSideConnection</code> over stdin/stdout and drives
+    <code>ctx.agents</code>; stdout is reserved for protocol frames, and diagnostics go to stderr.
+  </p>
+
+  <p>The method surface is small and deliberately restrained:</p>
+
+  <table>
+    <thead><tr><th>Method</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td><code>initialize</code></td><td>Negotiates the supported version and advertises only the baseline-only prompting capability; it declares no session, editor, terminal, filesystem, or MCP capabilities. <code>authenticate</code> is a no-op.</td></tr>
+      <tr><td><code>session/new</code></td><td>Creates a brand-new agent; the primary <code>cwd</code> is resolved to an absolute path; empty <code>additionalDirectories</code> and <code>mcpServers</code> are accepted, non-empty ones are rejected.</td></tr>
+      <tr><td><code>session/prompt</code></td><td>Concatenates text blocks and renders baseline resource links as bracketed text references; rejects empty input; one in-flight request per session; waits for the whole agent to be idle. A normal quiet finish reports <code>end_turn</code>; an explicitly cancelled or abandoned admission reports <code>cancelled</code>.</td></tr>
+      <tr><td><code>session/cancel</code></td><td>Cancels only the named agent; unknown ids are a no-op.</td></tr>
+      <tr><td><code>session/update</code></td><td>Emits one <code>agent_message_chunk</code> for each non-empty text block of each <strong>committed</strong> <code>assistant/message</code>; raw deltas and non-message events never reach the wire.</td></tr>
+      <tr><td><code>session/request_permission</code></td><td>Offers an allow/reject choice for one-shot approval requests carrying a tool-call id; the client may answer automatically.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Sending only committed messages deliberately trades token-level latency for a clean automation
+    result: uncommitted provider stream chunks and retry attempts can never leak half-finished
+    text; reasoning and tool activity stay in the session log for other interfaces to observe. The
+    model's view stays as clean as always (the rule from Chapter 4 holds here too): the text of
+    <code>session/prompt</code> is joined verbatim into a single user message, and protocol
+    metadata, client capabilities, permission choices, and session ids never enter a model request;
+    the product of a permission decision is just the owning tool's ordinary tool result. On
+    lifecycle, disconnection and Cordis disposal share one memoized cleanup: first reject new
+    sessions and prompts and settle in-flight prompts, then drain and destroy in parallel only
+    within the continuable descendants this connection <strong>precisely owns</strong> — Contexts
+    shared with other frontends keep their own forests, and an ACP-only plugin reload leaves no
+    orphan agents. The runnable composition is <code>pnpm run demo:acp</code> (the
+    <code>dsh-acp-demo</code> bin of <code>packages/examples/acp-demo</code>: agent spine + JSONL
+    persistence + checkpoint policy + ACP transport, where stdout is the protocol).
+  </p>
+
+  <h2 id="sec-sdk">21.3 The TS SDK: protocol, server, client</h2>
+
+  <p>
+    The three packages under <code>packages/sdk/</code> split the in-house protocol into three
+    layers:
+  </p>
+
+  <ul>
+    <li><code>dsh-sdk-protocol</code> — the shared wire contract: <code>JsonRpcLineTransport</code>
+        frames JSON-RPC 2.0 onto a caller-owned byte stream (one frame per line, compact JSON
+        terminated by <code>\n</code>; a message with both id and method is a request, id-only is a
+        response, method-only is a notification; malformed JSON lines are ignored), plus the named
+        request/result/notification types both ends share. A pure library, no plugin.</li>
+    <li><code>dsh-sdk-jsonrpc-server</code> (server) — the <code>jsonrpc</code> plugin with
+        <code>inject: ['agents']</code>: gets or creates one agent per <code>sessionId</code>,
+        streams every persisted session fact as <code>session.event</code> and every whole-agent
+        lifecycle flip as <code>session.status</code>. After replying to <code>shutdown</code> it
+        destroys the root context to quiescence and then exits 0.</li>
+    <li><code>dsh-sdk-client</code> (client) — the TS client, two layers: <code>DeepSeekHarness</code>
+        is the high-level owned-run API and <code>HarnessClient</code> the low-level protocol
+        client. It is a design twin of the Python SDK; the difference is that the launch spec is
+        fully explicit (<code>command</code>/<code>args</code>) — discovery of the bundled runtime
+        is left to the Python distribution.</li>
+  </ul>
+
+  <p>
+    The wire's request/notification surface is worth memorizing. Three requests:
+    <code>initialize</code> (cwd crosses the wire absolutized, carrying provider/model routing and
+    an optional positive-integer <code>maxTokens</code> output cap — effective for the root agent
+    and its in-process descendants), <code>session/prompt</code> (queues an id-bearing user message
+    and <strong>immediately</strong> returns a <code>{ messageId }</code> enqueue receipt), and
+    <code>shutdown</code>. Four notifications: <code>session.event</code> (events of
+    <strong>every</strong> session in the runtime, unfiltered — narrowing by session is the
+    client's own job), <code>session.status</code> (whole-agent running/idle flips),
+    <code>subagent.started</code>, and <code>subagent.finished</code> (in-process runs only).
+    <code>messageId</code> identifies the queued <code>UserMessage</code> — <strong>not</strong>
+    the assistant message that follows, not the turn end, and not the result of that prompt. The
+    protocol has no cancel method: the way to abandon a turn is to kill the runtime process.
+  </p>
+
+  <p>
+    How the high-level <code>DeepSeekHarness</code> builds run-once-get-a-result on top of these
+    primitives:
+  </p>
+
+  <pre><code><span class="code-key">await using</span> harness = <span class="code-key">new</span> <span class="code-fn">DeepSeekHarness</span>({
+  launch: { command: <span class="code-str">'node'</span>, args: [<span class="code-str">'lib/bin.js'</span>, <span class="code-str">'cordis.yml'</span>] },
+  provider: <span class="code-str">'deepseek-official'</span>,
+  model: <span class="code-str">'deepseek-v4-flash'</span>,
+})
+<span class="code-key">const</span> result = <span class="code-key">await</span> harness.<span class="code-fn">run</span>(<span class="code-str">'say hi'</span>)
+console.<span class="code-fn">log</span>(result.finalResponse)</code></pre>
+
+  <p>
+    <code>run()</code> owns <strong>one activity interval</strong>: it submits the prompt, waits
+    for its <code>MessageId</code> to appear in the persisted <code>agent/inbox/spliced</code>
+    receipt, then collects everything up to the next whole-agent <code>idle</code>; it returns a
+    <code>RunResult</code> (sessionId, finalResponse, events, notifications).
+    <code>finalResponse</code> is the <strong>last committed</strong> assistant text of the root
+    session within that interval — not the reply causally attributable to this prompt; steering
+    messages, injected context, and other queued work can all contribute content before idle. The
+    subprocess starts lazily and is held by the instance, reused across <code>run()</code> calls;
+    <code>close()</code> (or <code>await using</code>) must be called, and internally it walks the
+    protocol <code>shutdown</code> → stdin-EOF → SIGTERM → SIGKILL ladder until the process
+    actually exits. The example bin is <code>dsh-jsonrpc-agent</code> from
+    <code>packages/examples/jsonrpc-demo</code>: it only launches an external
+    <code>cordis.yml</code> (<code>$DSH_CORDIS_CONFIG</code> or a positional argument; missing
+    config prints one usage line and exits 1) and does not pick the server plugin — the
+    composition must include <code>dsh-sdk-jsonrpc-server</code> for there to be anything to
+    serve. stdin EOF and signals go through the same teardown; EOF can cut off an in-flight turn,
+    so use the protocol-level <code>shutdown</code> for an orderly finish.
+  </p>
+
+  <h2 id="sec-python">21.4 Python: two distributions and the bundled runtime</h2>
+
+  <p>
+    <code>python/</code> ships two distributions: <code>deepseek-harness-sdk</code> (module
+    <code>deepseek_harness</code>, the high-level turns API + the low-level JSON-RPC client) and
+    <code>deepseek-harness-runtime-bin</code> (module <code>deepseek_harness_runtime</code>, the
+    bundled runtime binary and the default agent configuration). Installing the former pulls in
+    the same-version platform wheel of the latter:
+  </p>
+
+  <pre><code><span class="code-key">from</span> deepseek_harness <span class="code-key">import</span> DeepSeekHarness
+
+<span class="code-key">with</span> <span class="code-fn">DeepSeekHarness</span>() <span class="code-key">as</span> harness:
+    result = harness.<span class="code-fn">run</span>(<span class="code-str">"Say hi."</span>)</code></pre>
+
+  <p>
+    When no channel is pinned, the SDK automatically launches the matching bundled runtime: by
+    default it launches the single-file executable
+    <code>dsh-jsonrpc-agent-pkg-&lt;platform&gt;-&lt;arch&gt;</code> (linux/macos × x64/arm64; the
+    target machine needs no Node install) and injects the distribution's own default composition
+    via <code>DSH_CORDIS_CONFIG</code> — the stdio JSON-RPC service entry, the agent core, the
+    preloaded DeepSeek adapter, JSONL persistence with an explicit semantic checkpoint policy, and
+    local bash. There is also a dev-only node carrier (the full deploy closure running on the
+    system Node), which is selected only when <code>DSH_RUNTIME_MODE=node</code> is set
+    explicitly — a production deployment must never silently ride on a source build. To use your
+    own plugin composition: keep the <code>@deepseek-ai/dsh-sdk-jsonrpc-server</code> entry in the
+    config and point <code>cordis=</code> at your cordis.yml. The runtime inherits
+    <code>DEEPSEEK_API_KEY</code>, <code>DEEPSEEK_BASE_URL</code>, and other environment
+    variables.
+  </p>
+
+  <p>
+    One piece of the design must be read precisely: <strong>the runtime always requires an
+    explicit configuration</strong> — without <code>$DSH_CORDIS_CONFIG</code> or a positional
+    argument it exits loudly, and that is the runtime's designed semantics, which
+    <code>deepseek-harness-runtime-bin</code> does not soften. Zero configuration is a single
+    explicit, visible parameter injection on the wrapper side, not a hidden fallback inside the
+    runtime. The high-level API matches its TS twin semantically: <code>Session.run()</code> owns
+    the activity interval from the persisted enqueue receipt to the next whole-agent idle and
+    returns <code>RunResult(session_id, final_response, finish_reason, events, notifications,
+    session_root)</code>; <code>finish_reason</code> is the <code>kind</code> of the root session's
+    last <code>turn/end</code> within the interval (for example <code>completed</code>,
+    <code>max-tokens</code>, <code>error</code>), or <code>None</code> if no turn ended.
+    <code>events</code> contains only root-session events — descendant messages cannot stand in
+    for the root answer; <code>notifications</code> and <code>on_notification</code> receive, in
+    wire order, all notifications from the root session plus discovered descendants. The low-level
+    <code>session_prompt()</code> likewise returns only a <code>MessageId</code>; you manage the
+    activity boundary yourself.
+  </p>
+
+  <h2 id="sec-choosing">21.5 How to choose</h2>
+
+  <p>
+    The three paths are not three tastes; they are three situations:
+  </p>
+
+  <table>
+    <thead><tr><th>Situation</th><th>Choose</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td>The client speaks standard ACP (orchestrators, other harnesses, general agent clients)</td><td>ACP</td><td>The standard protocol surface is small and stable; automation-only semantics fit external driving naturally; dsh can serve as another dsh's subagent backend (<code>dsh-subagent-acp</code>, Chapter 14).</td></tr>
+      <tr><td>Repo-adjacent TypeScript automation, CI, in-house tooling</td><td>TS SDK</td><td>The launch spec is fully explicit and the types come straight from <code>dsh-sdk-protocol</code>; fits callers who know exactly which runtime they are starting.</td></tr>
+      <tr><td>The Python ecosystem, scripts, notebooks, fastest start</td><td>Python SDK</td><td>Usable right after pip install; the bundled runtime spares a Node install; <code>DeepSeekHarness().run()</code> shows a result in three lines.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Whichever you choose, three things hold: stdout is the protocol (deployments must not compose
+    a stdout logger into it); the result is an aggregate over an activity interval, not a causal
+    attribution (if you need causality, define the interval yourself on the event stream);
+    cancellation is by killing the process or ACP's explicit <code>session/cancel</code> — the SDK
+    wire has no per-prompt cancel.
+  </p>
+
+  <h2 id="sec-recap">21.6 Chapter recap</h2>
+  <ul>
+    <li>The three out-of-process drive paths (ACP, TS SDK, Python SDK) share one foundation: all drive a full harness subprocess over stdio JSON-RPC, and none needs a browser.</li>
+    <li>ACP is an automation-only transport adapter: method surface initialize/session/new|prompt|cancel/update/request_permission; it emits only committed assistant text; permission choices never enter a model request; connection teardown cleans only the continuable descendants it precisely owns.</li>
+    <li>The SDK's three packages: protocol (the newline-delimited JSON-RPC 2.0 wire contract, a pure library), server (the <code>jsonrpc</code> plugin, inject agents), client (<code>DeepSeekHarness</code>/<code>HarnessClient</code>, fully explicit launch).</li>
+    <li>Wire semantics: <code>session/prompt</code> immediately returns a <code>{ messageId }</code> enqueue receipt; notifications are session.event/session.status/subagent.started|finished; there is no cancel method — abandoning a turn means killing the process.</li>
+    <li>Python's two distributions: the sdk automatically launches the matching bundled runtime and injects the default composition via <code>DSH_CORDIS_CONFIG</code>; the runtime itself always requires explicit configuration — zero config is an explicit wrapper injection, not a hidden fallback.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Treating ACP as a UI integration or a capability seam — it is an automation-only transport adapter; editor navigation, transcript, and mode switching are not on its surface.</li>
+      <li>Expecting streaming tokens from ACP — only committed <code>assistant/message</code> text blocks reach the wire; raw deltas never leave.</li>
+      <li>Reading <code>{ messageId }</code> as the id of the prompt's reply — it identifies the enqueued UserMessage; the final reply comes from aggregating an activity interval.</li>
+      <li>Adding a stdout logger to the runtime's composition — stdout is the JSON-RPC channel; logs go to stderr.</li>
+      <li>Assuming Python's zero config is default runtime behavior — without explicit configuration the runtime exits loudly; the injection happens in the wrapper's <code>start()</code>.</li>
+      <li>Forgetting <code>close()</code>/<code>await using</code> — the subprocess is held by the instance and leaks if you do not close it.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="21">
+    <h2>Chapter 21 Test</h2>
+
+    <div class="q" data-id="21-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — All three paths drive a full harness subprocess over JSON-RPC on stdio, with no browser needed."
+         data-rationale="B is correct. A is wrong: the two paths besides ACP use the in-house protocol. C is wrong: ACP runs over stdio, and so do the SDKs. D is wrong: each path's process is a full harness composition whose configuration decides the capability surface."
+         data-review="sec-three-paths">
+      <div class="prompt"><span class="qnum">Q1.</span> What is the shared foundation of the three out-of-process drive paths?</div>
+      <label class="opt"><input type="radio" name="q-21-1" value="a"> A. They all speak the standard Agent Client Protocol</label>
+      <label class="opt"><input type="radio" name="q-21-1" value="b"> B. They all drive a complete harness subprocess over JSON-RPC on stdio, no browser needed</label>
+      <label class="opt"><input type="radio" name="q-21-1" value="c"> C. They all use JSON-RPC over HTTP</label>
+      <label class="opt"><input type="radio" name="q-21-1" value="d"> D. They all mount only a minimal agent core, without the tool pipeline</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — An automation-only transport adapter: it serves programmatic clients only and provides no editor navigation, transcript, modes, configuration selector, or other human-facing surface."
+         data-rationale="C is correct. A is wrong: interactive rendering belongs to the Web host/client modules. B is wrong: it drives ctx.agents, but its own positioning is a transport adapter, not a seam. D is wrong: it has a real in-repo client (subagent-acp)."
+         data-review="sec-acp">
+      <div class="prompt"><span class="qnum">Q2.</span> What is the positioning of <code>@deepseek-ai/dsh-acp</code>?</div>
+      <label class="opt"><input type="radio" name="q-21-2" value="a"> A. A full client with an interactive interface</label>
+      <label class="opt"><input type="radio" name="q-21-2" value="b"> B. The Service Definition of a capability seam</label>
+      <label class="opt"><input type="radio" name="q-21-2" value="c"> C. An automation-only transport adapter, exclusively for programmatic clients</label>
+      <label class="opt"><input type="radio" name="q-21-2" value="d"> D. Used only for internal repo testing, with no real client</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-3" data-type="mcq" data-correct='["a"]'
+         data-answer="A — One agent_message_chunk for each non-empty text block of each committed assistant/message; raw deltas and non-message events never reach the wire."
+         data-rationale="A is correct: token-level latency is traded for a clean automation result — uncommitted content can never leak in half-finished form. B/C/D each move uncommitted deltas, reasoning, or tool activity onto the wire, all contrary to the design."
+         data-review="sec-acp">
+      <div class="prompt"><span class="qnum">Q3.</span> What does ACP's <code>session/update</code> emit?</div>
+      <label class="opt"><input type="radio" name="q-21-3" value="a"> A. The non-empty text blocks of committed assistant/messages, one agent_message_chunk per block</label>
+      <label class="opt"><input type="radio" name="q-21-3" value="b"> B. The provider's raw streaming deltas</label>
+      <label class="opt"><input type="radio" name="q-21-3" value="c"> C. Model reasoning content</label>
+      <label class="opt"><input type="radio" name="q-21-3" value="d"> D. All tool-call activity</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-4" data-type="fill" data-accepted='["subagent-acp","dsh-subagent-acp","subagent_acp"]'
+         data-answer="dsh-subagent-acp (the ACP provider, and the repo's primary ACP client)."
+         data-rationale="It runs each subagent in a brand-new subprocess and acts as the ACP client itself — in other words, dsh can serve as another dsh's subagent backend, as covered in Chapter 14."
+         data-review="sec-acp">
+      <div class="prompt"><span class="qnum">Q4.</span> Fill in the blank: the repo's primary ACP client is <code>______</code> (the out-of-process subagent provider from Chapter 14).</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — dsh-sdk-protocol: the newline-delimited JSON-RPC 2.0 transport class plus the named request/result/notification types shared by both ends; a pure library, no plugin."
+         data-rationale="B is correct. A is wrong — that is the server package. C is wrong — that is the client package. D is wrong — the Python SDK mirrors these types but does not import it."
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q5.</span> Which package owns the wire contract (frame format and named types)?</div>
+      <label class="opt"><input type="radio" name="q-21-5" value="a"> A. dsh-sdk-jsonrpc-server</label>
+      <label class="opt"><input type="radio" name="q-21-5" value="b"> B. dsh-sdk-protocol</label>
+      <label class="opt"><input type="radio" name="q-21-5" value="c"> C. dsh-sdk-client</label>
+      <label class="opt"><input type="radio" name="q-21-5" value="d"> D. deepseek-harness-sdk (Python)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C — It returns { messageId } immediately: an enqueue receipt for the queued UserMessage, not waiting for agent activity."
+         data-rationale="C is correct. A/D are wrong: the protocol has no per-prompt result; the client defines and observes the activity interval itself. B is wrong: the return happens before any agent activity."
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q6.</span> What does the SDK protocol's <code>session/prompt</code> return?</div>
+      <label class="opt"><input type="radio" name="q-21-6" value="a"> A. The full text of the final assistant message</label>
+      <label class="opt"><input type="radio" name="q-21-6" value="b"> B. The turn-end reason, after waiting for the agent to go idle</label>
+      <label class="opt"><input type="radio" name="q-21-6" value="c"> C. An immediate { messageId } enqueue receipt</label>
+      <label class="opt"><input type="radio" name="q-21-6" value="d"> D. A causal result object for that prompt</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, C."
+         data-rationale="A/B/C are all protocol notifications. D is wrong: there is no per-prompt result notification — result semantics come from the client aggregating an activity interval, which is one of the protocol's Known Limitations."
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q7.</span> Which of the following are notification types on the SDK wire? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="a"> A. <code>session.event</code></label>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="b"> B. <code>session.status</code></label>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="c"> C. <code>subagent.started</code> / <code>subagent.finished</code></label>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="d"> D. <code>prompt.result</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D — stdout carries only JSON-RPC frames; diagnostics go to stderr, and deployments must not compose a stdout logger (the server plugin does not inspect sibling loggers; discipline is the deployment's responsibility)."
+         data-rationale="D is correct. A/B/C each misuse stdout as a log channel and would corrupt the protocol. The jsonrpc-demo bin and the boot guards likewise diagnose only on stderr."
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q8.</span> Which statement about stdio channel discipline is correct?</div>
+      <label class="opt"><input type="radio" name="q-21-8" value="a"> A. Logs may be mixed into stdout; the client will filter them out</label>
+      <label class="opt"><input type="radio" name="q-21-8" value="b"> B. Both stderr and stdout can carry protocol frames</label>
+      <label class="opt"><input type="radio" name="q-21-8" value="c"> C. The server plugin actively vetoes stdout loggers</label>
+      <label class="opt"><input type="radio" name="q-21-8" value="d"> D. stdout carries only JSON-RPC frames; diagnostics go to stderr</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Automatic resolution looks only for the production exe; the dev-only node carrier requires an explicit DSH_RUNTIME_MODE=node, so a production deployment can never silently ride on a source build."
+         data-rationale="B is correct. A is wrong: the automatic path recognizes only the exe. C is wrong: the default config injected via DSH_CORDIS_CONFIG is the cordis.yml shipped with runtime-bin; the Python side writes no config content. D is wrong: the runtime inherits DEEPSEEK_API_KEY and other environment variables."
+         data-review="sec-python">
+      <div class="prompt"><span class="qnum">Q9.</span> How does the Python SDK choose a runtime when no channel is specified?</div>
+      <label class="opt"><input type="radio" name="q-21-9" value="a"> A. Prefer the exe, falling back to the node carrier automatically when not found</label>
+      <label class="opt"><input type="radio" name="q-21-9" value="b"> B. It auto-selects only the production exe; the dev-only node carrier requires an explicit DSH_RUNTIME_MODE=node</label>
+      <label class="opt"><input type="radio" name="q-21-9" value="c"> C. It uses a built-in Python config generator to write a cordis.yml on the spot</label>
+      <label class="opt"><input type="radio" name="q-21-9" value="d"> D. It starts no runtime and installs Node on demand at the first run()</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-10" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The runtime always requires explicit configuration ($DSH_CORDIS_CONFIG or a positional argument) and exits loudly without it; zero config is the SDK explicitly injecting the config path inside start()."
+         data-rationale="C is correct: runtime-bin does not soften the runtime's hard semantics; zero config is a single explicit, visible parameter injection by the wrapper. A/B move the fallback into the runtime — exactly the excluded design. D is wrong: missing config exits loudly rather than starting an empty tree."
+         data-review="sec-python">
+      <div class="prompt"><span class="qnum">Q10.</span> What is the actual mechanism behind zero configuration in the Python distribution?</div>
+      <label class="opt"><input type="radio" name="q-21-10" value="a"> A. The runtime has a built-in default plugin tree, silently enabled when no config is present</label>
+      <label class="opt"><input type="radio" name="q-21-10" value="b"> B. The runtime falls back to the bundled cordis.yml when it finds no config</label>
+      <label class="opt"><input type="radio" name="q-21-10" value="c"> C. The runtime always requires explicit configuration; the SDK side injects the default config path into DSH_CORDIS_CONFIG inside start()</label>
+      <label class="opt"><input type="radio" name="q-21-10" value="d"> D. Without config the runtime starts with an empty composition and serves silently</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-11" data-type="short"
+         data-key-points='["ACP: standard-protocol clients and cross-harness delegation (the subagent-acp backend, Ch. 14)","TS SDK: repo-adjacent TS automation/CI, fully explicit launch spec, types straight from the protocol package","Python: pip install with zero config to get started, bundled runtime means no Node install, fits scripts and data work","Shared foundation: stdio JSON-RPC driving a full harness subprocess; stdout is the protocol","Shared caveats: the result is an activity-interval aggregate, not causal attribution; the SDK wire has no cancel — abandoning a turn means killing the process (ACP has explicit session/cancel)"]'
+         data-answer="Choose ACP for clients that speak standard ACP or for cross-harness delegation — it is the backend of dsh-subagent-acp, so dsh can serve as another dsh's subagent. Choose the TS SDK for repo-adjacent TypeScript automation: the launch spec is fully explicit and the caller knows exactly which runtime it started. Choose the Python SDK for the Python ecosystem, scripts, and notebooks: pip install pulls a matching bundled runtime automatically, and three lines of code show a result. The three share the foundation of stdio JSON-RPC driving a full harness subprocess, with stdout as the protocol; the shared caveats are that the result is an activity-interval aggregate rather than a causal attribution, and that the SDK wire has no cancellation — abandoning a turn requires killing the runtime process (only ACP has an explicit session/cancel)."
+         data-rationale="Mapping the three situations to the three paths, plus the shared foundation and the two shared caveats, completes the selection."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> A new caller comes to you: in which situations do you choose ACP, the TS SDK, or the Python SDK? Also mention the caveats shared by all three paths.</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check only the points you actually covered — under-checking distorts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="22-testing.html"><strong>Chapter 22 · The Testing System</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>
