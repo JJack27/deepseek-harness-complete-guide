@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 1 章 · dsh 是什么：产品与仓库全景 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 1 章 · 全景</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="1">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 1 章 · 第一部分 · 全景与心智模型</div>
+    <h1>dsh 是什么：产品与仓库全景</h1>
+    <p class="lede">
+      在你写下一行 dsh 相关代码之前，先建立两张地图：一张是「一个只会说话的模型怎么变成能干活的助手」的分层地图，
+      一张是「代码都住在仓库哪个角落」的物理地图。本章两张都给你，后面的每一章都在这两张地图上放大局部。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能说清 LLM、agent harness、前端 UI、操作系统四层各自的职责边界</li>
+      <li>能指出一条 shell 命令「能不能执行」由哪一层决定、为什么</li>
+      <li>能列出 dsh 的四种产品形态（Web、headless、ACP、JSON-RPC SDK）分别给谁用</li>
+      <li>能在仓库里按目录定位：bash 工具在哪、core 脊柱是什么、vendor/ 里放着什么</li>
+      <li>能避免把 developer preview 阶段的接口当成稳定契约</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-llm-agent">1.1 一个只会说话的模型，怎么变成能干活的助手</h2>
+
+  <p>
+    先把起点说清楚：你直接调用 DeepSeek 的模型 API 时，得到的是什么？你发过去一串消息，
+    它返回一串文字——准确说，是一个 token 一个 token 地生成文本。仅此而已。它没有手：
+    不能启动一个进程，不能读写你的文件，不能上网抓页面。而且每次调用都是独立的：
+    这次聊完，下次它什么都不记得。
+  </p>
+
+  <p>
+    所谓 <strong>LLM agent</strong>，就是把这样一个「只会说话的大脑」变成能干活的助手，公式是：
+  </p>
+
+  <p><strong>agent = 模型 + 工具调用循环</strong></p>
+
+  <p>
+    循环大致长这样：模型看完当前对话，说「请帮我执行 bash 命令 <code>ls -la</code>」；
+    外面有个程序<strong>真的去执行</strong>这条命令，把输出塞回对话里；模型看完输出，决定下一步；
+    如此往复，直到模型认为任务完成。注意分工：模型只负责<strong>决定</strong>做什么，
+    真正动手的是外面那个程序。这个「外面那个程序」就是 <strong>agent harness</strong>（脚手架、马具——
+    套在模型身上让它能拉车的那套装备）。DeepSeek Harness（命令名 <code>dsh</code>）就是这样一个 harness。
+  </p>
+
+  <p>把循环拆开，harness 要管的远不止「执行命令」这一件事：</p>
+
+  <ul>
+    <li><strong>循环驱动</strong>——什么时候再调一次模型、工具还要不要再跑、什么时候算任务结束；</li>
+    <li><strong>工具执行与守卫</strong>——真的跑命令，但套上超时、沙箱、输出截断这些护栏；</li>
+    <li><strong>权限</strong>——这条命令涉及危险操作时，放行、拒绝、还是先问用户；</li>
+    <li><strong>会话持久化</strong>——把发生过的每件事记成日志，进程重启后还能恢复现场；</li>
+    <li><strong>prompt 装配</strong>——把系统提示、工具清单、对话历史组装成每次模型请求；</li>
+    <li><strong>多端 UI</strong>——同一套循环，既要给浏览器用，也要给终端、自动化协议用。</li>
+  </ul>
+
+  <p>
+    这份清单就是全书的目录预告：dsh 把每一项都做成了一组可替换的插件。本书后面会逐个走进去。
+  </p>
+
+  <h2 id="sec-layers">1.2 四层分工：谁管什么</h2>
+
+  <p>
+    把一次「你让 agent 跑测试」的旅程画成图，一共四层。从上往下：你在<strong>前端 UI</strong> 打字；
+    <strong>agent harness（dsh）</strong>组织一切；它向下的两只手，一只伸向<strong>LLM API</strong> 拿模型的下一个决定，
+    另一只伸向<strong>操作系统</strong>真正执行进程、读写文件。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="agent 四层分工图">
+      <rect x="120" y="16" width="440" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="2"/>
+      <text x="340" y="40" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">前端 UI（浏览器 Web UI / 终端）</text>
+      <text x="340" y="60" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">只渲染：聊天气泡、工具卡片 —— 不做决策</text>
+
+      <line x1="340" y1="74" x2="340" y2="130" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="340,130 335,121 345,121" style="fill:var(--muted)"/>
+      <line x1="352" y1="130" x2="352" y2="74" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="352,74 347,83 357,83" style="fill:var(--muted)"/>
+      <text x="380" y="106" style="fill:var(--fg-dim)" font-size="11">用户输入 ↓ / 会话事件 ↑</text>
+
+      <rect x="120" y="132" width="440" height="96" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="3"/>
+      <text x="340" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="15" font-weight="700">agent harness（dsh）</text>
+      <text x="340" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">循环驱动 · 工具执行与守卫 · 权限 · 会话持久化 · prompt 装配</text>
+      <text x="340" y="198" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">一条 shell 命令能不能执行，在这一层决定</text>
+      <rect x="150" y="206" width="120" height="16" rx="4" style="fill:var(--accent);fill-opacity:0.18"/>
+      <text x="210" y="218" text-anchor="middle" style="fill:var(--accent)" font-size="10" font-weight="700">决策点在这里</text>
+
+      <line x1="220" y1="228" x2="220" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="220,300 215,291 225,291" style="fill:var(--muted)"/>
+      <line x1="232" y1="300" x2="232" y2="228" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="232,228 227,237 237,237" style="fill:var(--muted)"/>
+      <text x="150" y="270" style="fill:var(--fg-dim)" font-size="11">模型请求 ↓ / token 流 ↑</text>
+
+      <line x1="470" y1="228" x2="470" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="470,300 465,291 475,291" style="fill:var(--muted)"/>
+      <text x="430" y="270" style="fill:var(--fg-dim)" font-size="11">隔着沙箱执行进程 · 读写文件 · 网络</text>
+
+      <rect x="120" y="302" width="200" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="2"/>
+      <text x="220" y="326" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">LLM API（DeepSeek 等）</text>
+      <text x="220" y="346" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">只负责生成下一个 token</text>
+
+      <rect x="360" y="302" width="200" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="2"/>
+      <text x="460" y="326" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">操作系统</text>
+      <text x="460" y="346" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">进程 · 文件 · 网络</text>
+
+      <text x="340" y="400" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">模型只能「请求」执行命令；允不允许、怎么守卫、结果怎么记进日志，全是 harness 的职责</text>
+    </svg>
+    <figcaption>agent 的四层分工。「一条 shell 命令能不能执行」是 agent harness（dsh）层的决策，不是模型的、也不是 UI 的。</figcaption>
+  </figure>
+
+  <p>逐层记住三句话，后面读任何 dsh 代码都不迷路：</p>
+
+  <ul>
+    <li><strong>LLM API 层</strong>不知道工具、会话、权限的存在。它收消息、吐 token。你在这一层能做的只有换模型、调参数。</li>
+    <li><strong>agent harness 层</strong>（dsh）是本书的主角。工具执行管道、权限、日志、prompt 装配全在这里。</li>
+    <li><strong>前端 UI 层</strong>消费 harness 投影出来的会话状态，把它画成界面。UI 换掉不影响决策逻辑；反过来 UI 也不替 harness 做任何安全决定。</li>
+  </ul>
+
+  <p>操作系统层不神秘：harness 通过子进程、文件系统调用去用它，中间隔着沙箱和策略（第 12 章细讲）。</p>
+
+  <div class="demo" data-demo="layerMapper">
+    <div class="demo-title">试一试 —— 这件事归哪一层管？</div>
+    <p>选择一项职责，看它落在 agent harness 的哪一层：</p>
+    <label><input type="radio" name="d1" value="a"> 生成下一个 token</label>
+    <label><input type="radio" name="d1" value="b"> 决定一条 shell 命令能不能执行</label>
+    <label><input type="radio" name="d1" value="c"> 把对话渲染成聊天气泡</label>
+    <label><input type="radio" name="d1" value="d"> 把会话事件写进磁盘</label>
+    <div class="demo-output empty">选一个试试。</div>
+  </div>
+
+  <h2 id="sec-product-forms">1.3 dsh 的产品形态：同一副骨架，四种外壳</h2>
+
+  <p>
+    dsh 不是一个单一程序，而是同一棵插件树的不同「出口」。你最先接触的四种形态：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>形态</th><th>命令 / 入口</th><th>给谁用</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Web 应用</td>
+        <td><code>npx @deepseek-ai/dsh web</code></td>
+        <td>人。默认起在 <code>http://127.0.0.1:3080</code>，浏览器里聊</td>
+      </tr>
+      <tr>
+        <td>一次性任务</td>
+        <td><code>dsh --profile headless "任务"</code></td>
+        <td>脚本 / CI。跑一个全新会话，打印最终答案就退出，全程不起服务</td>
+      </tr>
+      <tr>
+        <td>ACP 服务器</td>
+        <td><code>packages/acp/</code></td>
+        <td>自动化客户端（编辑器等）。只走 Agent Client Protocol，没有人类界面</td>
+      </tr>
+      <tr>
+        <td>JSON-RPC SDK</td>
+        <td><code>packages/sdk/</code>（TS）+ <code>python/</code>（Python）</td>
+        <td>把 dsh 当子进程驱动的程序。Python 侧有两个发行版：<code>deepseek-harness-sdk</code> 和 <code>deepseek-harness-runtime-bin</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    换形态换的是「外壳」——前端、入口、进程形态；不换的是底下那棵插件树的核心层（模型适配、工具、持久化）。
+    「树怎么长出来」正是第 3 章的主题，这里先埋个钩子。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">developer preview：地板会动</div>
+    <p>
+      dsh 目前处于 <strong>developer preview</strong>：迭代很快，官方明确说「会有兼容性破坏性变更」。
+      读写它的代码时，别把任何接口当成永久契约；反过来，这也是仓库敢大刀阔斧重构的原因——
+      你在贡献指南里会看到「宁可改对地基，也不留兼容垫片」的立场。
+    </p>
+  </div>
+
+  <h2 id="sec-repo-map">1.4 仓库地图</h2>
+
+  <p>
+    克隆仓库后先看根目录。最重要的一个事实：这是一个 pnpm monorepo，
+    <code>packages/</code> 下按<strong>能力</strong>分成 49 个分组、200 多个
+    <code>@deepseek-ai/dsh-*</code> 包（数字持续增长，记「按能力分组、每个包很小」这个原则即可，别背数字）。
+    <strong>everything is a plugin</strong>——每个包都是插件树上的一块积木。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="仓库根目录地图">
+      <rect x="16" y="16" width="648" height="298" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="40" y="44" style="fill:var(--fg)" font-size="13" font-weight="700">deepseek-harness/（pnpm monorepo）</text>
+
+      <rect x="40" y="60" width="280" height="150" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2.5"/>
+      <text x="180" y="86" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">packages/</text>
+      <text x="180" y="106" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">49 个分组 · 200+ 个 @deepseek-ai/dsh-* 包</text>
+      <text x="180" y="126" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">按能力分组：shell / fs / web / subagent / session …</text>
+      <text x="180" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">core/ 是脊柱；其余是能力插件</text>
+      <text x="180" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">一切皆是插件</text>
+
+      <rect x="360" y="60" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="430" y="79" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">vendor/</text>
+      <text x="430" y="96" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">钉住的 Cordis 框架源码</text>
+
+      <rect x="520" y="60" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="580" y="79" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">apps/</text>
+      <text x="580" y="96" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">cli + web</text>
+
+      <rect x="40" y="230" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">examples/</text>
+      <text x="110" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">可运行 cordis.yml 叶子</text>
+
+      <rect x="200" y="230" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="260" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">docs/</text>
+      <text x="260" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">架构与目录文档</text>
+
+      <rect x="340" y="230" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="400" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">python/</text>
+      <text x="400" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Python SDK + 运行时</text>
+
+      <rect x="480" y="230" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="550" y="249" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">native/</text>
+      <text x="550" y="266" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Landlock node addon</text>
+
+      <rect x="360" y="120" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="430" y="139" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">scripts/</text>
+      <text x="430" y="156" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">仓库检查与生成器</text>
+
+      <rect x="520" y="120" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="580" y="139" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">website/</text>
+      <text x="580" y="156" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">文档网站</text>
+    </svg>
+    <figcaption>仓库根目录地图。packages/ 占据中心：49 个能力分组、200 多个插件包。</figcaption>
+  </figure>
+
+  <p>逐个说清每个目录的角色：</p>
+
+  <table>
+    <thead>
+      <tr><th>目录</th><th>里面是什么</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>packages/</code></td>
+        <td>全部 <code>@deepseek-ai/dsh-*</code> 工作区包，按能力分组：core、api、typert、llm、shell、subprocess、terminal、fs、lsp、skill、web、compaction、context、subagent、bundle、workflow、todo、plan、preset、guard、extensions、hooks、session、session-query、settings、credentials、storage、workspace、sdk、acp、interaction、boot、host、client、examples、test-support、util、attachment、code-runtime、feedback、goal、jobs、mcp、runtime-diagnostics、sandbox、schedule、spill、e2b……</td></tr>
+      <tr><td><code>vendor/</code></td>
+        <td>vendored 的 Cordis 框架源码：钉住的上游副本，重命名为 <code>@deepseek-ai/cordis</code>（第 2 章主角）</td></tr>
+      <tr><td><code>apps/</code></td>
+        <td><code>cli/</code>（<code>dsh</code> 命令本体）和 <code>web/</code>（浏览器前端应用）</td></tr>
+      <tr><td><code>examples/</code></td>
+        <td>可运行的 <code>cordis.yml</code> 叶子示例（agent-spine + CLI/ACP/JSON-RPC 演示）</td></tr>
+      <tr><td><code>docs/</code></td>
+        <td>架构文档（architecture.md、cordis-primer.md）、生成目录、cookbook</td></tr>
+      <tr><td><code>python/</code></td>
+        <td>Python SDK 和打包的运行时：<code>deepseek-harness-sdk</code> 与 <code>deepseek-harness-runtime-bin</code></td></tr>
+      <tr><td><code>native/</code></td>
+        <td><code>@deepseek-ai/node-addon-landlock-run</code>：Linux Landlock 沙箱的 Node 原生模块</td></tr>
+      <tr><td><code>scripts/</code></td>
+        <td>仓库质量门禁脚本和生成器（<code>pnpm run hygiene</code>、<code>doc-sync</code> 背后就是它们）</td></tr>
+      <tr><td><code>website/</code></td>
+        <td>文档网站的 VitePress 源码</td></tr>
+    </tbody>
+  </table>
+
+  <div class="box key">
+    <div class="box-title">关键认知：按能力分组</div>
+    <p>
+      <code>packages/</code> 不是按「前端 / 后端」分组的，是按<strong>能力</strong>：shell 组管命令执行、fs 组管文件、
+      web 组管搜索抓取、subagent 组管委派、session 组管持久化……每组里通常还有更细的角色分工
+      （接口、实现、模型可见工具），第 11 章专门讲。现在你只需要记住：<strong>想找某个功能，先找它的能力组</strong>。
+    </p>
+  </div>
+
+  <h2 id="sec-finding-bash">1.5 上手第一课：bash 工具住在哪</h2>
+
+  <p>
+    用一个具体问题练手：「模型看到并调用的 bash 工具，代码在哪？」
+    新手的直觉是去 <code>packages/core/</code> 翻——毕竟那是「核心」。但按能力分组的原则，
+    bash 属于 <strong>shell 能力</strong>，所以它住在 <code>packages/shell/</code>：
+  </p>
+
+  <pre><code><span class="code-comment"># packages/shell/ 下的分工（bash 相关部分）</span>
+packages/shell/shell/          <span class="code-comment"># shell 能力接口（Service Definition）：executor seam</span>
+packages/shell/shell-local/    <span class="code-comment"># 本地实现（Provider）：真的在本机起进程</span>
+packages/shell/tool-bash/      <span class="code-comment"># 模型可见的 bash 工具（Consumer）← 找的就是它</span>
+packages/shell/tool-pwsh/      <span class="code-comment"># Windows 上的 PowerShell 孪生兄弟</span></code></pre>
+
+  <p>
+    模型可见的工具（<code>tool-bash</code>）、执行命令的本地实现（<code>shell-local</code>）、
+    两者之间的接口（<code>shell</code>）是三个不同的包。这个「接口 / 实现 / 使用者」的三分法
+    是 dsh 的核心设计之一，第 11 章会展开成完整的 capability seam 模型。
+  </p>
+
+  <p>那 <code>core/</code> 是什么？是<strong>脊柱</strong>——所有能力都要挂在上面的一组基础服务：</p>
+
+  <table>
+    <thead>
+      <tr><th>core 包</th><th>管什么</th><th>服务入口</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>core/session</code></td><td>追加式会话事件日志与内存存储</td><td><code>ctx.sessions</code></td></tr>
+      <tr><td><code>core/system-prompt</code></td><td>prompt 段落与工具 schema 的装配</td><td><code>ctx.systemPrompt</code></td></tr>
+      <tr><td><code>core/tools</code></td><td>带作用域的工具注册表 + 守卫执行管道</td><td><code>ctx.tools</code></td></tr>
+      <tr><td><code>core/agent</code></td><td>Agent 接口与在线注册表、<code>agent/*</code> 事件</td><td><code>ctx.agents</code></td></tr>
+      <tr><td><code>core/agent-loop</code></td><td>实现该接口的默认驱动循环</td><td><code>ctx.agentLoop</code></td></tr>
+      <tr><td><code>core/scope</code></td><td>按 agent 划定注册作用域的原语</td><td>库，无 ctx key</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    注意最后一列——<code>ctx.tools</code>、<code>ctx.sessions</code> 这些名字。它们是插件之间互相找服务的钥匙，
+    也是下一章的主角。甚至循环本身（<code>agent-loop</code>）也只是挂上去的一个插件，可以被换掉。
+  </p>
+
+  <h2 id="sec-recap">1.6 本章回顾</h2>
+
+  <ul>
+    <li>裸 LLM API 只会生成 token；<strong>agent = 模型 + 工具调用循环</strong>，循环驱动、工具执行与守卫、权限、持久化、prompt 装配、多端 UI 都是 harness 的活。</li>
+    <li>四层分工：LLM API（生成）↔ agent harness（dsh，决策与执行）↔ 前端 UI（渲染）↔ 操作系统（真正的进程/文件/网络）。「命令能不能执行」归 harness。</li>
+    <li>dsh 四种形态：Web（<code>npx @deepseek-ai/dsh web</code>，默认 <code>127.0.0.1:3080</code>）、headless 一次性任务、ACP 自动化服务器、TS + Python 的 JSON-RPC SDK。developer preview，会有破坏性变更。</li>
+    <li>仓库是 pnpm monorepo：<code>packages/</code> 按能力分组（49 组、200+ 包）、<code>vendor/</code> 是钉住的 Cordis、<code>apps/</code> 是 cli + web、<code>python/</code>、<code>native/</code>、<code>examples/</code>、<code>docs/</code>、<code>scripts/</code>、<code>website/</code>。</li>
+    <li>bash 工具在 <code>packages/shell/tool-bash</code>（能力组），不在 core；core/ 是脊柱：session、system-prompt、tools、agent、agent-loop、scope。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为模型「执行」了命令——模型只是请求执行，动手和把关的都是 harness。</li>
+      <li>以为 dsh 是一个大程序——它是一棵启动时组装出来的插件树，第 3 章会看到组装过程。</li>
+      <li>在 <code>packages/core/</code> 里找 bash 工具——core 是脊柱，具体能力住在各自的能力组（<code>packages/shell/</code>）。</li>
+      <li>以为权限决策在 UI 层——UI 只渲染，换掉 UI 不改变任何决策逻辑。</li>
+      <li>把 developer preview 阶段的任何接口当稳定契约——升级时可以整个换掉。</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="1">
+    <h2>第 1 章 测验</h2>
+
+    <div class="q" data-id="1-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 裸 LLM API 只做条件生成：输入消息、输出 token。"
+         data-rationale="B 正确，这是模型 API 的全部本职。A 和 D 需要本地执行与策略判断，是 harness 的职责；C 需要会话持久化，API 本身无状态，每次调用互相独立。"
+         data-review="sec-llm-agent">
+      <div class="prompt"><span class="qnum">Q1.</span> 不带任何 harness、直接调用 LLM API，它能做的事是？</div>
+      <label class="opt"><input type="radio" name="q-1-1" value="a"> A. 执行一条 bash 命令并返回输出</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="b"> B. 根据输入消息生成 token（文字）</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="c"> C. 记住上一次会话聊了什么</label>
+      <label class="opt"><input type="radio" name="q-1-1" value="d"> D. 判断一条命令是否安全</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— agent harness（dsh）层决定。"
+         data-rationale="C 正确：模型只能请求执行，放行、拒绝、沙箱、日志都在 harness 的工具管道与权限层。A 错：模型 API 根本不知道工具的存在。B 错：UI 只渲染状态。D 错：操作系统只被动执行被调用的一切，策略不在它那。"
+         data-review="sec-layers">
+      <div class="prompt"><span class="qnum">Q2.</span> 「这条 shell 命令能不能执行」由四层中的哪一层决定？</div>
+      <label class="opt"><input type="radio" name="q-1-2" value="a"> A. LLM API</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="b"> B. 前端 UI</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="c"> C. agent harness（dsh）</label>
+      <label class="opt"><input type="radio" name="q-1-2" value="d"> D. 操作系统</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-3" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A、B、C 都是 harness 的职责：循环驱动、工具执行与守卫、会话持久化。D 是前端 UI 的渲染工作——UI 消费 harness 投影出的状态，不做任何决策。"
+         data-review="sec-llm-agent">
+      <div class="prompt"><span class="qnum">Q3.</span> 下列哪些是 agent harness 的职责？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="a"> A. 循环驱动：决定何时再调一次模型、何时停</label>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="b"> B. 工具执行与守卫：权限、超时、沙箱</label>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="c"> C. 会话持久化：把事件写盘、重启可恢复</label>
+      <label class="opt"><input type="checkbox" name="q-1-3" value="d"> D. 把对话渲染成聊天气泡</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-4" data-type="fill" data-accepted='["127.0.0.1:3080","http://127.0.0.1:3080"]'
+         data-answer="127.0.0.1:3080（即 http://127.0.0.1:3080）。"
+         data-rationale="README 明确：npx @deepseek-ai/dsh web 启动的 Web UI 默认服务在 http://127.0.0.1:3080。写成 localhost:3080 语义等价，但默认输出写的是这个字面地址。"
+         data-review="sec-product-forms">
+      <div class="prompt"><span class="qnum">Q4.</span> 填空：<code>npx @deepseek-ai/dsh web</code> 启动后，Web UI 默认监听 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 跑一个全新的持久化会话，打印最终答案，然后退出；不开任何监听端口。"
+         data-rationale="B 正确，这正是 headless bundle 的设计：一次性 runner、无 Host、无 HTTP 服务器、无浏览器插件。A 是 web 形态的行为；C 同样是 web 的行为；D 无此模式。"
+         data-review="sec-product-forms">
+      <div class="prompt"><span class="qnum">Q5.</span> <code>dsh --profile headless "跑一遍测试"</code> 的行为是？</div>
+      <label class="opt"><input type="radio" name="q-1-5" value="a"> A. 启动一个常驻 Web 服务等待任务</label>
+      <label class="opt"><input type="radio" name="q-1-5" value="b"> B. 跑一个全新会话、打印最终答案、然后退出，全程不开监听端口</label>
+      <label class="opt"><input type="radio" name="q-1-5" value="c"> C. 打开浏览器界面让人对话</label>
+      <label class="opt"><input type="radio" name="q-1-5" value="d"> D. 只做类型检查，不真正运行</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— packages/shell/tool-bash/。"
+         data-rationale="B 正确：仓库按能力分组，bash 工具是 shell 能力组里模型可见的 Consumer 插件。A 是工具注册表与执行管道（脊柱），不是某个具体工具；C 是 dsh 命令启动器；D 是演示 bundle。"
+         data-review="sec-finding-bash">
+      <div class="prompt"><span class="qnum">Q6.</span> 模型可见的 bash 工具代码在仓库的哪里？</div>
+      <label class="opt"><input type="radio" name="q-1-6" value="a"> A. <code>packages/core/tools/</code></label>
+      <label class="opt"><input type="radio" name="q-1-6" value="b"> B. <code>packages/shell/tool-bash/</code></label>
+      <label class="opt"><input type="radio" name="q-1-6" value="c"> C. <code>apps/cli/</code></label>
+      <label class="opt"><input type="radio" name="q-1-6" value="d"> D. <code>packages/examples/</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 都正确。C 错在分组维度：packages/ 按「能力」分组（shell、fs、web、subagent……），不是按前后端技术层分组——这正是找代码时要记住的原则。"
+         data-review="sec-repo-map">
+      <div class="prompt"><span class="qnum">Q7.</span> 关于仓库布局，下列说法正确的有哪些？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="a"> A. <code>vendor/</code> 是钉住的 Cordis 框架源码副本，已 rescope 为 <code>@deepseek-ai/cordis</code></label>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="b"> B. <code>apps/</code> 放着 cli（dsh 命令本体）和 web（前端应用）</label>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="c"> C. <code>packages/</code> 按「前端 / 后端」技术层分组</label>
+      <label class="opt"><input type="checkbox" name="q-1-7" value="d"> D. <code>examples/</code> 存放可运行的 cordis.yml 叶子示例</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 产品 API 脊柱：session、system-prompt、tools、agent、agent-loop（以及 scope）。"
+         data-rationale="A 正确，这些是所有能力都要挂靠的基础服务。B 错：具体工具实现住在能力组（如 packages/shell/tool-bash）。C 错：Web 前端在 apps/web 与 client 组。D 错：测试辅助是 test-support 组。"
+         data-review="sec-finding-bash">
+      <div class="prompt"><span class="qnum">Q8.</span> <code>packages/core/</code> 组的角色是？</div>
+      <label class="opt"><input type="radio" name="q-1-8" value="a"> A. 产品 API 脊柱：session、system-prompt、tools、agent、agent-loop（以及 scope）</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="b"> B. 存放所有模型可见工具的具体实现</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="c"> C. Web 前端代码</label>
+      <label class="opt"><input type="radio" name="q-1-8" value="d"> D. 测试辅助设施</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-9" data-type="fill" data-accepted='["@deepseek-ai/dsh-tool-bash","dsh-tool-bash"]'
+         data-answer="@deepseek-ai/dsh-tool-bash。"
+         data-rationale="包名规则是 @deepseek-ai/dsh-&lt;名&gt;：packages/shell/tool-bash 对应 @deepseek-ai/dsh-tool-bash。写成 @deepseek-ai/dsh-bash 或 dsh-shell 都不对——后者是能力接口包。"
+         data-review="sec-finding-bash">
+      <div class="prompt"><span class="qnum">Q9.</span> 填空：模型可见的 bash 工具插件的 npm 包名是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 会有兼容性破坏性变更，别把接口当长期稳定契约。"
+         data-rationale="B 正确：README 明确写了 developer preview 与「THERE WILL BE COMPATIBILITY-BREAKING CHANGES」。A 错：它是开源可用的；C 错：恰好在快速迭代；D 错：docs/ 是公开的。"
+         data-review="sec-product-forms">
+      <div class="prompt"><span class="qnum">Q10.</span> dsh 目前处于 developer preview，这意味着？</div>
+      <label class="opt"><input type="radio" name="q-1-10" value="a"> A. 只能内部使用，不对外开放</label>
+      <label class="opt"><input type="radio" name="q-1-10" value="b"> B. 会有兼容性破坏性变更，别把接口当长期稳定契约</label>
+      <label class="opt"><input type="radio" name="q-1-10" value="c"> C. 功能已冻结，只修 bug</label>
+      <label class="opt"><input type="radio" name="q-1-10" value="d"> D. 文档不对外公开</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-11" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— packages/mcp/。"
+         data-rationale="A 正确：packages/mcp/ 下有 dsh-mcp-client 等桥接插件，把外部 MCP 服务器的工具注册到 ctx.tools。B 是语言服务器能力；C 是网页搜索/抓取能力；D 错，vendor/ 只装 Cordis 一族框架包。"
+         data-review="sec-repo-map">
+      <div class="prompt"><span class="qnum">Q11.</span> 想研究 dsh 如何接入 MCP（Model Context Protocol）外部服务器，应该去哪个分组找？</div>
+      <label class="opt"><input type="radio" name="q-1-11" value="a"> A. <code>packages/mcp/</code></label>
+      <label class="opt"><input type="radio" name="q-1-11" value="b"> B. <code>packages/lsp/</code></label>
+      <label class="opt"><input type="radio" name="q-1-11" value="c"> C. <code>packages/web/</code></label>
+      <label class="opt"><input type="radio" name="q-1-11" value="d"> D. <code>vendor/mcp/</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="1-12" data-type="short"
+         data-key-points='["LLM API 只负责生成 token，不知道工具、会话、权限的存在","agent harness（dsh）负责循环驱动、工具执行与守卫、权限、持久化、prompt 装配","前端 UI 只渲染 harness 投影出的会话状态，不做决策","操作系统提供真正的进程、文件、网络，由 harness 隔着沙箱调用","命令是否放行是本地策略决策：模型只能请求，UI 只是显示，所以归 harness"]'
+         data-answer="四层分工：LLM API 收消息、吐 token；agent harness（dsh）组织循环、执行并守卫工具、管权限与持久化、装配 prompt；前端 UI 只渲染投影出的状态；操作系统层提供真正的进程、文件、网络。「命令能不能执行」是本地策略决策——模型只能请求执行，UI 只负责显示，唯一既连接模型决策又连接本地执行的位置就是 harness。"
+         data-rationale="抓住「生成 / 决策与执行 / 渲染 / 被调用」四个动词，加上「放行是本地决策」这一点，分层就不会错。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> 用你自己的话描述四层分工，并解释为什么「命令能不能执行」归 harness 管，而不归模型或 UI。</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正答到的要点——少勾会损害校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="02-cordis-mind-model.html"><strong>第 2 章 · Cordis 心智模型</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

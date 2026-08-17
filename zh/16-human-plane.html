@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 16 章 · 人类协作面：commands、permission、approval、ask-user — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 16 章 · 人类协作面</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="16">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 16 章 · 第三部分 · Capability Seams 专题</div>
+    <h1>人类协作面：commands、permission、approval、ask-user</h1>
+    <p class="lede">
+      上一章的 <code>/compact</code> 已经剧透了本章的核心区分：dsh 里人机交互分属两个平面。
+      <strong>命令平面</strong>上的斜杠命令经 <code>ctx.commands</code> 分发，不经模型轮次直接执行；
+      <strong>消息平面</strong>上一切要到达模型的内容都必须作为 SessionEvent 落日志。本章走完
+      interaction 家族的全部服务——命令注册表、one-shot 审批瀑布、permission presets、
+      结构化提问——再连同 plan-mode、todo、feedback 三个状态插件，把「人如何驾驭一个正在跑的
+      agent」这件事的完整机制讲清楚。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能用命令平面/消息平面的二分法判断任意一种交互「走哪条路、写不写日志、进不进模型历史」</li>
+      <li>能描述 <code>ctx.commands</code> 的注册与分发契约，包括 <code>command/run</code>/<code>command/done</code> 事件对与 agent 作用域遮蔽</li>
+      <li>能解释 one-shot 审批瀑布：结果词汇、fail-closed、<code>tools/pre-execute</code> 的 <code>ask</code> 决策如何路由到 <code>ctx.approval</code></li>
+      <li>能说出 permission-presets 打包了哪两个机制旋钮、<code>custom</code> 为何只能派生不能选中</li>
+      <li>能区分 plan-mode 的 logged state 与强制执行：计划模式是软引导，sandbox 与 approval 独立执法</li>
+      <li>能指出 todo 与 feedback 的两种归宿：会话日志事件 vs Host 侧 sidecar，以及为何都不进模型对话</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-two-planes">16.1 两个平面：命令 vs 消息</h2>
+
+  <p>
+    dsh 的交互服务全部组装在现有契约之上，不改循环。<code>packages/interaction/</code> 组
+    README 的第一句就点明了范围：这些是「人类与运行中 agent 协作」的服务与插件——
+    questions、approvals、permission presets、commands。把它们摆上第 4 章的事件溯源底座，
+    就得到一条贯穿本章的判断轴：
+  </p>
+  <ul>
+    <li>
+      <strong>命令平面</strong>：人类输入斜杠命令，<code>ctx.commands.execute(agent, line, signal)</code>
+      解析并直接运行处理器。<strong>不经模型轮次</strong>——没有请求、没有 token；
+      结果由 UI 适配器直接渲染，<strong>绝不进入模型历史</strong>。但命令生命周期本身是审计对象：
+      每次已解析的调用在该 agent 的会话上追加 log-only 的 <code>command/run</code>（先铸
+      <code>commandId</code>）与 <code>command/done</code>（结算时）事件对，没有 turn 包裹它们。
+    </li>
+    <li>
+      <strong>消息平面</strong>：任何要发给模型的内容——直接提示、steering、注入的上下文——
+      都以表面事件落日志（model-visible ⟺ logged），经第 7 章的 turn/step 循环进入请求。
+    </li>
+  </ul>
+
+  <p>
+    命令平面「绕过模型但仍在日志里」不是矛盾：日志是<strong>审计与回放的唯一权威</strong>，
+    而模型历史是它的一个投影（<code>deriveMessages()</code> 只取表面事件）。命令处理器若确实要
+    触发模型工作，必须显式使用接收方的 <code>Agent</code>（如 <code>/plan [message]</code> 会经
+    <code>agent.steer()</code> 提交消息）——那时它就切换到了消息平面，并自己拥有 resulting
+    message 的契约。注册表从不隐式把 <code>rawInput</code> 提交给 agent。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 660 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="命令平面与消息平面对照">
+      <rect x="25" y="130" width="110" height="64" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="80" y="167" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">人类</text>
+
+      <text x="392" y="28" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">命令平面 · ctx.commands（不经模型轮次）</text>
+      <rect x="200" y="42" width="180" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="290" y="65" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">斜杠命令分发</text>
+      <text x="290" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">/compact · /plan · /feedback …</text>
+
+      <rect x="440" y="42" width="195" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="537" y="65" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">直接结果</text>
+      <text x="537" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">UI 适配器渲染</text>
+
+      <line x1="135" y1="148" x2="167" y2="148" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="148" x2="167" y2="71" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="71" x2="196" y2="71" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="199,71 191,67 191,75" style="fill:var(--muted)"/>
+
+      <line x1="380" y1="71" x2="436" y2="71" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="439,71 431,67 431,75" style="fill:var(--muted)"/>
+
+      <line x1="537" y1="104" x2="537" y2="178" style="stroke:var(--fail)" stroke-width="2" stroke-dasharray="5 4"/>
+      <text x="546" y="145" style="fill:var(--fail)" font-size="10">结果永不进入模型历史</text>
+
+      <text x="392" y="168" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">消息平面 · 一切模型可见内容都在日志里</text>
+      <rect x="200" y="182" width="180" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="290" y="205" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Agent · turn/step 循环</text>
+      <text x="290" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">followup / steer / inject</text>
+
+      <rect x="440" y="182" width="195" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="537" y="205" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">模型请求</text>
+      <text x="537" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">deriveMessages() 的投影</text>
+
+      <line x1="135" y1="176" x2="167" y2="176" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="176" x2="167" y2="211" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="211" x2="196" y2="211" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="199,211 191,207 191,215" style="fill:var(--muted)"/>
+
+      <line x1="380" y1="211" x2="436" y2="211" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="439,211 431,207 431,215" style="fill:var(--muted)"/>
+
+      <rect x="200" y="274" width="435" height="50" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="417" y="295" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">会话日志（追加式）</text>
+      <text x="417" y="313" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">命令平面写 log-only 事件 · 消息平面的表面事件是模型历史的来源</text>
+
+      <line x1="250" y1="100" x2="250" y2="271" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="250,274 246,266 254,266" style="fill:var(--muted)"/>
+      <text x="240" y="195" text-anchor="end" style="fill:var(--fg-dim)" font-size="9">command/run · command/done（log-only）</text>
+
+      <line x1="335" y1="240" x2="335" y2="271" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="335,274 331,266 339,266" style="fill:var(--muted)"/>
+      <text x="345" y="262" style="fill:var(--fg-dim)" font-size="9">表面事件</text>
+    </svg>
+    <figcaption>双平面对照：命令平面绕过模型直达结果（但命令生命周期以 log-only 事件入日志）；消息平面的一切模型可见内容都在日志里。</figcaption>
+  </figure>
+
+  <p>
+    这张二分图也解释了各表面的差异：Web 客户端提供命令适配器；headless、ACP 自动化与
+    JSON-RPC 不提供——所以 <code>/compact</code>、<code>/feedback</code> 这类命令在那里不存在，
+    自动压缩照常工作。<code>docs/architecture.md</code> 的「Where new behavior goes」表里对应的一行是：
+    <em>Add a human command → register on <code>ctx.commands</code>; it dispatches without a model turn</em>。
+  </p>
+
+  <h2 id="sec-commands">16.2 ctx.commands：命令注册表</h2>
+
+  <p>
+    <code>dsh-commands</code> 拥有 <code>ctx.commands</code>。注册一个命令就是
+    <code>register(definition)</code>：小写命令名（字母、数字、<code>_</code>、<code>-</code>）、
+    描述、可选输入提示、可选 <code>recordInput</code> 策略与可中止的处理器。
+    <code>recordInput</code> 默认为 true；当一个命令的权威领域事件自己携带载荷时把它设为 false，
+    <code>command/run</code> 就会省略 <code>args</code> 而不是把输入重复记两遍——
+    <code>/feedback</code> 就是这么做的（文本只存在于 <code>feedback/record</code> 事件里）。
+  </p>
+
+  <p>
+    作用域规则沿用第 11 章见过的 host+per-scope 分层：普通 context 的注册是全局的；
+    挂在 <code>agent.ctx</code> 之下的命令生产者声明自己的 <code>commands</code> 注入、
+    创建精确的 agent 作用域定义，并<strong>遮蔽</strong>同名全局定义。同层重名在注册时失败。
+    注册与移除通知所有 <code>commands/change</code> 观察者，让活动适配器刷新发现列表。
+    <code>parseCommand()</code> 只认「第 0 字节是斜杠 + 小写名 + 空白或结尾」，名字之后的
+    每个字节都是 <code>rawInput</code>——命令特定的语法归各命令自己解析。
+  </p>
+
+  <p>
+    分发的结算契约：处理器返回 <code>success</code> 或 <code>error</code> 加可选 UI 文本；
+    成功时还可返回 <code>sourceEventSeq</code> 指向同会话中更早的一条非命令事件，
+    当那条领域事件拥有更丰富的展示时（如 <code>/compact</code> 指向 <code>compaction/summary</code>）。
+    生命周期不变量要求这个引用是<strong>先前</strong>的非命令事件。未知命令或非法语法返回
+    <code>undefined</code>，不产生任何日志（admission miss 不记账）；随船适配器对未知斜杠输入
+    直接拒绝，而不是把它变成发给模型的提示。
+  </p>
+
+  <h2 id="sec-approval">16.3 user-approval：one-shot 审批瀑布</h2>
+
+  <p>
+    <code>dsh-user-approval</code> 定义通道中立的 <strong>one-shot 审批</strong> seam
+    （<code>ctx.approval</code>）。一次 <code>approval.request(req)</code> 返回四种结局之一：
+    <code>allowed-once</code>、<code>rejected</code>、<code>cancelled</code>、<code>unavailable</code>——
+    注意词汇里只有 <strong>once</strong>：没有 <code>allow-always</code>、没有记忆规则、没有撤销存储，
+    一次授权只覆盖被请求的那一个动作。应答者缺席或失败时<strong>fail closed</strong>。
+    每个请求必须属于一个打开的 agent turn；服务追加成对的 <code>approval/asked</code> 与
+    <code>approval/decided</code> 审计记录（log-only），模型看到的只是最终的请求方工具结果。
+  </p>
+
+  <p>
+    应答者是 <code>approval/request</code> 瀑布监听器——第 2 章的瀑布语义在这里是硬约束：
+    <strong>要么返回一个结局为本 agent 作答，要么调用 <code>next()</code> 委托</strong>，
+    静默返回会掐断整条链。agent 作用域的监听器只收到该 agent 的请求；每个部署只组装一个
+    终端应答者，因为兄弟监听器的顺序不是策略优先级机制。ACP 自动化桥为它拥有的会话
+    提供机器决策的 one-shot 应答者。
+  </p>
+
+  <p>
+    与工具管道的接驳点在第 8 章：<code>tools/pre-execute</code> 决策联合包含
+    <code>{kind:'ask', reason?}</code>——注册表把它路由给 <code>ctx.approval</code>；
+    seam 未挂载时<strong>降级为 deny</strong>（注册表对 approval 是机会主义消费
+    <code>ctx.get('approval')</code>，无静态注入，部署没有它也保持 ask→deny 语义）。
+    沙箱化的 bash 工具在升级重试时也走这个 seam。会话级策略只有两档：
+    <code>ApprovalPolicy</code> 为 <code>ask</code> 或 <code>never</code>，有效值是最后一条
+    <code>approval/policy</code> 事件（回退到配置），<code>setApprovalPolicy()</code> 是写路径；
+    <code>never</code> 在交互分发之前就拒绝。首次请求与每次有效策略变化会向模型追加一条
+    简短的运行时上下文快照（例如 <code>never</code> 下明确告诉模型不要再请求沙箱升级）。
+  </p>
+
+  <div class="demo" data-demo="permissionOnce">
+    <div class="demo-title">试一试 —— one-shot permission waterfall</div>
+    <button data-run>发起一次工具审批</button>
+    <div class="demo-output empty">点击发起。</div>
+  </div>
+
+  <div class="box note">
+    <div class="box-title">为什么只有 one-shot</div>
+    <p>
+      「记住我的选择」需要授权存储、失效与撤销语义——那是另一个尚未存在的领域。
+      one-shot 让审计语义保持最小：每次危险动作对应一次明确的决定，
+      <code>approval/asked</code>/<code>approval/decided</code> 成对可回放。
+      要减少打扰，用 16.4 的 preset 切换整组策略，而不是让单次授权泛化。
+    </p>
+  </div>
+
+  <h2 id="sec-presets">16.4 permission-presets：面向用户的开关组合</h2>
+
+  <p>
+    <code>sandbox/mode</code> 与 <code>approval/policy</code> 是两个独立的机制旋钮；
+    <code>dsh-permission-presets</code>（<code>ctx.permissionPresets</code>）把它们<strong>打包成
+    用户能理解的预设</strong>。每个配置的预设名捆绑一组值，随船默认是
+    <code>workspace-write</code>（<code>workspace-write</code> + <code>ask</code>）和
+    <code>danger-full-access</code>（<code>danger-full-access</code> + <code>never</code>）。
+    UI 适配器可以把表渲染成一个选择器，而沙箱执行与审批继续消费各自的旋钮——
+    preset 是展示与用户意图层，不是新的执行机制。
+  </p>
+
+  <p>
+    <code>set(session, name)</code> 先追加 log-only 的 <code>permissionPresets/preset</code> 事件
+    记录用户的选择，再在有效值变化时调用各旋钮的 setter——选择事件在前，保住了
+    「预设共享同一捆绑时的用户意图」；净零选择什么都不追加。<code>current(events)</code>
+    优先返回仍然匹配的已记录选择，否则第一个匹配的表项，都不匹配时返回 <code>custom</code>：
+    <strong><code>custom</code> 只能派生、不能被选中</strong>——用户可以切换离开一个
+    不再匹配的旋钮组合，但不能以它为目标持久化。名为 <code>custom</code> 的表项在加载时抛错。
+  </p>
+
+  <p>
+    会话创建时固定（pin）三件事：<code>permissionPresets/preset</code>、<code>sandbox/mode</code>、
+    <code>approval/policy</code> 落进该会话，之后的默认值变化不再改动既有会话；
+    恢复的 seed（包括显式空 seed）保留其有效权限。该服务要求一个受限的
+    <code>ctx.shell</code> 执行器与 <code>ctx.approval</code>——组合不匹配任何预设且未给
+    <code>defaultPreset</code> 时加载失败。两个可选子件随注册表激活：会话投影单元
+    （把三个全值旋钮事件折叠成选择视图）与 <code>/permissionPresets</code> 命令
+    （裸调用报告当前预设与表，带参切换）。
+  </p>
+
+  <h2 id="sec-ask-user">16.5 user-questions 与 tool-ask-user：模型向用户提问</h2>
+
+  <p>
+    到目前为止是人类发起（命令）与人类批准（审批）；<code>dsh-user-questions</code>
+    补上反方向：<strong>模型暂停工作、向人类要一个决定</strong>。Service Definition
+    <code>ctx.userQuestions</code> 只有两个动词：UI 侧 <code>registerProvider(provider)</code>
+    （一个 context 只允许一个活跃 provider，重复注册抛 <code>DUPLICATE_PROVIDER</code>），
+    与 <code>ask(request)</code>（等待活跃 provider 的回答）。词汇是问题表单的形状：
+    <code>questions: [{ id, question, detail?, header?, options?, multiSelect? }]</code>，
+    回答是 <code>{ answers: [{ id, selected, custom? }] }</code>——单选时 <code>custom</code>
+    覆盖 <code>selected</code>，多选时补充它。循环不变：一个工具调用 await 一个 promise，
+    工具结果照常回到 agent 循环；等待期间<strong>不消耗任何 token</strong>。
+  </p>
+
+  <p>
+    Consumer 包 <code>dsh-tool-ask-user</code> 把它暴露为模型可见的 <code>ask_user_question</code>
+    工具：接受同样的 questions 数组（推荐选项放第一位并在 label 后加
+    <code>(Recommended)</code>），调用 <code>ctx.userQuestions.ask()</code>，
+    返回紧凑 JSON。它不渲染 UI、不知道输入怎么收集——只翻译参数与结果。
+  </p>
+
+  <p>
+    两处边界设计值得记下。其一，<strong>运行时拥有的子代理不能问用户</strong>：
+    请求带 <code>agent</code> 时，<code>ask()</code> 通过活跃 <code>AgentRegistry</code> 认证
+    确切的运行时根身份；被另一个 live agent 拥有的子代理被拒（工具侧表现为
+    <code>DELEGATED_CALLER</code> 错误，指示把未决问题写进子代理的最终结果）——
+    durable lineage 不是权威：一个带历史委派深度的会话被恢复为新的运行时根后可以正常提问。
+    这与第 14 章「lineage 是数据、不是可见性」一脉相承。其二，
+    <strong>presentation intent</strong>：问题的 <code>intent</code> 字段声明这是一个已知种类的决定
+    （如 <code>plan-review</code>），认识的 UI 可以把它渲染成评审卡片，不认识的 UI 渲染通用选项表，
+    两种情况下调用者读到同样的回答字段。
+  </p>
+
+  <h2 id="sec-plan-mode">16.6 plan-mode：logged state，不是特权模式</h2>
+
+  <p>
+    <code>dsh-plan-mode</code> 是双平面协作的最佳样本。它的持久状态是一条 log-only、
+    全值替换的 <code>plan/mode</code>（<code>{ active: boolean }</code>）SessionEvent：
+    <code>foldPlanMode(events)</code> 返回最后记录值或 <code>false</code>，所以 resume、fork、
+    compaction 都直接从会话日志恢复计划状态，UI 通过 <code>session/event</code> 观察翻转。
+    <strong>计划模式是记录在日志里的状态，不是进程的特权模式</strong>——不存在「进入 plan mode
+    后运行时获得特殊权限」这回事。
+  </p>
+
+  <p>
+    对模型，激活的计划模式渲染配置的 <code>section</code> 文本到系统提示（prompt order 50）；
+    对人类，它经 <code>ctx.commands</code> 注册 <code>/plan [message]</code>（裸调用选择计划模式；
+    非 <code>off</code> 的非空参数先选择模式、再经 <code>agent.steer()</code> 把消息作为
+    普通日志 user 消息提交——这是命令处理器显式切换到消息平面的例子）与 <code>/plan off</code>
+    （直接退出，不发模型输入）。退出评审走始终注册的 <code>exit_plan_mode</code> 工具：
+    只有激活状态下可执行，且必须经 <code>ctx.userQuestions</code> 拿到用户的确切批准
+    （问题带 <code>plan-review</code> intent，<code>Approve</code> 是批准标签）；
+    用户关闭评审转而说话时，模型被告知留在计划模式等待消息。
+    工具 schema 跨状态稳定，模式切换不改工具目录。
+  </p>
+
+  <p>
+    最容易误解的一点：<strong>计划模式是软引导</strong>。它引导模型先探索设计再交计划，
+    但不强制任何限制——sandbox 模式与审批策略独立执法、不读写计划状态。需要硬约束的部署
+    应配置 sandbox 与 approval（16.3、16.4），而不是指望 <code>section</code> 文本。
+    会话投影方面，挂载 <code>ctx.sessionProjections</code> 时它注册 <code>plan</code> 单元，
+    折叠 <code>command/run</code>（名为 plan）与 <code>plan/mode</code> 两种事件，
+    <code>view</code> 派生 <code>{ active, pending }</code>——<code>pending</code> 是纯回放量，
+    主机重启、其他标签页、冷读都能从日志单独恢复它。
+  </p>
+
+  <h2 id="sec-todo-feedback">16.7 todo 与 feedback：计划的两种归宿</h2>
+
+  <p>
+    <code>dsh-tool-todo</code> 注册模型可见的 <code>todo_write</code> 工具，设计极度克制：
+    <strong>整表替换</strong>是唯一操作——模型每次调用发送完整任务列表
+    （<code>{ content, status }</code>，status 为 <code>pending</code>/<code>in_progress</code>/<code>completed</code>），
+    没有部分更新、没有逐项编辑。每次调用经 <code>agent.session.append('todo/write', { todos })</code>
+    追加一条全量快照事件；当前列表就是最新那条（回放时 last-write-wins）。
+    列表属于<strong>唯一</strong>调用它的 agent 会话——没有 subagent/共享/swarm 作用域，
+    非 agent 调用者直接被拒。<code>allowParallelInProgress</code> 是必填配置：并发活动任务是否
+    合法是部署的选择，不是固定规则；但 durable-log 不变量不跟随它收紧（并行时期写的日志
+    必须仍能在收紧后回放）。挂载投影注册表时，<code>todos</code> 单元在每条 <code>turn/start</code>
+    清空——standing plan 只活到下一个 turn 开始，<code>turn/end</code> 保留完成的清单。
+  </p>
+
+  <p>
+    feedback 家族是「记录人类反馈」的两个刻意分离的契约。命令侧：
+    <code>dsh-command-feedback</code> 的 <code>recordFeedback(session, text)</code> 追加一条
+    log-only 的 <code>feedback/record</code> 事件，<code>/feedback &lt;text&gt;</code> 命令只是
+    这个写路径的人类入口（因此 <code>recordInput: false</code>，命令配对事件不重复记录文本）。
+    反馈是触发无关的：别的 UI、hook、host 集成可以直接调用 producer。文本不做任何解析、
+    截断或合并；日志是追加式的，没有撤回。<code>dsh-session-telemetry-otel</code> 可选地观察
+    这个事件来释放 feedback-gated 的遥测前缀。消息侧：<code>dsh-message-feedback</code>
+    （<code>ctx.messageFeedback</code>）是<strong>可编辑</strong的单条 assistant 消息评分/备注，
+    存在 storage-domain 的 sidecar 行里，发布 Host <code>messageFeedback.list/put/delete</code>
+    Remote 契约，带 <code>ifVersion</code> compare-and-set 与按消息的版本冲突语义——
+    它不是 Session 事件、不是投影、不触发遥测移交。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">关键点</div>
+    <p>
+      四种人类输入、四种归宿：斜杠命令 → 命令平面直接执行 + log-only 生命周期；
+      审批/提问 → 工具调用内的 one-shot 决定，审计对 log-only，模型只见工具结果；
+      计划 → log-only 的 <code>plan/mode</code> 状态 + 系统提示软引导；
+      反馈 → log-only 的 <code>feedback/record</code> 或 Host sidecar。
+      <strong>没有一种把 UI 交互本身塞进模型历史。</strong>
+    </p>
+  </div>
+
+  <h2 id="sec-recap">16.8 本章回顾</h2>
+  <ul>
+    <li>双平面：命令平面经 <code>ctx.commands</code> 分发，不经模型轮次、结果不进模型历史，但记录 log-only 的 <code>command/run</code>/<code>command/done</code>；消息平面一切模型可见内容都以表面事件落日志。</li>
+    <li>命令注册表：全局注册 + <code>agent.ctx</code> 作用域遮蔽，同层重名失败；<code>recordInput: false</code> 让权威领域事件独占载荷；未知斜杠输入被随船适配器拒绝而非变成提示。</li>
+    <li>审批是 one-shot：<code>allowed-once | rejected | cancelled | unavailable</code>，授权只覆盖被请求的动作；应答者瀑布要么作答要么 <code>next()</code>；缺席/失败 fail closed；<code>tools/pre-execute</code> 的 <code>ask</code> 决策路由到 <code>ctx.approval</code>，未挂载则降级 deny。</li>
+    <li>permission-presets 打包 <code>sandbox/mode</code> + <code>approval/policy</code>（默认 <code>workspace-write</code>/<code>danger-full-access</code>）；<code>custom</code> 只能派生；会话创建时 pin 三事件。</li>
+    <li><code>ctx.userQuestions</code> 单 provider；<code>ask_user_question</code> 是 Consumer；被 live 父代理拥有的子代理被拒（<code>DELEGATED_CALLER</code>），durable lineage 不是权威；<code>intent</code>（如 <code>plan-review</code>）只改展示不改回答字段。</li>
+    <li>plan-mode 是 logged state：<code>plan/mode</code> 全值替换事件 + 系统提示软引导 + <code>exit_plan_mode</code> 经确切批准退出；强制限制由 sandbox 与 approval 独立执行。</li>
+    <li>todo_write 整表替换、单 owner、<code>todo/write</code> 全量快照事件、投影在 <code>turn/start</code> 清空；feedback 分两路：<code>feedback/record</code> log-only 事件（命令可触发但触发无关）与 <code>ctx.messageFeedback</code> sidecar（带 CAS 的 Host Remote）。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>以为斜杠命令的结果会进入模型上下文——不会；命令处理器要触发模型工作必须显式使用 <code>Agent</code> 并拥有 resulting message 契约。</li>
+      <li>在审批瀑布监听器里返回 <code>undefined</code> 而不调 <code>next()</code>——整条链被掐断；瀑布监听器必须委托。</li>
+      <li>期待 <code>allow-always</code> 或「记住我的选择」——词汇里只有 <code>allowed-once</code>；减少打扰用 preset 切策略。</li>
+      <li>以为没挂 approval seam 时 <code>ask</code> 会放行或报错给用户——它降级为 deny，fail closed 是刻意的。</li>
+      <li>把 plan mode 当强制边界——它是软引导；硬约束属于 sandbox/approval，两者不读写计划状态。</li>
+      <li>给 todo_write 设计部分更新 API——整表替换是唯一操作，扩展 item 形状（id、嵌套）会在校验中 fail loud。</li>
+      <li>把 message-feedback 当 Session 事件或投影——它是 storage-domain sidecar，与不可变的 <code>feedback/record</code> 事件是两个契约。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="16">
+    <h2>第 16 章测验</h2>
+
+    <div class="q" data-id="16-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— ctx.commands.execute 解析并直接运行处理器：不经模型轮次，结果由适配器渲染、不进模型历史，但记录 log-only 的命令生命周期事件对。"
+         data-rationale="B 正确。A 错：命令平面刻意绕过模型。C 错：命令结果是直接渲染的，不作为 user 消息落表面。D 错：admission miss（未知命令/非法语法）不产生任何日志；已解析的调用才记录 command/run 与 command/done。"
+         data-review="sec-two-planes">
+      <div class="prompt"><span class="qnum">Q1.</span> 用户在 Web 客户端输入 <code>/compact</code> 后，执行路径是什么？</div>
+      <label class="opt"><input type="radio" name="q-16-1" value="a"> A. 转成一条 user 消息发给模型，由模型决定压缩</label>
+      <label class="opt"><input type="radio" name="q-16-1" value="b"> B. 命令平面直接分发执行，不经模型轮次；结果 UI 渲染、不进模型历史，生命周期以 log-only 事件入日志</label>
+      <label class="opt"><input type="radio" name="q-16-1" value="c"> C. 作为工具调用走 tools 管道，模型看到 compact 工具</label>
+      <label class="opt"><input type="radio" name="q-16-1" value="d"> D. 命令被静默忽略且不写任何日志</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A、B、C 都永不进入模型请求：命令结果由适配器直接渲染；approval/asked 与 approval/decided 是 log-only 审计对，模型只见最终工具结果；评审时的 UI 交互不是模型上下文，模型看到的是 exit_plan_mode 的工具结果。D 错：人类的回答以紧凑 JSON 工具结果回到 agent 循环，正是模型要消费的输入。"
+         data-review="sec-two-planes">
+      <div class="prompt"><span class="qnum">Q2.</span> 下列哪些内容<strong>永远不会进入模型请求</strong>？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="a"> A. <code>/compact</code> 的直接结果文本</label>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="b"> B. <code>approval/asked</code> / <code>approval/decided</code> 审计事件</label>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="c"> C. plan 评审时用户在 UI 上的点击交互本身</label>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="d"> D. <code>ask_user_question</code> 得到的人类回答 JSON</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— allowed-once、rejected、cancelled、unavailable。"
+         data-rationale="C 正确，这是 ctx.approval.request 的完整结局词汇。A 里的 allowed-always 不存在：没有 allow-always、记忆规则或授权存储。B 里的 denied 与 timeout 不是词汇（拒绝是 rejected，中止解析为 cancelled）。D 把 permissionPresets 的事件名当成了审批结局。"
+         data-review="sec-approval">
+      <div class="prompt"><span class="qnum">Q3.</span> one-shot 审批请求的结局词汇是哪一组？</div>
+      <label class="opt"><input type="radio" name="q-16-3" value="a"> A. allowed-once、allowed-always、rejected、cancelled</label>
+      <label class="opt"><input type="radio" name="q-16-3" value="b"> B. allowed、denied、timeout、unavailable</label>
+      <label class="opt"><input type="radio" name="q-16-3" value="c"> C. allowed-once、rejected、cancelled、unavailable</label>
+      <label class="opt"><input type="radio" name="q-16-3" value="d"> D. ask、never、preset、custom</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 降级为 deny：注册表机会主义地消费 ctx.get('approval')，无审批 seam 的部署保持 ask→deny 语义，fail closed。"
+         data-rationale="B 正确，这是刻意的 fail-closed 设计。A 错：不会放行。C 错：工具管道不弹 UI，交互应答由部署组装的 approval answerer 提供。D 错：注册表不因缺 approval 而失效——没有它照样工作，只是 ask 降级。"
+         data-review="sec-approval">
+      <div class="prompt"><span class="qnum">Q4.</span> <code>tools/pre-execute</code> 监听器返回 <code>{kind:'ask'}</code>，但部署没有挂载审批 seam，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-16-4" value="a"> A. 调用被放行，因为没有拒绝者</label>
+      <label class="opt"><input type="radio" name="q-16-4" value="b"> B. ask 降级为 deny，调用被拒绝</label>
+      <label class="opt"><input type="radio" name="q-16-4" value="c"> C. 工具注册表弹出交互式提问窗口</label>
+      <label class="opt"><input type="radio" name="q-16-4" value="d"> D. 工具注册表卸载自己</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-5" data-type="fill"
+         data-accepted='["sandbox/mode 和 approval/policy","sandbox/mode + approval/policy","sandbox/mode 与 approval/policy","sandbox mode 和 approval policy"]'
+         data-answer="sandbox/mode 与 approval/policy 两个机制旋钮。"
+         data-rationale="preset 是展示与用户意图层：每个名字捆绑这两个旋钮的一组值，默认 workspace-write（workspace-write + ask）与 danger-full-access（danger-full-access + never）；沙箱执行与审批继续消费各自的旋钮。填 plan/mode 是把计划状态误当成权限机制。"
+         data-review="sec-presets">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：一个 permission preset 打包 ______ 这两个机制旋钮。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 被 live 父代理拥有的子代理被拒（DELEGATED_CALLER），失败信息指示把未决问题或决定写进子代理的最终结果。"
+         data-rationale="C 正确：ask() 认证确切的运行时根身份；durable lineage 不是权威，被恢复为运行时根的会话即使有历史委派深度也可以正常提问。A、B 都无视了这个边界。D 错：父代理不会收到自动转发，通信责任在子代理的最终结果里。"
+         data-review="sec-ask-user">
+      <div class="prompt"><span class="qnum">Q6.</span> 一个被运行中父代理拥有的子代理调用 <code>ask_user_question</code>，结果是什么？</div>
+      <label class="opt"><input type="radio" name="q-16-6" value="a"> A. 问题被自动转发给父代理的用户</label>
+      <label class="opt"><input type="radio" name="q-16-6" value="b"> B. 子代理照常拿到人类的回答</label>
+      <label class="opt"><input type="radio" name="q-16-6" value="c"> C. 调用被拒（DELEGATED_CALLER），子代理应把未决问题写进最终结果</label>
+      <label class="opt"><input type="radio" name="q-16-6" value="d"> D. 问题排队等待子代理结束 turn 后再问</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-7" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— plan/mode 是 log-only、全值替换的 SessionEvent；resume/fork/compaction 直接从日志恢复计划状态。"
+         data-rationale="D 正确，这正是「logged state 而非特权模式」的含义。A 错：它是软引导，没有强制语义。B 错：模式切换不改工具目录，exit_plan_mode 两种状态都注册。C 错：sandbox 模式与审批策略独立执法、不读写计划状态。"
+         data-review="sec-plan-mode">
+      <div class="prompt"><span class="qnum">Q7.</span> 关于 plan-mode 的状态与边界，哪个说法是对的？</div>
+      <label class="opt"><input type="radio" name="q-16-7" value="a"> A. 计划模式激活时运行时获得强制只读权限</label>
+      <label class="opt"><input type="radio" name="q-16-7" value="b"> B. 进入计划模式会换掉整套工具 schema</label>
+      <label class="opt"><input type="radio" name="q-16-7" value="c"> C. 计划模式负责收紧 sandbox 与审批策略</label>
+      <label class="opt"><input type="radio" name="q-16-7" value="d"> D. <code>plan/mode</code> 是 log-only 全值替换事件，resume/fork/compaction 都从日志恢复它</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-8" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 正确：整表替换是唯一操作、todo/write 是全量快照事件（last-write-wins 回放）、todos 投影在 turn/start 清空（standing plan）。C 恰好相反：列表属于唯一调用它的 agent 会话，没有共享作用域，非 agent 调用者被拒。"
+         data-review="sec-todo-feedback">
+      <div class="prompt"><span class="qnum">Q8.</span> 关于 <code>todo_write</code>，下列哪些说法正确？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="a"> A. 每次调用发送完整列表，没有部分更新</label>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="b"> B. <code>todo/write</code> 事件携带全量列表快照</label>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="c"> C. 列表可以被子代理与父代理共享</label>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="d"> D. <code>todos</code> 投影单元在每条 <code>turn/start</code> 清空</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 追加一条 log-only 的 feedback/record 事件；命令配对事件因 recordInput 为 false 不重复记录文本。"
+         data-rationale="B 正确：反馈文本只存在于 feedback/record 这一个持久载荷里，事件是权威（反馈可能来自其他触发器）。A 错：不是 Session 投影。C 错：可编辑的按消息评分存在 ctx.messageFeedback 的 storage sidecar，与命令反馈是两个分离契约。D 错：日志是追加式的，没有撤回或 tombstone。"
+         data-review="sec-todo-feedback">
+      <div class="prompt"><span class="qnum">Q9.</span> 用户执行 <code>/feedback 界面有点慢</code> 后，文本去了哪里？</div>
+      <label class="opt"><input type="radio" name="q-16-9" value="a"> A. 变成 todo 投影的一项</label>
+      <label class="opt"><input type="radio" name="q-16-9" value="b"> B. 追加一条 log-only 的 <code>feedback/record</code> 事件，不进模型上下文</label>
+      <label class="opt"><input type="radio" name="q-16-9" value="c"> C. 写进 <code>ctx.messageFeedback</code> 的 sidecar 行</label>
+      <label class="opt"><input type="radio" name="q-16-9" value="d"> D. 作为可撤回的草稿保存在 UI 中</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-10" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 计划模式是记录在会话日志里的状态（plan/mode 事件 + 系统提示软引导），不是进程的特权模式。"
+         data-rationale="A 正确：foldPlanMode 从日志取最后值，resume/fork/compaction 都恢复它。B 错：它只引导模型，不强制任何限制。C 错：无特权进程模式存在。D 错：/plan 与 /plan off 是 ctx.commands 上的命令，不经模型轮次。"
+         data-review="sec-plan-mode">
+      <div class="prompt"><span class="qnum">Q10.</span> 「计划模式是 logged state 而非特权模式」这句话的正确解读是？</div>
+      <label class="opt"><input type="radio" name="q-16-10" value="a"> A. 状态以 log-only 的 <code>plan/mode</code> 事件持久化，回放即恢复；它对模型是软引导</label>
+      <label class="opt"><input type="radio" name="q-16-10" value="b"> B. 激活后运行时进入只读特权进程模式</label>
+      <label class="opt"><input type="radio" name="q-16-10" value="c"> C. 计划保存在内存里，进程重启即丢失</label>
+      <label class="opt"><input type="radio" name="q-16-10" value="d"> D. <code>/plan</code> 命令本身是一个模型工具</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-11" data-type="short"
+         data-key-points='["命令平面：ctx.commands 分发，不经模型轮次，结果不进模型历史，生命周期 log-only（command/run + command/done）","消息平面：发给模型的一切以表面事件落日志（model-visible ⟺ logged）","命令处理器要触发模型工作时必须显式使用 Agent（如 /plan [message] 经 agent.steer()），并拥有 resulting message 契约","审批/提问是工具调用内的决定：审计 log-only，模型只见工具结果"]'
+         data-answer="双平面是判断轴：命令平面（/compact、/plan、/feedback、/permissionPresets）经 ctx.commands 直接执行——没有模型轮次与 token，结果由适配器渲染且绝不进模型历史，但已解析调用记录 log-only 的 command/run/command/done 供审计回放；消息平面（提示、steering、注入上下文）一切模型可见内容都以表面事件落日志，deriveMessages() 从中投影模型历史。命令处理器若要触发模型工作必须显式使用 Agent（/plan [message] 经 agent.steer() 切换到消息平面）并自己拥有消息契约。审批与提问是工具调用内的人类决定：approval/asked 与 approval/decided 审计对 log-only，模型只见最终工具结果。"
+         data-rationale="双平面 + 两类「人在工具调用内的决定」+ 命令处理器的显式切换，这就是人类协作面的全部骨架。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> 用自己的话解释命令平面与消息平面的区分，各举一例；并说明命令处理器想让模型做事时怎么办。</div>
+      <textarea class="short" placeholder="你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正覆盖了某个要点才勾选它——少选伤害校准，多选只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="17-capability-tour.html"><strong>第 17 章 · 能力面速览</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

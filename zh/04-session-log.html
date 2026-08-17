@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 4 章 · Session Log：事件溯源的真相源 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 4 章 · Session Log</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="4">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 4 章 · 第二部分 · 核心脊柱</div>
+    <h1>Session Log：事件溯源的真相源</h1>
+    <p class="lede">
+      这是全书最重的一章。dsh 对「一次 agent 对话是什么」的全部回答，都压缩在
+      <code>packages/core/session</code> 这一个包里：一条 append-only 的
+      <code>SessionEvent</code> 日志。模型看到的历史、UI 显示的转录、崩溃后的恢复、
+      从中间分叉的新会话、遥测导出——全部是同一条事件流的投影。读完本章，
+      你应该能把「dsh 为什么这样存对话」讲给任何人听。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学完本章你能够</div>
+    <ul>
+      <li>解释事件溯源取向：dsh 不存「对话的当前状态」，只追加「发生过的事实」，以及为什么这让 fork/resume/转录/遥测全部从同一条流推导</li>
+      <li>读懂一条 <code>SessionEvent</code> 的信封字段与完整事件词汇表，包括插件如何用 declaration merging 扩展 <code>SessionEventMap</code></li>
+      <li>描述 <code>deriveMessages()</code> 的投影规则，尤其是 <code>assistant/chunk</code> 与 <code>assistant/message</code> 的分工</li>
+      <li>把「model-visible ⟺ logged」不变量应用到一个新需求上：判断该加会话事件还是该走别的通道</li>
+      <li>说出 <code>SessionHeader</code>、<code>session/end-seed</code>、<code>fork()</code> 边界和 <code>repair.ts</code> 各自解决什么问题</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-event-sourcing">4.1 不存状态，只存事实</h2>
+
+  <p>
+    想象你要记录一次 agent 对话。最直觉的做法是维护一个「当前状态」：
+    一个消息数组，模型每回复一次就往里 push 一条，需要改历史时就地修改。
+    这个做法的问题不在写，而在读——<strong>状态只能回答「现在是什么」，
+    回答不了「怎么变成这样的」</strong>。你想从第 3 轮分叉重试、想回放当时的流式输出、
+    想统计每一步的 token 消耗、想在崩溃后恢复现场，每一种需求都要求你
+    额外记录一份「演化过程」，于是真相散落成好几份互相竞争的副本。
+  </p>
+
+  <p>
+    dsh 的选择反过来：<strong>只追加发生过的事实，不存任何当前状态</strong>。
+    一次对话就是一个 <code>Session</code>，它的全部内容是一条只增不改的
+    <code>SessionEvent</code> 日志（append-only log）。用户发了一条消息，是一个事实；
+    模型吐了一个流式分片，是一个事实；一次工具调用和它的结果、一个 turn 的开始与结束，
+    都是事实。任何「当前状态」——最典型的就是模型历史——都是<strong>从这条日志推导出来的投影</strong>，
+    推导函数是纯的，随时可以重跑。
+  </p>
+
+  <p>
+    这就是「会话真相只有一份」的含义：
+  </p>
+  <ul>
+    <li><strong>resume</strong>（进程重启后继续会话）：把持久化的事件流重新灌回内存，投影照旧成立；</li>
+    <li><strong>fork</strong>（从某个历史时刻分叉出新会话）：取事件流的一个稳定前缀做种子；</li>
+    <li><strong>转录</strong>（UI 回放）：按事件顺序渲染，连打字机般的流式过程都能逐 token 重放；</li>
+    <li><strong>遥测</strong>：消费同一条流的投影；</li>
+    <li><strong>持久化</strong>：把流原样落盘，没有第二种序列化格式要维护。</li>
+  </ul>
+
+  <p>
+    载体是 <code>ctx.sessions</code>（<code>SessionStore</code>，一个 Cordis 服务）：
+    它持有当前进程内所有活会话的注册表；每个 <code>Session</code> 对象内部是一条
+    <code>SessionEvent[]</code> 日志加上几个投影缓存。注意分工——<strong>内存日志是活真相，
+    落盘是插件的事</strong>：持久化插件订阅 <code>session/event</code> 广播、
+    在 <code>session/flush</code> 检查点排空缓冲。整条持久化接缝是下一章的主角。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">源码位置</div>
+    <p class="small" style="margin:0;">
+      <code>packages/core/session/src/index.ts</code>（<code>Session</code> 类与
+      <code>SessionStore</code>）、<code>types.ts</code>（事件词汇与信封类型）、
+      <code>surface.ts</code>（surface 投影）、<code>repair.ts</code>（崩溃修复）、
+      <code>preparation.ts</code>（发布前准备）。文档在
+      <code>docs/subsystems/session.md</code> 与 <code>docs/architecture.md</code> 的
+      Session log 一节。
+    </p>
+  </div>
+
+  <h2 id="sec-event-envelope">4.2 SessionEvent：一条日志长什么样</h2>
+
+  <p>
+    每条事件是一个可判别联合（discriminated union over <code>type</code>）的成员，
+    信封字段固定：
+  </p>
+
+  <pre><code><span class="code-key">type</span> <span class="code-fn">SessionEvent</span>&lt;T <span class="code-key">extends</span> SessionEventType = SessionEventType&gt; = {
+  type: T            <span class="code-comment">// 事件类型，switch 的判别标签</span>
+  seq: number        <span class="code-comment">// 会话内单调序号，恒等于它之前的事件数</span>
+  time: number       <span class="code-comment">// Unix epoch 毫秒</span>
+  data: SessionEventMap[T]  <span class="code-comment">// 类型化载荷，纯 JSON</span>
+  ignorable?: true   <span class="code-comment">// 读者不认识 type 时可安全跳过的标记</span>
+}</code></pre>
+
+  <p>
+    两个契约值得刻在脑子里：
+  </p>
+  <ul>
+    <li>
+      <strong><code>seq = log.length</code> 连续性契约</strong>。事件序号从 0 开始严格连续，
+      事件在日志里的下标就是它自己的 <code>seq</code>。这条契约是整个系统的地基：
+      持久化后端可以逐行落盘、崩溃后可以判断「截断到哪」，都靠它。
+      连 <code>assistant/chunk</code> 这种高频事件也<strong>不允许被过滤掉</strong>——
+      一旦丢弃，<code>seq</code> 就出现空洞。
+    </li>
+    <li>
+      <strong>载荷必须是无损 JSON</strong>。<code>Session.append()</code> 在入口就做一次
+      递归校验加快照：BigInt、函数、<code>undefined</code>、循环引用、<code>Date</code>、
+      <code>Map</code> 这类值当场抛错，坏事件<strong>永远进不了日志</strong>，
+      而不是等到落盘时才失败。通过校验的数据被深冻结（deep freeze）——
+      事件一旦入日志，任何代码都无法改写既成事实。
+    </li>
+  </ul>
+
+  <h3>核心事件词汇</h3>
+
+  <p>
+    <code>SessionEventMap</code> 声明了全部事件类型的载荷。核心成员（你在任何会话里
+    都会反复见到的）：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>事件类型</th><th>载荷要点</th><th>角色</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>turn/start</code> / <code>turn/end</code></td><td><code>{ turn }</code>；end 附带 <code>TurnEndReason</code></td><td>turn 边界。一个 turn 是「零或多个 step」的外壳</td></tr>
+      <tr><td><code>step/start</code> / <code>step/end</code></td><td><code>{ turn, step }</code></td><td>step 边界。一个 step = 一次模型调用 + 它请求的工具执行</td></tr>
+      <tr><td><code>user/message</code></td><td>完整的 <code>UserMessage</code></td><td>进入模型可见表面的用户侧消息：人类提问、<code>agent.inject()</code> 注入的上下文、goal 续轮，<code>source</code> 区分三者</td></tr>
+      <tr><td><code>assistant/chunk</code></td><td><code>{ turn, step, chunk }</code></td><td>原始流式分片，逐 token 回放保真</td></tr>
+      <tr><td><code>assistant/message</code></td><td><code>{ turn, step, message, usage? }</code></td><td>组装完成的 assistant 消息，推导历史用它；usage 与消息同行</td></tr>
+      <tr><td><code>tool/call</code></td><td><code>{ turn, step, callId, name, arguments }</code></td><td>模型请求的工具调用，<code>arguments</code> 是模型原样的未解析 JSON 字符串</td></tr>
+      <tr><td><code>tool/result</code></td><td><code>{ turn, step, message, error?, meta? }</code></td><td>工具调用的模型可见结果；<code>meta</code> 是工具私有的展示数据（必须可 JSON 序列化）</td></tr>
+      <tr><td><code>request/header</code></td><td><code>{ header: EpochHeader, reason }</code></td><td>下一次请求的完整信封：调用配置 + 渲染后的 system prompt + 工具 schema。log-only</td></tr>
+      <tr><td><code>request/context</code></td><td>解析到的路由与容量元数据</td><td>log-only，路由或容量变化时才记录</td></tr>
+      <tr><td><code>session/end-seed</code></td><td>空载荷</td><td>构造种子结束的边界标记（见 4.6）</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    「step 里模型到底看到了什么配置」由 <code>request/header</code> 回答：
+    每个循环实例的第一个请求记一张完整快照（<code>reason: 'initial'</code> 或
+    <code>'resume'</code>），之后配置变了再记一张（<code>'change'</code>）。
+    最新一张快照就能重建请求信封——<strong>每次对话请求都是日志的纯函数</strong>，
+    这是 reconstructability 的另一半（4.5 节）。
+  </p>
+
+  <h3 id="sec-event-extensibility">词汇是可合并扩展的</h3>
+
+  <p>
+    <code>SessionEventMap</code> 不是封闭枚举。插件通过 declaration merging
+    声明自己的事件类型——比如 compaction 接缝加的 <code>compaction/start</code> /
+    <code>compaction/end</code>，agent 包加的 <code>agent/inbox/spliced</code>：
+
+  </p>
+
+  <pre><code><span class="code-comment">// 某插件内：向会话词汇表合并一个新事件类型</span>
+<span class="code-key">declare module</span> <span class="code-str">'@deepseek-ai/dsh-session/types'</span> {
+  <span class="code-key">interface</span> SessionEventMap {
+    <span class="code-str">'my-plugin/notice'</span>: { text: <span class="code-key">string</span> }
+  }
+}</code></pre>
+
+  <p>
+    合并之后，<code>session.append('my-plugin/notice', { text })</code> 就是类型安全的。
+    这些插件事件默认是 <strong>log-only</strong>：它们是可回放的事实记录，
+    不携带 surface 元数据、不进模型历史。
+  </p>
+
+  <p>
+    扩展性立刻引出一个读者问题：一个旧版 dsh 读到新版插件写的事件怎么办？
+    答案是<strong>默认 required-on-read</strong>：遇到不认识的 <code>type</code> 且信封上
+    没有 <code>ignorable: true</code> 标记，读取方必须拒绝重建会话，而不是静默丢事件——
+    一个不认识的必需事件可能改变整条日志其余部分的读法。写方只有在事件
+    「纯粹是信息性的、丢了也不影响重建」时才标 <code>ignorable</code>。
+    这个默认值的取向值得体会：<strong>忘打标记的后果是拒绝（麻烦但不伤数据），
+    而不是静默恢复出一个被掏空的会话（伤数据）</strong>。
+    本仓库构建里全部已知类型由生成器产出到
+    <code>known-event-types.ts</code> 的 <code>KNOWN_SESSION_EVENT_TYPES</code> 集合，
+    持久化读取路径用它做这份判定。
+  </p>
+
+  <h2 id="sec-append-path">4.3 追加路径：append、广播与不变量</h2>
+
+  <p>
+    <code>Session.append(type, data, ...opts)</code> 是日志唯一的人口。它做的事，
+    按顺序：
+  </p>
+  <ol>
+    <li>对 <code>data</code> 与 surface 元数据各做一次<strong>无损 JSON 校验 + 快照</strong>，不过就抛——日志入口即校验入口；</li>
+    <li>构造事件对象（<code>seq = log.length</code>、<code>time = Date.now()</code>）并<strong>深冻结</strong>；</li>
+    <li>校验 surface 转换合法性（4.4 节）；</li>
+    <li>解析 <code>session/event</code> 监听器快照；</li>
+    <li><strong>push 进日志——此刻追加已提交</strong>；</li>
+    <li>逐个调用监听器，每个监听器的失败只记日志、不影响返回值，也不挡住后续监听器。</li>
+  </ol>
+
+  <p>
+    注意提交与通知的顺序：<strong>事件先入日志，监听器后跑</strong>。追加是同步的、
+    热路径上不碰 I/O——持久化插件在自己的缓冲里异步攒批（下一章展开）。
+    观察者挂了也不能让已提交的事实消失，这就是「contained observer」语义。
+  </p>
+
+  <p>
+    日志事件与 Cordis 事件的边界在这里最容易混淆，值得单独说清：
+    <code>SessionEvent</code> 是<strong>日志条目</strong>，不是 Cordis 事件。
+    一条日志事件抵达监听器，走的是唯一的 Cordis emit 通道 <code>session/event</code>，
+    载荷是 <code>(session, event)</code>。围绕会话生命周期的 Cordis 事件一共四个：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Cordis 事件</th><th>模式</th><th>语义</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>session/created</code></td><td>emit</td><td>会话发布完成。同步抛出可以否决发布并回滚</td></tr>
+      <tr><td><code>session/disposed</code></td><td>emit</td><td>已发布的会话离开 store（含发布回滚的配对通知）</td></tr>
+      <tr><td><code>session/event</code></td><td>emit</td><td>提交后、即发即忘的追加流。持久化、遥测、投影都挂在这里</td></tr>
+      <tr><td><code>session/flush</code></td><td>parallel</td><td>被 await 的持久性检查点：所有监听器并行跑完并等待，无 waterfall 否决</td></tr>
+    </tbody>
+  </table>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Session log event pipeline">
+      <rect x="10" y="30" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="85" y="58" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">loop / 工具 / 插件</text>
+      <text x="85" y="80" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">session.append(type, data)</text>
+
+      <line x1="160" y1="65" x2="218" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="218,65 210,61 210,69" style="fill:var(--muted)"/>
+      <text x="189" y="52" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">同步校验 + 冻结</text>
+
+      <rect x="220" y="20" width="170" height="90" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="305" y="48" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">append-only 日志</text>
+      <text x="305" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">seq = log.length</text>
+      <text x="305" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">push 即提交</text>
+
+      <line x1="390" y1="65" x2="448" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="448,65 440,61 440,69" style="fill:var(--muted)"/>
+      <text x="419" y="52" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">session/event 广播</text>
+
+      <rect x="450" y="10" width="140" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="520" y="30" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">持久化插件</text>
+      <text x="520" y="47" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">缓冲 → 批量落盘</text>
+
+      <rect x="450" y="68" width="140" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="520" y="88" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">遥测 / 投影</text>
+      <text x="520" y="105" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">派生状态消费者</text>
+
+      <rect x="450" y="126" width="140" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="520" y="146" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">UI 转录回放</text>
+      <text x="520" y="163" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">按事件顺序渲染</text>
+
+      <line x1="305" y1="110" x2="305" y2="190" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="305,190 301,182 309,182" style="fill:var(--muted)"/>
+      <rect x="140" y="192" width="330" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="305" y="211" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">deriveMessages()：模型历史投影</text>
+      <text x="305" y="228" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">下一轮模型请求读这份推导结果</text>
+
+      <line x1="470" y1="174" x2="470" y2="192" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="640" y="105" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">session/flush 检查点</text>
+      <text x="640" y="120" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">把缓冲排空到持久层</text>
+      <text x="380" y="270" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">一条流，四种消费者：落盘、遥测、回放、推导 —— 会话真相只有一份</text>
+    </svg>
+    <figcaption>图 4-1 · 事件流管线：追加（校验 + 冻结 + push 即提交）→ session/event 广播 → 持久化缓冲 → 各类投影。模型历史是投影之一，不是独立存储。</figcaption>
+  </figure>
+
+  <p>
+    图 4-1 是本章的心智图。特别留意右下角：模型历史和遥测、UI 回放地位相同，
+    都只是这条流的消费者。<strong>不存在一份「权威消息数组」</strong>让别的数据去同步。
+  </p>
+
+  <h2 id="sec-derive-messages">4.4 deriveMessages()：从日志投影模型历史</h2>
+
+  <p>
+    <code>session.deriveMessages()</code> 是把事件日志折叠成 <code>Message[]</code>（模型请求
+    的 <code>messages</code> 字段）的纯投影。它不直接扫全部事件，而是沿着一条由
+    surface 元数据维护的<strong>有序表面（surface）</strong>走：只有三种
+    「消息生产事件」（<code>SurfaceEventType</code>）能上表面——
+    <code>user/message</code>、<code>assistant/message</code>、<code>tool/result</code>——
+    而它们每次 append 时都<strong>必须</strong>声明 <code>surfaceOp</code>（怎么加入表面），
+    编译器在调用点强制非表面类型（如 <code>turn/start</code>、<code>assistant/chunk</code>）
+    传不了这个参数。
+  </p>
+
+  <pre><code><span class="code-comment">// 表面事件的追加必须声明 surfaceOp；普通路径是 append</span>
+session.<span class="code-fn">append</span>(<span class="code-str">'user/message'</span>, message, {
+  surfaceOp: <span class="code-str">'append'</span>,
+  sourceEventSeqs: [],  <span class="code-comment">// 可选：引用哪些更早的事件</span>
+})</code></pre>
+
+  <p>
+    <code>surfaceOp</code> 有两种：
+  </p>
+  <ul>
+    <li><code>'append'</code>：加到表面尾部。用户消息、assistant 消息、工具结果的常规路径。</li>
+    <li>
+      <code>{ op: 'replace', start, end }</code>：把表面上 <code>start</code> 到 <code>end</code>
+      （闭区间）的节点<strong>遮蔽</strong>掉，用本事件顶替。这是 compaction（上下文压缩）
+      的机制：摘要事件替换被摘要的那段历史，推导历史里旧节点就此消失，
+      但<strong>原始事件仍留在日志里</strong>——人类转录读的是 append 起源的原始事件，
+      模型读的是压缩后的表面，两不相扰。
+    </li>
+  </ul>
+
+  <p>
+    逐节点的投影规则（<code>deriveEventMessage</code>，公开的纯函数，外部重建方与
+    核心用同一套规则，不可能各推各的）：
+  </p>
+  <ul>
+    <li><code>user/message</code> → 一条 user 消息，<code>content</code> 原样投影（人类提问、注入上下文、goal 续轮一律如此，<code>source</code> 区分来源）；</li>
+    <li><code>assistant/message</code> → 一条 assistant 消息；<strong>空 content 的 assistant/message 被跳过</strong>——max-tokens 截断、没产出内容的 step 仍会记一条 <code>assistant/message</code> 来承载 usage 与 provider/model，但空内容不该进模型转录；</li>
+    <li><code>tool/result</code> → 一条 user 角色消息，内含 <code>tool-result</code> block；</li>
+    <li>其余一切（<code>turn/*</code>、<code>step/*</code>、插件 log-only 事件）是结构性记录，不投影成消息。</li>
+  </ul>
+
+  <h3>chunk 与 message 的分工（常考细节）</h3>
+
+  <p>
+    一个 step 的模型输出在日志里出现<strong>两次</strong>：流式期间每个分片一条
+    <code>assistant/chunk</code>，流结束后一条组装好的 <code>assistant/message</code>。
+    分工是：
+  </p>
+  <ul>
+    <li><strong><code>assistant/chunk</code>：回放保真与计量</strong>。UI 重放打字机效果、
+      逐 token 时间戳靠它；token 计量也优先读每 step 的 <code>usage</code> 类型 chunk，
+      失败的请求没有 assistant 消息，它的 usage chunk 就是唯一的计量记录。</li>
+    <li><strong><code>assistant/message</code>：推导权威</strong>。<code>deriveMessages()</code>
+      只认它。原始 chunk 在推导中<strong>被跳过</strong>——组装消息才是权威副本。
+      它可以带 <code>sourceEventSeqs</code> 反向引用构成它的那些 chunk。</li>
+  </ul>
+
+  <p>
+    所以「删掉 chunk 省空间」听起来诱人，却直接违反 <code>seq</code> 连续性契约——
+    持久层只能换编码（JSONL 后端的 packed chunk row 就是这种编码，见下一章），
+    不能删事件。投影本身有缓存：每个表面节点只投影一次，之后的调用只处理新节点，
+    是 O(新节点)；一次 <code>replace</code> 改写表面会让缓存整体重建
+    （<code>replaceGeneration</code> 代数控制）。返回的数组每次是新快照，
+    里面的 <code>Message</code> 对象与日志共享且深冻结——想通过投影改历史，
+    在 JavaScript 层面就不可表示。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="deriveMessages projection">
+      <text x="95" y="24" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">事件日志（按 seq）</text>
+      <g font-size="10.5">
+        <rect x="20" y="36" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="52" text-anchor="middle" style="fill:var(--fg)">turn/start</text>
+        <rect x="20" y="64" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="80" text-anchor="middle" style="fill:var(--fg)">user/message</text>
+        <rect x="20" y="92" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="108" text-anchor="middle" style="fill:var(--fg)">assistant/chunk ×n</text>
+        <rect x="20" y="120" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="136" text-anchor="middle" style="fill:var(--fg)">assistant/message</text>
+        <rect x="20" y="148" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="164" text-anchor="middle" style="fill:var(--fg)">tool/call</text>
+        <rect x="20" y="176" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="192" text-anchor="middle" style="fill:var(--fg)">tool/result</text>
+        <rect x="20" y="204" width="150" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--accent)"/>
+        <text x="95" y="220" text-anchor="middle" style="fill:var(--fg)">turn/end</text>
+      </g>
+
+      <line x1="172" y1="76" x2="360" y2="70" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <line x1="172" y1="132" x2="360" y2="104" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="360,104 352,100 352,108" style="fill:var(--muted)"/>
+      <line x1="172" y1="188" x2="360" y2="138" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="360,138 352,134 352,142" style="fill:var(--muted)"/>
+
+      <text x="290" y="60" text-anchor="middle" style="fill:var(--fail)" font-size="10">chunk 不上表面</text>
+
+      <rect x="362" y="48" width="160" height="112" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="442" y="70" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">有序表面</text>
+      <text x="442" y="90" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">surfaceOp 维护的</text>
+      <text x="442" y="106" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">消息生产事件序列</text>
+      <text x="442" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">replace 可遮蔽区间</text>
+      <text x="442" y="148" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">（compaction 摘要）</text>
+
+      <line x1="522" y1="104" x2="588" y2="104" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="588,104 580,100 580,108" style="fill:var(--muted)"/>
+      <text x="555" y="92" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">逐节点投影</text>
+
+      <rect x="590" y="48" width="150" height="112" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="665" y="68" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">deriveMessages()</text>
+      <g font-size="10.5">
+        <text x="665" y="92" text-anchor="middle" style="fill:var(--fg)">user 消息</text>
+        <text x="665" y="112" text-anchor="middle" style="fill:var(--fg)">assistant 消息</text>
+        <text x="665" y="132" text-anchor="middle" style="fill:var(--fg)">tool-result 消息</text>
+        <text x="665" y="152" text-anchor="middle" style="fill:var(--fg-dim)">→ 下一次请求</text>
+      </g>
+      <text x="380" y="248" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">chunk 保回放保真；message 是推导权威 —— 双写但不双真相</text>
+    </svg>
+    <figcaption>图 4-2 · deriveMessages() 的数据通路：日志 → surfaceOp 维护的有序表面 → 逐节点纯投影 → 模型消息历史。assistant/chunk 留在日志里服务回放与计量，但不上表面。</figcaption>
+  </figure>
+
+  <div class="demo" data-demo="eventLogDerive">
+    <div class="demo-title">试一试 —— 从事件日志推导模型历史</div>
+    <p>逐步追加会话事件，观察 deriveMessages() 与「model-visible ⟺ logged」：</p>
+    <button data-run>下一步</button>
+    <div class="demo-output empty">点击开始。</div>
+  </div>
+
+  <h2 id="sec-model-visible-logged">4.5 核心不变量：model-visible ⟺ logged</h2>
+
+  <p>
+    现在可以把全仓最重要的会话规则说完整了：
+  </p>
+
+  <div class="box key">
+    <p style="margin:0;">
+      <strong>凡是进入模型请求的内容，必须能从会话日志重建</strong>（model-visible means logged）。
+      一条运行时不变量（invariant 插件）会断言它。因此：
+      新增一种模型可见输入，必然意味着新增一个会话事件——
+      扩展 <code>SessionEventMap</code>，并让消费路径从日志渲染。
+    </p>
+  </div>
+
+  <p>
+    这条规则把「能不能被恢复」从祈祷变成了机械检查。想想它覆盖的面：
+  </p>
+  <ul>
+    <li><strong>消息历史</strong>：<code>deriveMessages()</code> 只从日志推导（4.4 节）。</li>
+    <li><strong>请求信封</strong>：system prompt、工具 schema、调用配置由
+      <code>request/header</code> 快照承载，最新一张即可重建，请求是日志的纯函数。</li>
+    <li><strong>组合本身</strong>：agent 由哪个 preset 组装决定了模型看到的工具和 prompt，
+      所以 preset 切换要落一条 <code>agent-preset/selected</code> 会话事件——
+      否则 resume 后重建出的组合和产生这段历史的组合不一致，
+      模型会面对一段自己「无法行动」的历史。</li>
+    <li><strong>注入上下文</strong>：<code>agent.inject()</code> 塞进下一次请求的文件变更通知、
+      skill 内容等，落地为 <code>user/message</code> 事件（source 标明来源），
+      而不是请求时的旁路魔法。</li>
+  </ul>
+
+  <p>
+    反过来说，<strong>不需要</strong>在 resume 后重建的运行时细节——比如一次工具执行的
+    展示元数据之外的内部过程——不必也不应该发明事件。判断口诀：
+    「模型下次请求还能不能感知到它？」能，就必须可从日志重建；不能，就别污染词汇表。
+    仓库规约把这条写成硬约束（AGENTS.md：a new model-visible input requires a session event），
+    第 23 章讲门禁时你还会遇到它。
+  </p>
+
+  <p>
+    一个推论值得单独点名：拦截点里改请求配置是允许的——<code>agent/request</code>
+    waterfall 可以替换 <code>LlmCallConfig</code>——但改了之后这条 header 会被记进日志
+    （下一个 <code>request/header</code> 快照），下次请求从日志比对。可以改事实，
+    不可以绕过记账。
+  </p>
+
+  <h2 id="sec-header-and-end-seed">4.6 SessionHeader 与 session/end-seed</h2>
+
+  <p>
+    有意留在日志<strong>之外</strong>的一类信息：会话的创建元数据。
+    <code>SessionHeader</code> 是一个深冻结的小对象，经 <code>session.header</code> 读取：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>字段</th><th>含义</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>version</code></td><td>磁盘格式版本，来自 <code>SESSION_FORMAT_VERSION</code>（当前为 0）。持久化后端加载时拒绝任何其他版本——不迁移</td></tr>
+      <tr><td><code>id</code> / <code>createdAt</code></td><td>会话身份与创建时间</td></tr>
+      <tr><td><code>cwd</code></td><td>创建时的绝对工作目录（必须是绝对路径；存储后端按它分目录）</td></tr>
+      <tr><td><code>parentSession</code></td><td>种子谱系：这个会话从哪个会话 fork/resume 而来</td></tr>
+      <tr><td><code>seedLength</code></td><td>通过种子继承的前缀长度，让 resume/fork 区分「父母的历史」与「自己的工作」</td></tr>
+      <tr><td><code>origin</code> / <code>delegationDepth</code></td><td>子代理分类与委托深度（递归预算要熬过重启，所以持久化）</td></tr>
+      <tr><td><code>agentPreset</code></td><td>组装本会话 agent 的 preset id（4.5 节讲过它为什么必须持久）</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    为什么放日志外？因为它们是<strong>存储关注点，不是可回放的对话状态</strong>：
+    不产生消息、不参与推导，也不该占用 <code>seq</code>。谱系字段是纯数据——
+    「我是从谁分出来的」不带来任何运行时可见性，第 6 章讲 scope 时会回到这点。
+  </p>
+
+  <h3>session/end-seed：种子边界的持久投影</h3>
+
+  <p>
+    resume 或 fork 出来的会话，构造时带一个事件种子。种子事件与活写入在字节上
+    无法区分，于是 <code>Session</code> 的构造函数在种子末尾追加一条空载荷的
+    <strong><code>session/end-seed</code></strong> 事件，作为「这个生命周期从哪开始写」的
+    边界。三件事容易考倒人：
+  </p>
+  <ul>
+    <li>它是 <code>firstLiveSeq</code>（内存对象上的字段）的<strong>持久投影</strong>：
+      手里拿对象读字段，手里只有磁盘字节读事件。</li>
+    <li>读<strong>最后一条</strong> <code>session/end-seed</code>，不要假设它在
+      <code>firstLiveSeq</code> 位置——一个会话被反复打开而中间没干活，
+      不会每次都补一条标记。</li>
+    <li><strong>构造函数是唯一合法写入者</strong>。插件自己 append 一条，
+      会把之前的活写入静默错认成种子历史。所以核心的不变量伴随件刻意不管它——
+      写错属于「误用保留给作者的权限」。</li>
+  </ul>
+
+  <h2 id="sec-fork">4.7 fork：从任意稳定边界分叉</h2>
+
+  <p>
+    事件溯源的回报在这一节兑现。分叉一个会话不需要拷贝任何「状态」，
+    只需要取事件流的一个前缀做种子：
+  </p>
+
+  <pre><code><span class="code-comment">// 从 source 的一个稳定前缀长出一个活子会话</span>
+<span class="code-key">const</span> child = ctx.sessions.<span class="code-fn">fork</span>(source, boundary?, childSessionId?)</code></pre>
+
+  <p>
+    语义逐个参数说：
+  </p>
+  <ul>
+    <li><code>source</code>：活 <code>Session</code> 对象或活 <code>SessionId</code>。
+    传一个已不在 store 里的对象会得到 <code>SESSION_NOT_LIVE</code>。</li>
+    <li><code>boundary</code>：包含（inclusive）的源事件 <code>seq</code>；
+    省略表示「当前最后一条事件」。</li>
+    <li><code>childSessionId</code>：可选子会话 id，省略由 store 分配。</li>
+  </ul>
+
+  <p>
+    子会话自动带上谱系元数据：<code>parentSession</code>、<code>seedLength</code>（= 种子长度）、
+    继承的 <code>cwd</code>。拒绝情形是类型化的（<code>SessionForkError</code> 携带错误码）：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>错误码</th><th>何时抛</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>SESSION_NOT_FOUND</code> / <code>SESSION_NOT_LIVE</code></td><td>源 id 不在 store / 源对象不是 store 的活实例</td></tr>
+      <tr><td><code>SESSION_ALREADY_EXISTS</code></td><td>请求的子 id 已被占用</td></tr>
+      <tr><td><code>INVALID_BOUNDARY</code></td><td>boundary 不是非负安全整数，或指向不存在/不连续的 seq</td></tr>
+      <tr><td><code>OPEN_TURN</code></td><td>选中的前缀结束在一个未闭合的 turn 里</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <code>OPEN_TURN</code> 这条值得停下来想。选中的前缀<strong>允许</strong>停在 turn 之间的
+    某条独立 log-only 事件上（比如一条 <code>turn/end</code> 之后、下一条
+    <code>turn/start</code> 之前），但<strong>不允许</strong>停在开着的 turn 中间——
+    那样种子就带着悬空的工具调用与未闭合的边界，恢复出的转录对 provider 不合法。
+    API 的选择是拒绝而不是悄悄裁剪：要分叉就明说一个稳定边界。
+    （工具中途委托给子代理的 <code>dsh-subagent-fork-in-process</code> 场景保留自己的
+    完成前缀裁剪，因为父 turn 通常还开着——那是另一个包的显式策略。）
+  </p>
+
+  <h2 id="sec-repair-and-preparation">4.8 崩溃修复与发布前准备</h2>
+
+  <p>
+    日志世界的最后一组机制处理两个边角：进程崩在 turn 中间怎么办，
+    以及一个从磁盘重建的会话在被发布前归谁管。
+  </p>
+
+  <h3>repair.ts：收口，而不是截断</h3>
+
+  <p>
+    进程崩溃时，磁盘上的日志可能停在半截：一个 <code>turn/start</code> 没等到它的
+    <code>turn/end</code>，assistant 消息里的工具调用没等到 <code>tool/result</code>。
+    dsh 的修复语义（<code>interruptedTurnClosers(events)</code>，纯函数、确定性）是：
+  </p>
+  <ol>
+    <li>扫日志，追踪开着的 turn、开着的 step、以及悬空的工具调用
+      （assistant 消息的 tool-call block 出现了、但没有配对的 <code>tool/result</code>）；</li>
+    <li>为每个悬空调用合成一条<strong>error 的 <code>tool/result</code></strong>，错误码区分两种情况：
+      <code>TOOL_NOT_STARTED</code>（还没记录为已开始，重试安全）与
+      <code>TOOL_OUTCOME_UNKNOWN</code>（已开始但结果未落盘，结果未知——
+      合成文本明确告诫模型「先验证外部状态再决定是否重试」）；</li>
+    <li>补一条 <code>step/end</code>（如有开着的 step）、一条
+      <code>turn/end</code>，理由是 <code>{ kind: 'interrupted' }</code>；</li>
+    <li>合成事件的 <code>seq</code> 接续日志，<code>time</code> 复用最后一条真实事件的时间戳。</li>
+  </ol>
+
+  <p>
+    关键取舍：<strong>崩溃前已落盘的事件一条不动</strong>。长任务的一个大 turn
+    可能装着巨量工具输出，截断等于销毁工作成果；收口只是补上边界，让恢复出的
+    转录对 provider 合法。顺带一提，<code>interrupted</code> 是唯一一个
+    <strong>循环永远不会发出</strong>的 <code>TurnEndReason</code>——它只属于崩溃恢复
+    （持久化后端在加载时调用这套修复，下一章见）。日志本身是平衡的（没有开着的 turn）
+    就什么都不补。
+  </p>
+
+  <h3>preparation.ts：发布前的所有权</h3>
+
+  <p>
+    从磁盘重建的会话在被挂进 store、对观察者发布之前，存在一个窗口：
+    它是「谁的东西」？<code>SessionPreparation</code> 回答这个问题——
+    它包住一个确切的未发布 <code>Session</code>，实现 <code>Disposable</code>
+    （<code>using</code> 语法可直接用）：发布成功或回滚时，
+    <code>[Symbol.dispose]()</code> 恰好一次地释放提供方持有的状态
+    （可选的 <code>release</code> 回调决定是归还缓存还是丢弃）。
+    这让 resume 路径能把「读取、验证、冻结、构造会话」这套昂贵工作
+    在多次冷读与最终 resume 之间共享——细节属于持久化协调器，下一章展开。
+  </p>
+
+  <h2 id="sec-recap">4.9 本章回顾</h2>
+  <ul>
+    <li>dsh 只追加事实，不存状态：<code>Session</code> 是一条 append-only 的 <code>SessionEvent</code> 日志，fork/resume/转录/遥测/持久化全部是同一条流的投影，会话真相只有一份。</li>
+    <li>事件信封是 <code>type/seq/time/data</code>（surface 事件另带 <code>surfaceOp</code>/<code>sourceEventSeqs</code>），<code>seq = log.length</code> 严格连续，载荷必须无损 JSON 且入日志即深冻结。</li>
+    <li>词汇表由 <code>SessionEventMap</code> 声明、插件可 declaration-merge 扩展；未知事件默认 required-on-read，除非信封带 <code>ignorable: true</code>。</li>
+    <li><code>append</code> 同步校验、push 即提交、再广播 <code>session/event</code>；持久化走 <code>session/flush</code> 检查点。</li>
+    <li><code>deriveMessages()</code> 沿 <code>surfaceOp</code> 维护的有序表面投影模型历史；<code>assistant/chunk</code> 保回放与计量、不进推导，<code>assistant/message</code> 是推导权威；compaction 用 <code>replace</code> 遮蔽区间。</li>
+    <li><strong>model-visible ⟺ logged</strong>：进入模型请求的一切必须可从日志重建，运行时不变量断言它；新模型可见输入必须新增会话事件。</li>
+    <li><code>SessionHeader</code>（版本、cwd、谱系、preset）是日志外的存储元数据；<code>session/end-seed</code> 是种子边界的持久投影，构造函数是唯一合法写入者。</li>
+    <li><code>fork(source, boundary?, childSessionId?)</code> 取稳定前缀做种子，拒绝停在开着的 turn（<code>OPEN_TURN</code>）。</li>
+    <li>崩溃修复收口不截断：悬空工具调用补 error 结果（<code>TOOL_NOT_STARTED</code> / <code>TOOL_OUTCOME_UNKNOWN</code>），再补 <code>step/end</code> 与 <code>turn/end { interrupted }</code>；<code>SessionPreparation</code> 持有未发布会话直至发布或回滚。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>把 <code>SessionEvent</code> 当 Cordis 事件理解。日志条目不是事件总线的成员；它只通过唯一的 <code>session/event</code> emit 抵达监听器。</li>
+      <li>以为 <code>assistant/chunk</code> 参与模型历史推导。推导只认 <code>assistant/message</code>；chunk 服务于回放与 token 计量，但持久层一条都不能丢（seq 连续性）。</li>
+      <li>想给模型塞新输入时走「请求时旁路」而不是新增事件。违反 model-visible ⟺ logged，运行时不变量会当场拒绝。</li>
+      <li>给所有新事件打 <code>ignorable: true</code> 求省事。标记只属于丢了不影响重建的纯信息性记录；默认 required-on-read 是有意的安全取向。</li>
+      <li>把 <code>session/end-seed</code> 当「会话开始」标记，或假设它总在 <code>firstLiveSeq</code> 处。它是种子<strong>结束</strong>的边界，读最后一条。</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="4">
+    <h2>第 4 章测验</h2>
+
+    <div class="q" data-id="4-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— fork、resume、转录、遥测、持久化全部是同一条事件流的投影，不需要为每种需求维护一份演化记录。"
+         data-rationale="C 正确：状态只能回答「现在是什么」，而 fork/resume/回放/统计都需要「怎么变成这样的」，事件流一份就够。A 是状态式存法的卖点，恰是 dsh 放弃的路线。B 说反了：投影是纯函数，推导恰恰便宜且可重跑。D 错：事件日志本来就是持久化的内容，不需要第二个序列化格式。"
+         data-review="sec-event-sourcing">
+      <div class="prompt"><span class="qnum">Q1.</span> dsh 选择「只追加事实、不存当前状态」的最主要回报是什么？</div>
+      <label class="opt"><input type="radio" name="q-4-1" value="a"> A. 追加比更新更快，省 CPU</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="b"> B. 消息数组的推导比直接存储更便宜</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="c"> C. fork、resume、转录回放、遥测、持久化全部从同一条流推导，会话真相只有一份</label>
+      <label class="opt"><input type="radio" name="q-4-1" value="d"> D. 事件流让持久化层可以省掉序列化</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— seq 恒等于它之前的事件数（seq = log.length），从 0 开始严格连续；连 assistant/chunk 都不许被过滤掉。"
+         data-rationale="B 正确：这是全系统依赖的连续性契约，持久化逐行落盘与崩溃判断都靠它。A 错：seq 是会话内序号，不是全局。C 错：时间戳另存 time 字段，与 seq 无关。D 恰好说反：丢 chunk 会打洞，所以一条都不能丢。"
+         data-review="sec-event-envelope">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于事件信封里的 <code>seq</code>，下列哪句是对的？</div>
+      <label class="opt"><input type="radio" name="q-4-2" value="a"> A. 它是进程内全局递增的序号</label>
+      <label class="opt"><input type="radio" name="q-4-2" value="b"> B. 它等于该事件之前的事件数，严格连续从 0 开始，因此 assistant/chunk 也不能被过滤掉</label>
+      <label class="opt"><input type="radio" name="q-4-2" value="c"> C. 它按时间戳排序，可以不连续</label>
+      <label class="opt"><input type="radio" name="q-4-2" value="d"> D. 它允许在存储时为省空间跳过高频 chunk</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-3" data-type="mcq" data-multiselect="true" data-correct='["a","d","f"]'
+         data-answer="A、D、F —— user/message、assistant/message、tool/result 是全部三种 SurfaceEventType；其余事件不上表面。"
+         data-rationale="A、D、F 正确：SurfaceEventType 恰好是这三个消息生产类型。B 错：chunk 是回放/计量数据，推导中被跳过。C 错：turn 边界是结构性记录。E 错：request/header 是 log-only 的请求信封快照。"
+         data-review="sec-derive-messages">
+      <div class="prompt"><span class="qnum">Q3.</span> 下列哪些事件类型属于 SurfaceEventType、其事件会进入 deriveMessages() 的投影？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="a"> A. <code>user/message</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="b"> B. <code>assistant/chunk</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="c"> C. <code>turn/start</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="d"> D. <code>assistant/message</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="e"> E. <code>request/header</code></label>
+      <label class="opt"><input type="checkbox" name="q-4-3" value="f"> F. <code>tool/result</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— chunk 保流式回放与 token 计量保真，message 是推导历史的权威副本。"
+         data-rationale="C 正确：双写各司其职。A 错：推导完全跳过 chunk。B 错：恰恰相反，持久层一条 chunk 都不能丢（seq 连续性），只能换编码（packed chunk row）。D 错：两者都要持久化，丢弃任何一类都会破坏契约。"
+         data-review="sec-derive-messages">
+      <div class="prompt"><span class="qnum">Q4.</span> <code>assistant/chunk</code> 与 <code>assistant/message</code> 的分工是什么？</div>
+      <label class="opt"><input type="radio" name="q-4-4" value="a"> A. chunk 用于推导历史，message 用于 UI 显示</label>
+      <label class="opt"><input type="radio" name="q-4-4" value="b"> B. message 落盘，chunk 只留在内存里</label>
+      <label class="opt"><input type="radio" name="q-4-4" value="c"> C. chunk 保逐 token 回放与计量保真，message 是模型历史推导的权威；两者都完整持久化</label>
+      <label class="opt"><input type="radio" name="q-4-4" value="d"> D. 旧版本用 chunk，新版本用 message</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 在插件里 declaration-merge 扩展 SessionEventMap，让新输入作为会话事件落日志，并从日志渲染。"
+         data-rationale="B 正确：这是 model-visible ⟺ logged 的直接推论，也是仓库规约的原文要求。A 是典型的违规做法，运行时不变量会拒绝。C 只是编码细节，不解决可重建性。D 恰好相反：inject 的内容正因为要进模型请求，才必须落成 user/message 事件。"
+         data-review="sec-model-visible-logged">
+      <div class="prompt"><span class="qnum">Q5.</span> 你要给模型增加一种新可见输入（例如实时天气摘要），正确路径是？</div>
+      <label class="opt"><input type="radio" name="q-4-5" value="a"> A. 在组装请求时直接拼进 messages，不落日志</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="b"> B. 扩展 SessionEventMap 新增一个会话事件（或复用 user/message 注入路径），从日志渲染</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="c"> C. 把数据 JSON.stringify 后塞进工具结果的 meta 字段</label>
+      <label class="opt"><input type="radio" name="q-4-5" value="d"> D. 用 agent.inject() 注入，因为注入的内容不需要落日志</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-6" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B、C —— 消息历史与请求信封（system prompt、工具 schema、调用配置）都必须可从日志重建。"
+         data-rationale="B、C 正确：deriveMessages 与 request/header 快照分别覆盖这两块。A 错：日志深冻结，任何代码都不能改写历史。D 错：监听器失败被抑制（contained），不影响已提交的追加，更不会改写历史。"
+         data-review="sec-model-visible-logged">
+      <div class="prompt"><span class="qnum">Q6.</span> 「model-visible ⟺ logged」不变量覆盖下列哪些内容？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="a"> A. 消息历史可以直接在内存里改写，改完再补日志</label>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="b"> B. 模型看到的消息历史必须从日志可推导</label>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="c"> C. system prompt、工具 schema、调用配置要能从 request/header 快照重建</label>
+      <label class="opt"><input type="checkbox" name="q-4-6" value="d"> D. session/event 监听器抛错时应改写已入日志的事件</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-7" data-type="fill" data-accepted='["surfaceOp","surfaceop","surface op","thesurfaceop"]'
+         data-answer="surfaceOp（事件加入有序表面的方式标记：append 或 replace）。"
+         data-rationale="deriveMessages() 沿 surfaceOp 维护的有序表面走。三种 SurfaceEventType 每次追加都必须声明它；非表面类型编译期就传不进来。compaction 的 replace 靠它遮蔽区间。"
+         data-review="sec-derive-messages">
+      <div class="prompt"><span class="qnum">Q7.</span> 填空：deriveMessages() 不直接扫描全部事件，而是沿一条由 <code>______</code> 标记维护的有序表面逐节点投影。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 默认 required-on-read：不认识又没有 ignorable: true 的事件必须拒绝重建，宁可过拒不可静默掏空会话。"
+         data-rationale="D 正确：这是安全取向——忘打标记只是不便，静默跳过可能重建出错误会话。A 错：那是把 ignorable 当默认。B 错：没有这种自动升级。C 错：作者侧从不静默跳过；打包省空间是编码层（packed rows）的事，与读取判定无关。"
+         data-review="sec-event-envelope">
+      <div class="prompt"><span class="qnum">Q8.</span> 一个旧构建读到日志里有个不认识的事件类型、信封上没有 ignorable 标记，读取方应该？</div>
+      <label class="opt"><input type="radio" name="q-4-8" value="a"> A. 静默跳过这条事件继续重建</label>
+      <label class="opt"><input type="radio" name="q-4-8" value="b"> B. 自动把日志升级到新格式</label>
+      <label class="opt"><input type="radio" name="q-4-8" value="c"> C. 删掉这条事件并在文件里记一笔</label>
+      <label class="opt"><input type="radio" name="q-4-8" value="d"> D. 拒绝重建整个会话——未知必需事件可能改变其余日志的读法</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 抛 SessionForkError，错误码 OPEN_TURN；API 拒绝而不是悄悄裁剪。"
+         data-rationale="A 正确：开着 turn 的前缀带悬空工具调用与未闭合边界，恢复出的转录对 provider 不合法；边界可以是 turn 之间的独立 log-only 事件，但必须闭合。B 错：不存在自动裁剪。C 错：与持久化无关，是内存中的活源校验。D 错：会正常分叉，停在 turn 之间是合法边界。"
+         data-review="sec-fork">
+      <div class="prompt"><span class="qnum">Q9.</span> fork 的 boundary 选中的前缀结束在一个还没闭合的 turn 里，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-4-9" value="a"> A. 拒绝分叉，错误码 OPEN_TURN</label>
+      <label class="opt"><input type="radio" name="q-4-9" value="b"> B. 自动裁剪到上一个 turn/end</label>
+      <label class="opt"><input type="radio" name="q-4-9" value="c"> C. 先把日志落盘再分叉</label>
+      <label class="opt"><input type="radio" name="q-4-9" value="d"> D. 正常分叉，turn 边界与 fork 无关</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-10" data-type="mcq" data-multiselect="true" data-correct='["a","c","e"]'
+         data-answer="A、C、E —— cwd、parentSession、agentPreset 都是 SessionHeader 字段；model 是 AgentOptions 的事，turn 计数在日志里。"
+         data-rationale="A、C、E 正确：header 还含 version、id、createdAt、seedLength、origin、delegationDepth，全是存储元数据。B 错：模型选择记录在 request/header 事件与 AgentOptions 里，不是会话头字段。D 错：turn 序号来自日志中的 turn/start 计数，不进 header。"
+         data-review="sec-header-and-end-seed">
+      <div class="prompt"><span class="qnum">Q10.</span> 下列哪些信息存放在 SessionHeader（而不是事件日志）里？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="a"> A. 会话创建时的绝对工作目录 cwd</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="b"> B. 当前使用的模型 id</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="c"> C. 种子谱系 parentSession 与 seedLength</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="d"> D. 会话经历过的 turn 总数</label>
+      <label class="opt"><input type="checkbox" name="q-4-10" value="e"> E. 组装本会话 agent 的 preset id</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 为悬空调用合成 error 的 tool/result，再补 step/end 与 turn/end { interrupted }；崩溃前已落盘的事件一条不动。"
+         data-rationale="B 正确：收口不截断，大 turn 的工具成果得以保留，转录恢复后对 provider 合法。A 错：截断正是被否掉的方案。C 错：log 是 append-only 的，不能重写已有事件。D 错：TOOL_NOT_STARTED 只盖「未开始」的调用；已开始的用 TOOL_OUTCOME_UNKNOWN。"
+         data-review="sec-repair-and-preparation">
+      <div class="prompt"><span class="qnum">Q11.</span> 崩溃恢复（repair.ts）对一段停在半截的日志做什么？</div>
+      <label class="opt"><input type="radio" name="q-4-11" value="a"> A. 截断到最后一个完整 turn，丢弃半截事件</label>
+      <label class="opt"><input type="radio" name="q-4-11" value="b"> B. 为悬空工具调用补 error 的 tool/result，再补 step/end 与 turn/end { interrupted }，已有事件不动</label>
+      <label class="opt"><input type="radio" name="q-4-11" value="c"> C. 重写崩溃前的事件，补上缺失的配对</label>
+      <label class="opt"><input type="radio" name="q-4-11" value="d"> D. 给所有未完成调用统一标 TOOL_NOT_STARTED</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-12" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 读存储历史的消费者定位最后一条 session/end-seed：它之前的 seq 来自种子（resume/fork/replay），这个生命周期没写过它们。"
+         data-rationale="C 正确：end-seed 是 firstLiveSeq 的持久投影，空载荷、位置即含义。A 错：它标记的是种子结束，不是会话开始。B 错：构造函数是唯一合法写入者，重复打开不重复补标记，所以要读最后一条。D 错：遥测正是靠它（或内存里的 firstLiveSeq）避免把 resume 的历史重新上报。"
+         data-review="sec-header-and-end-seed">
+      <div class="prompt"><span class="qnum">Q12.</span> <code>session/end-seed</code> 事件的用途是什么？</div>
+      <label class="opt"><input type="radio" name="q-4-12" value="a"> A. 标记一个新会话的创建时刻</label>
+      <label class="opt"><input type="radio" name="q-4-12" value="b"> B. 每次进程重启都要重新追加一条</label>
+      <label class="opt"><input type="radio" name="q-4-12" value="c"> C. 标记构造种子的结束边界：之前的 seq 继承自 resume/fork/replay，读存储历史的消费者找最后一条</label>
+      <label class="opt"><input type="radio" name="q-4-12" value="d"> D. 只服务遥测去重，其他消费者忽略它</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="4-13" data-type="short"
+         data-key-points='["凡是进入模型请求的内容必须能从会话日志重建（model-visible ⟺ logged）","运行时不变量会断言它，违规会被当场拒绝","新增模型可见输入必须扩展 SessionEventMap 并从日志渲染","这条规则让 resume/fork 后的重建机械可验证，而不是靠祈祷","请求信封（system prompt、工具 schema、配置）也由 request/header 快照承载，请求是日志的纯函数"]'
+         data-answer="要点：进入模型请求的一切必须可从日志重建；运行时不变量断言；新输入必须走新会话事件（扩展 SessionEventMap）；消息历史由 deriveMessages 推导、请求信封由 request/header 快照重建，因此每次请求都是日志的纯函数，resume/fork 的正确性变成机械可验证。"
+         data-rationale="答出「日志可重建 + 不变量断言 + 新事件是唯一入口 + 请求是日志纯函数」四点，这条规则就拿下了。"
+         data-review="sec-model-visible-logged">
+      <div class="prompt"><span class="qnum">Q13.</span> 用你自己的话解释「model-visible ⟺ logged」：它要求什么、靠什么强制执行、为什么它让 resume 和 fork 的正确性变成可机械验证的？</div>
+      <textarea class="short" placeholder="写下你的理解…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正说到了才勾选——少勾损害的是书对你的校准，多勾只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做本测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="05-persistence.html"><strong>第 5 章 · 持久化：JSONL/SQLite 后端与版本化</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

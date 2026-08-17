@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 23 章 · 质量门禁与仓库约定 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 23 章 · 质量门禁</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="23">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 23 章 · 第五部分 · 工程与贡献</div>
+    <h1>质量门禁与仓库约定</h1>
+    <p class="lede">
+      一个「everything is a plugin」的仓库，靠什么让几十个包的插件不打架？答案分两层：
+      一层是可执行的<strong>门禁</strong>——run-gates.ts 调度的几十个验证命令加 lefthook 钩子；
+      另一层是写在 AGENTS.md 里的<strong>硬约定</strong>——每一条都在回答「为什么这么写才不会烂」。
+      本章把这两层摊开：先给你命令地图与「按证据面选检查」的本地哲学，再逐条讲透二十条约定。
+      读完你就有了在这个仓库里判断「这么做行不行」的内化标准。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>默写常用命令地图：clean / test / test:coverage / test:e2e / test:snapshot[:record] / typecheck / lint / duplication / build / hygiene / doc-sync / website:build 与 <code>dsh --profile headless</code>。</li>
+      <li>按「证据面 → 检查」为一次改动选出最小检查集，而不是默认全量套件。</li>
+      <li>说出 lefthook 三个钩子各查什么、刻意不查什么，以及 run-gates.ts 的 CI lane 划分。</li>
+      <li>逐条复述 AGENTS.md 的二十条硬约定，并为每条讲出「为什么」。</li>
+      <li>区分 <code>test</code> 与 <code>test:coverage</code>：后者才是 CI 覆盖率门禁。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-commands">23.1 命令地图</h2>
+
+  <p>
+    AGENTS.md 的 Commands 一节是命令的唯一权威入口；package.json 拥有脚本清单，
+    scripts/run-gates.ts 拥有门禁聚合。日常用到的命令如下：
+  </p>
+
+  <table>
+    <thead><tr><th>命令</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>pnpm install</code></td><td>pnpm workspaces 安装（Node ^22.19 || &gt;=24），同时配置 worktree 本地 lefthook 钩子与翻译配对 merge driver。</td></tr>
+      <tr><td><code>pnpm run clean</code></td><td>移除构建产物与已删包的安全残留。</td></tr>
+      <tr><td><code>pnpm run test</code></td><td>vitest 单元通道（22.1 节的 unit lane）。</td></tr>
+      <tr><td><code>pnpm run test:coverage</code></td><td><strong>CI 覆盖率门禁</strong>：<code>packages/*/*/src</code> per-file 100%。</td></tr>
+      <tr><td><code>pnpm run test:e2e</code></td><td>真实 API 通道；无 <code>DEEPSEEK_API_KEY</code> 自动跳过。</td></tr>
+      <tr><td><code>pnpm run test:snapshot</code> / <code>:record</code></td><td>keyless 快照对比 / 带密钥重录金标准（22.4 节）；快照过滤用 <code>-t &lt;name&gt;</code>。</td></tr>
+      <tr><td><code>pnpm run typecheck</code></td><td>先完成 Host lib 阶段（含 Typert 契约生成），再跑 Client TypeScript 检查。</td></tr>
+      <tr><td><code>pnpm run lint</code></td><td>Oxlint；同样先构建 Host lib 让 lint 契约就绪。</td></tr>
+      <tr><td><code>pnpm run duplication</code></td><td>jscpd 跨文件 TypeScript 克隆检测。</td></tr>
+      <tr><td><code>pnpm run build</code></td><td>tsc 产出 <code>lib/types</code>，tsdown 打包运行时（Host 面 → Client 面 → Web）。</td></tr>
+      <tr><td><code>pnpm run hygiene</code></td><td>knip + publint + workspace constraints + NodeNext 消费者检查，外加 rescope、许可、包不变量、cordis 配置、运行时闭包、vendored 链接等验证。</td></tr>
+      <tr><td><code>pnpm run check:windows-wine</code></td><td><strong>仅</strong>在诊断已知 Windows 故障时本地跑（需要 wine）；这个信号归 CI 所有。</td></tr>
+      <tr><td><code>pnpm run doc-sync</code></td><td>全部文档门禁；叶子清单在 scripts/run-gates.ts（目录、预算、链接、翻译配对、Agent Note 分类……）。</td></tr>
+      <tr><td><code>pnpm run website:build</code></td><td>VitePress 构建，兼作死链检查。</td></tr>
+      <tr><td><code>pnpm dsh --profile headless "task"</code></td><td>从源码跑一次真实任务（需要 <code>DEEPSEEK_API_KEY</code>）。</td></tr>
+    </tbody>
+  </table>
+
+  <p class="small">
+    另有 <code>pnpm run check:all</code>：可选的完整本地门禁聚合，独立于 Git 钩子，不是 agent 指令。
+    demo 家族（<code>demo:cordis</code>、<code>demo:acp</code>）都需密钥。
+  </p>
+
+  <h2 id="sec-evidence">23.2 本地检查哲学：按证据面选检查</h2>
+
+  <p>
+    这个仓库对本地检查的态度只有一句话：<strong>匹配证据面，绝不默认全量</strong>。AGENTS.md
+    「Run relevant checks locally」一节列出五组对应关系——行为改动跑聚焦测试；模型或用户输出
+    跑快照；文档跑 <code>doc-sync</code>；发布路径跑 build/hygiene 加构建产物 smoke；provider
+    行为跑 e2e。为提交或推送重复跑一遍已经绿的检查被视为错误，而不是稳妥。穷尽覆盖与平台矩阵
+    （Node 22.19 / 24 / 26、Linux / Windows）是 CI 的职责；本地只有三种情况才值得排练全量：
+    明确要求、诊断 CI、或一个不可拆分的仓库级改动。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="证据面到检查的决策树">
+      <rect x="8" y="16" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="98" y="40" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">这次 PR 改了什么？</text>
+      <text x="98" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">先问证据面，再选命令</text>
+
+      <line x1="188" y1="44" x2="240" y2="44" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="240" y1="44" x2="240" y2="392" style="stroke:var(--muted)" stroke-width="2"/>
+
+      <line x1="240" y1="60" x2="284" y2="60" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="36" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="296" y="55" style="fill:var(--fg)" font-size="12">包内行为（逻辑、事件顺序）</text>
+      <text x="296" y="73" style="fill:var(--accent)" font-size="12" font-family="monospace">→ 聚焦测试 vitest -t / 单文件</text>
+
+      <line x1="240" y1="132" x2="284" y2="132" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="108" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="296" y="127" style="fill:var(--fg)" font-size="12">模型或产品用户可见输出</text>
+      <text x="296" y="145" style="fill:var(--accent-2)" font-size="12" font-family="monospace">→ 同 PR 补 keyless 快照</text>
+
+      <line x1="240" y1="204" x2="284" y2="204" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="180" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="296" y="199" style="fill:var(--fg)" font-size="12">文档 / README / JSDoc</text>
+      <text x="296" y="217" style="fill:var(--accent)" font-size="12" font-family="monospace">→ pnpm run doc-sync</text>
+
+      <line x1="240" y1="276" x2="284" y2="276" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="252" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="296" y="271" style="fill:var(--fg)" font-size="12">发布路径（bin / lib / exports）</text>
+      <text x="296" y="289" style="fill:var(--accent)" font-size="12" font-family="monospace">→ build + hygiene + built smoke</text>
+
+      <line x1="240" y1="348" x2="284" y2="348" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="284" y="324" width="230" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1"/>
+      <text x="296" y="343" style="fill:var(--fg)" font-size="12">provider 真实行为</text>
+      <text x="296" y="361" style="fill:var(--warn)" font-size="12" font-family="monospace">→ test:e2e（需密钥）</text>
+
+      <rect x="540" y="36" width="232" height="336" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="656" y="64" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">共同的底盘</text>
+      <text x="556" y="92" style="fill:var(--fg)" font-size="12">• 推送前走 dsh-pre-push-checks</text>
+      <text x="556" y="116" style="fill:var(--fg)" font-size="12">  技能选最小检查集</text>
+      <text x="556" y="148" style="fill:var(--fg)" font-size="12">• 非平凡改动同 PR 带 Agent Note</text>
+      <text x="556" y="180" style="fill:var(--fg)" font-size="12">• 覆盖率门禁是 test:coverage，</text>
+      <text x="556" y="204" style="fill:var(--fg)" font-size="12">  不是 test</text>
+      <text x="556" y="236" style="fill:var(--fg)" font-size="12">• gh stack sync 后立即验证，</text>
+      <text x="556" y="260" style="fill:var(--fg)" font-size="12">  检查不过不合并</text>
+      <text x="556" y="292" style="fill:var(--fg-dim)" font-size="12">绝不：为提交/推送重复跑</text>
+      <text x="556" y="316" style="fill:var(--fg-dim)" font-size="12">已绿的检查，或默认全量套件</text>
+      <text x="556" y="348" style="fill:var(--fg-dim)" font-size="12">CI 拥有穷尽覆盖与平台矩阵</text>
+
+      <rect x="8" y="392" width="764" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="390" y="411" text-anchor="middle" style="fill:var(--fg-dim)" font-size="12">沙箱失败例外：gh/pnpm/build/test 因 agent 沙箱（凭证、网络、IPC、嵌套 sandbox-exec）失败时，先用最窄的宿主升级重试原命令，再诊断项目故障</text>
+    </svg>
+    <figcaption>一次 PR 的「证据面 → 检查」决策树。左边问改动类型，右边是五组对应关系；共同的底盘（最小检查集、Agent Note、覆盖率门禁归属）适用于所有分支。</figcaption>
+  </figure>
+
+  <h2 id="sec-gates">23.3 门禁家族：run-gates、CI lane 与 Git 钩子</h2>
+
+  <p>
+    <code>scripts/run-gates.ts</code> 是门禁的调度器：它以有向依赖图组织几十个 gate，在
+    有界并发下跑进程并汇总诊断。它的 Mode 清单就是 CI 的 lane 划分——<code>ci-primary</code>
+    （<code>ci-linux-primary</code> 额外加 web 浏览器快照）、<code>ci-static</code>、
+    <code>ci-coverage</code>、<code>ci-snapshot</code>、<code>ci-artifacts</code>、
+    <code>ci-consumers</code>、三个 Windows lane（blocking / complete / observational）、
+    <code>node-compat</code>，加上本地可选的 <code>check-all</code> 与文档聚合
+    <code>doc-sync</code>。一条 lane 内部，artifact 消费者等待同 lane 的一次 build，而不是各建各的。
+  </p>
+
+  <p>
+    <code>doc-sync</code> 的叶子清单能让你感受这个仓库把「文档正确」做成了多少条可执行断言：
+    cordis/client/tool/config/persistence 目录再生成比对、export JSDoc 校验、文档图、scoped events、
+    Markdown 换行与链接、公开仓库链接、文档引用、包路径、配置来源属主、README 的 model-experience
+    与 limitations 章节、Agent Note 的分类/格式/冻结校验、type-equiv（文档里贴的类型与源码逐字一致）、
+    翻译 prompt 与配对、文档预算、VitePress 站点构建。任何一个改了，门禁都会红。
+  </p>
+
+  <p>
+    Git 侧由 lefthook 提供三个快速检查点。<code>pre-commit</code>：校验暂存的翻译配对记录、用
+    项目无关的 <code>.oxlintrc.staged.json</code> 档案校验暂存文件并带一次有界重试地应用 Oxlint
+    修复、在输入文件变化时重新生成 <code>THIRD_PARTY_NOTICES.md</code>、检查暂存 diff 的空白错误
+    （<code>git diff --cached --check</code>——这就是「文件恰好一个尾随换行」的执行者）、跑 vendor
+    manifest 守卫。<code>pre-merge-commit</code>：做同一套配对检查。<code>pre-push</code>：跑
+    <code>pnpm run typecheck</code>。注意钩子<strong>刻意不跑</strong>测试、快照、文档检查、构建
+    或 hygiene——那些归贡献者按证据面选择，归 CI 穷尽。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">宿主沙箱失败的重试规则</div>
+    <p>
+      当必需的 <code>gh</code>、<code>pnpm</code>、build、test 或生成器命令因为 agent 沙箱挡了
+      凭证、网络、IPC、文件监听或嵌套 <code>sandbox-exec</code> 而失败时，先<strong>原样</strong>用
+      最窄的宿主升级重试，再诊断认证或项目故障。要拿得出沙箱证据；绝不绕过真实的测试失败或被测的
+      产品沙箱。
+    </p>
+  </div>
+
+  <h2 id="sec-contracts-runtime">23.4 运行时契约：五条关于 Cordis 与事件的约定</h2>
+
+  <p><strong>1）注册即效应。</strong>every contribution 经 <code>ctx.effect()</code> / <code>ctx.on()</code>，
+  注册表的 <code>register()</code> 返回 disposer。为什么：Cordis 的 fiber 生命周期是插件卸载/HMR
+  的基础，凡是不走 effect 的注册就是卸不掉的泄漏；第 3 章的 HMR-safety 测试正是对这条约定的验证。</p>
+
+  <p><strong>2）运行时不变量断言拥有的关系。</strong>检查权威事件流或可变数据，而不是服务或方法
+  存在性、插件元数据、effect、固定的纯例子。为什么：「服务还在」证明不了「关系还对」——存在性检查
+  会在注册了却从不写日志的实现上绿灯通过。若无合理关系可断言，一个解释过的空伴随（empty companion）
+  就是正确答案，不要为了凑断言造伪证。</p>
+
+  <p><strong>3）typed events 用 declaration merging。</strong>事件接口靠声明合并扩展 merge-extensible
+  maps；事件 JSDoc 要 <code>@mode</code>，payload 要 <code>@param</code>，不在 payload 里的 scoped key
+  要标 <code>@dshScopeScan unsupported</code>。<code>SessionEventMap</code> 成员默认 required-on-read：
+  不认识该事件类型的构建拒绝读日志，除非事件带 <code>ignorable: true</code>；只有结构性格式变化才
+  bump <code>SESSION_FORMAT_VERSION</code>。为什么：这是「日志可重建运行时」的类型级保险，未知事件
+  在静默丢弃与拒绝加载之间，仓库选择了拒绝。</p>
+
+  <p><strong>4）判别标签上 switch。</strong>封闭 union 以 <code>assertNever</code> 收尾；可扩展
+  union 穿过一个写明注释的 default。为什么：判别标签让穷尽性检查由编译器执行——给封闭 union 加
+  一个成员，所有忘记处理的 switch 立刻红；漏掉 <code>assertNever</code> 就把这层保险拆了。</p>
+
+  <p><strong>5）waterfall 监听器必须调 <code>next()</code>。</strong>不调 <code>next()</code> 而直接
+  return 就是短路整条链。为什么：waterfall 的语义是层层委托（如权限审批的链式放行），忘了委托的
+  监听器会把下游所有监听器无声地藏起来——这是最难排查的一类「权限突然全拒绝」。</p>
+
+  <h2 id="sec-contracts-visible">23.5 模型可见性与扩展点：三条结构性约定</h2>
+
+  <p><strong>6）model-visible ⟺ logged。</strong>凡到达模型请求的东西必须能从会话日志重建；新增一个
+  模型可见输入必须新增一个会话事件。为什么：会话日志是可回放、可审计、可做快照金标准的唯一事实源
+  （第 4 章）；从 <code>llm-replay</code> 到 ACP 快照，整条测试体系都站在这个等价关系上。绕过日志
+  塞进请求的内容，回放时会消失，快照会漂移。</p>
+
+  <p><strong>7）插件不改 loop。</strong>新行为落在文档化的扩展点上；要改 <code>agent-loop</code> 本体
+  就必须同步更新 docs/architecture.md。为什么：loop 是所有插件共享的调度核，直接在里面塞私有逻辑
+  等于给所有人埋雷；扩展点是插件之间互不踩踏的合同。</p>
+
+  <p><strong>8）capability seam 三角色齐全。</strong>一个能力面由 Service Definition / Service Provider /
+  Consumer 三角色构成，齐全才算 seam，只有角色演化节奏确实不同才拆开。为什么：缺 Provider 的
+  「能力」没法换实现，缺 Consumer 的「能力」没人用，缺 Definition 的两端各自理解协议——三角色是
+  第 11 章可替换性的最小完备集。</p>
+
+  <h2 id="sec-contracts-boundary">23.6 包边界与配置：六条工程约定</h2>
+
+  <p><strong>9）优先维护良好的依赖而非手滚。</strong>当依赖真能删掉自有代码与测试时用它——这有政策
+  文档（<code>.agents/notes/implemented/process/2026-07-26-dependencies-over-hand-rolling.md</code>）背书。
+  为什么：「我们自己写更快」的直觉常忽略维护与测试的长期账单；但反过来，为省三行代码引入一个依赖
+  同样亏，所以判据是「真正删掉 owned code 与 tests」。</p>
+
+  <p><strong>10）包边界显式 &gt; 隐式。</strong>默认值是 owning 实现里一个显式的
+  <code>resolve(request): Spec</code> 步骤，绝不是 <code>run()</code> 里藏着的 <code>?? default</code>
+  ——<code>dsh-shell</code> 的 request/spec 拆分是模板。为什么：藏在执行路径里的默认值在审查与配置
+  面上都不可见，策略漂移无声发生；显式 resolve 让「谁拥有默认」一处可查。</p>
+
+  <p><strong>11）插件里不许硬编码 tunables。</strong>部署可变的选项是经过校验的 <code>Config</code> 字段，
+  可从 cordis.yml 改；<code>DEFAULT_*</code> 常量或测试钩子不算可配置。协议常数、外部规范与安全
+  不量保持固定。为什么：一个写死的超时在别的部署里就是故障；而「安全不变量」如果做成可配置，就
+  不再是不变量。</p>
+
+  <p><strong>12）配置错误大声失败。</strong>能自证时在加载期失败，否则在最早可解析点；绝不静默跳过
+  缺失的引用。为什么：静默跳过把错误推迟到运行中最贵的时刻，还伪装成正常；fail loud 让坏配置在
+  <code>--dump-config</code> 或启动时就爆。</p>
+
+  <p><strong>15）source plane 与 artifact plane 永不混合。</strong>静态门禁与测试经 tsconfig
+  <code>paths</code> 把 workspace 导入解析到 <code>src</code>，在干净树上通过；消费构建 <code>lib/</code>
+  的门禁显式声明该依赖。为什么：混用会装出第二份模块单例、让陈旧产物混进源码验证，两边各自证明的
+  东西就都不可信了（22.7 节）。</p>
+
+  <p><strong>16）每包一个聚合 compiler face。</strong>唯一例外是 <code>api/remotes</code>（Host 与
+  Client 两份 tsconfig，因 Host Typert 图与 Client <code>/remote</code> 声明的先后依赖而拆）。仓库级
+  程序要从 <code>tsconfig.host.json</code> 或 <code>tsconfig.client.json</code> 起种，绝不用根 solution。
+  为什么：两侧在相同键下 declaration-merge 出不同的 <code>Context</code>，压进一个 <code>ts.Program</code>
+  会撞合并冲突——这是两聚合架构（第 3 章）的编译面映照。</p>
+
+  <h2 id="sec-constraints-discipline">23.7 类型与代码纪律：六条小而硬的规矩</h2>
+
+  <p><strong>13）跨边界 id 用 branded 类型。</strong><code>Branded&lt;B&gt;</code>（来自
+  <code>dsh-brand</code>），绝不裸 <code>string</code>。为什么：session id、turn id、goal id 在运行时
+  都是字符串，但把它们混着传是真实发生过的一类 bug；branded 类型把这类错误从运行时提前到编译时，
+  且零运行时开销。</p>
+
+  <p><strong>14）类型化同进程边界信任 TypeScript。</strong>静态接口已要求的值，不额外加运行时校验、
+  回退行为或敌意输入测试；校验只发生在 parser/config、排队、模型/工具 JSON、durable/文件、worker、
+  进程与 wire 边界。为什么：为类型已保证的东西写防御代码，等于宣称自己的类型系统不可信——这些代码
+  无法被测试有意义地触发，只会腐烂。边界清单就是「不信任恰好开始的地方」。</p>
+
+  <p><strong>17）空 <code>catch</code> 要点名吞了什么、为什么别的到不了；<code>try</code> 只包一条
+  语句。</strong>为什么：空 catch 是「这里出过错，然后有人把它按住了」的化石——不说清楚，下一个读者
+  无法判断吞掉的是预期分支还是新故障；<code>try</code> 缩小到一条语句让「吞了什么」在语法上无处
+  可藏。</p>
+
+  <p><strong>18）平行值保持对称。</strong>未解释的不对称通常是漏掉一次提取的信号。为什么：成对出现
+  的值（两个 provider、两个方向、请求与响应）一旦不对称，要么是 bug，要么是没写下来的设计决策；
+  约定逼你二选一：改对称，或把理由写出来。</p>
+
+  <p><strong>19）测试描述行为，不描述正确性。</strong>行为过时就连测试一起改，并在 PR 里说明为什么。
+  为什么：把测试当「正确性的碑文」会导致实现改进被旧断言锁死；测试的寿命应该等于它描述的行为的
+  寿命。</p>
+
+  <p><strong>20）TODO 标记按紧急度：<code>FIXME</code>（应阻塞新发布）&lt; <code>TODO</code>（尽快修）
+  &lt; <code>XXX</code>（也许哪天修）。文件以恰好一个尾随换行结束</strong>，<code>git diff --cached
+  --check</code> 在 pre-commit 把关。为什么：扫描代码的人要能一眼分出发布阻塞与 someday-maybe；
+  换行约定则是给 diff 与工具链一个确定的文件终界。</p>
+
+  <div class="box key">
+    <div class="box-title">把二十条读成一句话</div>
+    <p>
+      Cordis 层：注册可撤销、不变量断言关系、事件可合并、union 可穷尽、waterfall 必须委托。可见性层：
+      模型可见必被日志记录、行为上扩展点而不是 loop、seam 三角色齐全。边界层：依赖优先但看删除量、
+      默认值显式 resolve、tunables 进 Config、配置 fail loud、源码面与产物面不混、每包一个聚合 face。
+      纪律层：id 要 branded、同进程信任 TS、空 catch 要交代、平行值要对称、测试随行为改、TODO 分级、
+      文件一个尾随换行。
+    </p>
+  </div>
+
+  <h2 id="sec-recap">23.8 本章回顾</h2>
+  <ul>
+    <li>命令地图就位：clean / test / test:coverage / test:e2e / test:snapshot[:record] / typecheck / lint / duplication / build / hygiene / doc-sync / website:build / <code>dsh --profile headless</code>。</li>
+    <li>本地哲学：按证据面选最小检查集（行为→聚焦测试、模型/用户输出→快照、文档→doc-sync、发布路径→build+hygiene+smoke、provider→e2e）；CI 拥有穷尽覆盖与平台矩阵；覆盖率门禁是 test:coverage。</li>
+    <li>run-gates.ts 的 Mode 清单即 CI lane；doc-sync 把文档正确做成几十条可执行断言；lefthook 三钩子（pre-commit 空白/暂存 lint/vendor 守卫、pre-merge-commit 配对、pre-push typecheck）刻意不跑测试。</li>
+    <li>运行时契约：注册即效应、不变量断言拥有的关系、typed events 声明合并 + required-on-read + <code>ignorable: true</code> 例外、switch + assertNever、waterfall 必调 <code>next()</code>。</li>
+    <li>结构契约：model-visible ⟺ logged、插件不改 loop、seam 三角色齐全。</li>
+    <li>边界与纪律：显式 <code>resolve(request): Spec</code>、tunables 进 Config、fail loud、branded id、同进程信任 TS、source/artifact 面分离、一个聚合 face、空 catch 交代、对称性、测试随行为改、TODO 分级 + 一个尾随换行。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>提交前习惯性跑 <code>pnpm run test</code> 全量——按证据面选聚焦检查；重复跑绿检查是这个仓库明确反对的。</li>
+      <li>把 <code>pnpm run test</code> 当覆盖率门禁——门禁是 <code>test:coverage</code>（per-file 100%）。</li>
+      <li>在 <code>run()</code> 里用 <code>??</code> 给请求补默认值——默认值属于 owning 实现的显式 <code>resolve(request): Spec</code>。</li>
+      <li>给同进程函数参数加运行时校验——信任 TS；校验留给 parser/config、模型/工具 JSON、durable/文件、worker、进程、wire 边界。</li>
+      <li>waterfall 监听器判断完直接 return——必须调 <code>next()</code>，否则整条链被短路。</li>
+      <li>给封闭 union 的 switch 写 default 而不收 <code>assertNever</code>——编译器再也帮不了你。</li>
+      <li>新模型可见输入只改请求组装——没有对应会话事件就违反 model-visible ⟺ logged，快照与回放会漂移。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="23">
+    <h2>第 23 章测验</h2>
+
+    <div class="q" data-id="23-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— pnpm run doc-sync 聚合全部文档门禁（目录、预算、链接、翻译配对、Agent Note 校验等）。"
+         data-rationale="B 正确。A 是覆盖率门禁，与文档无关。C 是死链检查的子集（website:build 兼作），但不覆盖 markdown wrap、doc-refs、type-equiv 等。D 混淆了层级：doc-sync 的叶子清单在 scripts/run-gates.ts，由它聚合执行。"
+         data-review="sec-commands">
+      <div class="prompt"><span class="qnum">Q1.</span> 你只改了 docs/ 下两段文档，本地应该跑什么？</div>
+      <label class="opt"><input type="radio" name="q-23-1" value="a"> A. <code>pnpm run test:coverage</code></label>
+      <label class="opt"><input type="radio" name="q-23-1" value="b"> B. <code>pnpm run doc-sync</code></label>
+      <label class="opt"><input type="radio" name="q-23-1" value="c"> C. <code>pnpm run website:build</code> 就够了</label>
+      <label class="opt"><input type="radio" name="q-23-1" value="d"> D. 手动逐个跑 scripts/run-gates.ts 里的每个 verify-*</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 都是政策原文的对应关系：模型/用户输出→快照（同一 PR 内 keyless 场景），发布路径→build/hygiene 加构建产物 smoke，provider 行为→e2e。C 错：覆盖率门禁是 test:coverage，且穷尽覆盖归 CI，本地不默认全量。"
+         data-review="sec-evidence">
+      <div class="prompt"><span class="qnum">Q2.</span> 「按证据面选检查」的对应关系，下列正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="a"> A. 模型或用户可见输出 → 快照</label>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="b"> B. 发布路径（bin/lib/exports）→ build + hygiene + built smokes</label>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="c"> C. 文档改动 → pnpm run test 全量套件</label>
+      <label class="opt"><input type="checkbox" name="q-23-2" value="d"> D. provider 行为 → e2e（需密钥）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-3" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B、C、D。"
+         data-rationale="B/C/D 是 lefthook 三钩子的真实分工。A 错误最关键：钩子刻意不跑测试、快照、文档检查、构建或 hygiene——那些归贡献者按证据面选择，归 CI 穷尽。"
+         data-review="sec-gates">
+      <div class="prompt"><span class="qnum">Q3.</span> 关于 Git 钩子，下列说法正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="a"> A. pre-commit 会跑完整测试套件</label>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="b"> B. pre-commit 用 <code>git diff --cached --check</code> 把关空白与尾随换行</label>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="c"> C. pre-push 跑 <code>pnpm run typecheck</code></label>
+      <label class="opt"><input type="checkbox" name="q-23-3" value="d"> D. pre-merge-commit 做暂存配对记录检查</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 不调 next() 而直接 return 就是短路整条链，下游监听器全部不再被咨询。"
+         data-rationale="C 正确：waterfall 语义是层层委托。A 错（缺省不是自动委托）。B 错（这不是性能提示而是正确性契约）。D 描述的是普通 on 事件，不是 waterfall。"
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q4.</span> 一个 waterfall 监听器做完自己的判断后直接 return（没调 <code>next()</code>），后果是什么？</div>
+      <label class="opt"><input type="radio" name="q-23-4" value="a"> A. 链路自动继续，只是丢掉本层修改</label>
+      <label class="opt"><input type="radio" name="q-23-4" value="b"> B. 触发一个警告日志</label>
+      <label class="opt"><input type="radio" name="q-23-4" value="c"> C. 整条链被短路，下游所有监听器无声地不再执行</label>
+      <label class="opt"><input type="radio" name="q-23-4" value="d"> D. 等价于调用了 next(null)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 必须新增一个会话事件：凡到达模型请求的内容都要能从会话日志重建。"
+         data-rationale="B 正确，这是 model-visible ⟺ logged 等价关系。A 只改请求组装会让回放与快照漂移。C 把结构变化误当默认路径——只有结构性变化才 bump SESSION_FORMAT_VERSION，新事件类型在 required-on-read 下由 ignorable: true 决定旧读取器行为。D 与事件流向无关。"
+         data-review="sec-contracts-visible">
+      <div class="prompt"><span class="qnum">Q5.</span> 你要给模型请求加一种新的可见输入（比如一段新的上下文注入），按约定必须同时做什么？</div>
+      <label class="opt"><input type="radio" name="q-23-5" value="a"> A. 只改请求组装代码，日志保持不变</label>
+      <label class="opt"><input type="radio" name="q-23-5" value="b"> B. 新增一个会话事件记录它，保证可从日志重建请求</label>
+      <label class="opt"><input type="radio" name="q-23-5" value="c"> C. bump SESSION_FORMAT_VERSION</label>
+      <label class="opt"><input type="radio" name="q-23-5" value="d"> D. 在 cordis.yml 加一个开关</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 断言权威事件流或可变数据这类「拥有的关系」；没有合理关系时，解释过的空伴随是正确的。"
+         data-rationale="D 正确。A/B/C 查的都是存在性、元数据或固定例子——注册了却从不写日志的实现照样通过。运行时不变量要断言关系（如「事件之后日志里有对应记录」）。"
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q6.</span> 「运行时不变量断言拥有的关系」是什么意思？</div>
+      <label class="opt"><input type="radio" name="q-23-6" value="a"> A. 断言服务在 context 上存在</label>
+      <label class="opt"><input type="radio" name="q-23-6" value="b"> B. 断言插件元数据正确</label>
+      <label class="opt"><input type="radio" name="q-23-6" value="c"> C. 断言方法存在且可调用一次</label>
+      <label class="opt"><input type="radio" name="q-23-6" value="d"> D. 断言权威事件流或可变数据反映的关系；无可断言时，解释过的空伴随就是正确答案</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— required-on-read：不认识该事件类型的构建拒绝读日志，除非事件带 ignorable: true。"
+         data-rationale="A 正确。B 是静默丢弃，仓库明确拒绝。C 反了：只有结构性格式变化才 bump SESSION_FORMAT_VERSION，新增可忽略事件不需要。D 无此机制。"
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q7.</span> <code>SessionEventMap</code> 的 required-on-read 默认意味着什么？</div>
+      <label class="opt"><input type="radio" name="q-23-7" value="a"> A. 不认识该事件类型的构建拒绝读日志，除非事件带 <code>ignorable: true</code></label>
+      <label class="opt"><input type="radio" name="q-23-7" value="b"> B. 未知事件被静默丢弃并打警告</label>
+      <label class="opt"><input type="radio" name="q-23-7" value="c"> C. 每新增一种事件都要 bump <code>SESSION_FORMAT_VERSION</code></label>
+      <label class="opt"><input type="radio" name="q-23-7" value="d"> D. 事件必须实现 ignore() 方法</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 默认值是 owning 实现里显式的 resolve(request): Spec 步骤；dsh-shell 的 request/spec 拆分是模板。"
+         data-rationale="C 正确。A/B 把默认藏进执行路径，审查与配置面都看不见。D 与默认值属主无关。"
+         data-review="sec-contracts-boundary">
+      <div class="prompt"><span class="qnum">Q8.</span> 「包边界显式 &gt; 隐式」对默认值的要求是什么？</div>
+      <label class="opt"><input type="radio" name="q-23-8" value="a"> A. 在 run() 里用 <code>?? default</code> 就地兜底</label>
+      <label class="opt"><input type="radio" name="q-23-8" value="b"> B. 定义 DEFAULT_* 常量并在入口导出</label>
+      <label class="opt"><input type="radio" name="q-23-8" value="c"> C. 默认值是 owning 实现里显式的 <code>resolve(request): Spec</code> 步骤（dsh-shell 是模板）</label>
+      <label class="opt"><input type="radio" name="q-23-8" value="d"> D. 由调用方各自决定默认值</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— parser/config、排队、模型/工具 JSON、durable/文件、worker、进程、wire 边界。"
+         data-rationale="C 正确，这是「不信任恰好开始的地方」的完整清单。A/B/D 都是静态接口已要求的同进程值，加运行时校验等于宣称类型系统不可信。"
+         data-review="sec-constraints-discipline">
+      <div class="prompt"><span class="qnum">Q9.</span> 「类型化同进程边界信任 TypeScript」：运行时校验应该放在哪里？</div>
+      <label class="opt"><input type="radio" name="q-23-9" value="a"> A. 任何导出函数的入口都加一道</label>
+      <label class="opt"><input type="radio" name="q-23-9" value="b"> B. 同包内两个模块的调用处</label>
+      <label class="opt"><input type="radio" name="q-23-9" value="c"> C. parser/config、排队、模型/工具 JSON、durable/文件、worker、进程、wire 边界</label>
+      <label class="opt"><input type="radio" name="q-23-9" value="d"> D. 只在测试里加敌意输入用例</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-10" data-type="fill" data-accepted='["assertnever"]'
+         data-answer="assertNever。"
+         data-rationale="封闭 union 的 switch 以 assertNever 收尾，让编译器执行穷尽性检查；可扩展 union 则穿过一个写明注释的 default。"
+         data-review="sec-contracts-runtime">
+      <div class="prompt"><span class="qnum">Q10.</span> 填空：封闭 union 的 switch 必须以 <code>______</code> 收尾，把穷尽性交给编译器。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 空 catch 要点名吞了什么、为什么别的到不了，且 try 只包一条语句。"
+         data-rationale="B 正确：空 catch 是被按住的错误化石，不说清楚就没法判断吞的是预期分支还是新故障。A/C 都在扩大或维持含糊；D 无此规则。"
+         data-review="sec-constraints-discipline">
+      <div class="prompt"><span class="qnum">Q11.</span> 写一个吞掉异常的 <code>catch</code>，仓库约定要求什么？</div>
+      <label class="opt"><input type="radio" name="q-23-11" value="a"> A. 只要加一行 console.warn 即可</label>
+      <label class="opt"><input type="radio" name="q-23-11" value="b"> B. 点名吞了什么、为什么别的到不了；try 只包一条语句</label>
+      <label class="opt"><input type="radio" name="q-23-11" value="c"> C. 把 catch 改成重新 throw 就行</label>
+      <label class="opt"><input type="radio" name="q-23-11" value="d"> D. 在 catch 里补一个 TODO 就算合规</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-12" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 静态门禁与测试经 tsconfig paths 解析到 src；消费 lib/ 的门禁显式声明依赖。"
+         data-rationale="B 正确：混合会让陈旧产物装出第二份模块单例、混进源码验证。A 描述的恰是被禁止的混合。C 说反了，构建产物只在显式声明处被消费。D 是另一个约定（compiler face），别混。"
+         data-review="sec-contracts-boundary">
+      <div class="prompt"><span class="qnum">Q12.</span> source plane 与 artifact plane 不混合，具体指什么？</div>
+      <label class="opt"><input type="radio" name="q-23-12" value="a"> A. 测试可以随意在 src 与 lib 之间挑选解析目标</label>
+      <label class="opt"><input type="radio" name="q-23-12" value="b"> B. 静态门禁与测试经 tsconfig paths 解析到 src、在干净树上通过；消费构建 lib/ 的门禁显式声明该依赖</label>
+      <label class="opt"><input type="radio" name="q-23-12" value="c"> C. 一切检查都必须先 build</label>
+      <label class="opt"><input type="radio" name="q-23-12" value="d"> D. 每个包只能暴露一个 compiler face</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-13" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— FIXME 应阻塞新发布，TODO 尽快修，XXX 也许哪天修。"
+         data-rationale="D 正确。A/B/C 的排序与语义都不符合按紧急度分级的定义（FIXME 最高，XXX 最低无承诺）。"
+         data-review="sec-constraints-discipline">
+      <div class="prompt"><span class="qnum">Q13.</span> 三个 TODO 标记的紧急度排序与含义是？</div>
+      <label class="opt"><input type="radio" name="q-23-13" value="a"> A. XXX 最紧急，FIXME 最低</label>
+      <label class="opt"><input type="radio" name="q-23-13" value="b"> B. TODO 表示发布阻塞</label>
+      <label class="opt"><input type="radio" name="q-23-13" value="c"> C. 三者等价，只是风格差异</label>
+      <label class="opt"><input type="radio" name="q-23-13" value="d"> D. FIXME 应阻塞新发布，TODO 尽快修，XXX 也许哪天修、无承诺</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="23-14" data-type="short"
+         data-key-points='["loop 是所有插件共享的调度核，直接改会给所有人埋雷","新行为应落在文档化扩展点上","改 agent-loop 需要同步更新 docs/architecture.md","扩展点是插件互不踩踏的合同"]'
+         data-answer="因为 agent-loop 是所有插件共享的调度核心，任何私有改动都会影响全部插件；新行为应上文档化扩展点，若确实要改 loop 本体则必须同步更新 docs/architecture.md。"
+         data-rationale="抓住「共享核 + 扩展点合同 + 改 loop 必须更新架构文档」三点即达标。"
+         data-review="sec-contracts-visible">
+      <div class="prompt"><span class="qnum">Q14.</span> 用自己的话解释：为什么约定「插件不改 loop」，新行为应该放到哪里？</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="24-extension-practice.html"><strong>第 24 章 · 扩展实战：从 cookbook 写一个插件</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

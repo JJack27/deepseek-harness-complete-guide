@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 19 章 · Web UI 架构 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 19 章 · Web UI</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="19">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 19 章 · 第四部分 · 产品端与协议</div>
+    <h1>Web UI 架构：host、client modules、ui-slots</h1>
+    <p class="lede">
+      <code>dsh web</code> 背后不是一个「带界面的单体」，而是两个半区：Node 进程里的 host
+      和浏览器里的 SPA。本章要建立的关键直觉只有一个——<strong>浏览器这一半也是插件化的</strong>：
+      页面上的每个区域都是一个 ui-* 特性插件，通过 ui-slots 的扩展槽组合出来。RPC 与 WebSocket
+      的连接细节留给第 20 章，这里只画通道的位置。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出两半架构的边界：host 半区（webserver + frontend-static）与浏览器半区（Vite SPA）。</li>
+      <li>描述浏览器壳的两段式 boot：<code>window.__DSH_BOOT__</code> 模块图 → vendored Loader 插件面。</li>
+      <li>解释 ui-slots 的 register 模型与 chain slot 的自荐选举。</li>
+      <li>区分会话数据的两条来路：冷读的 projection cache 与实时流的 <code>session/projection</code> 帧。</li>
+      <li>说清 client 插件 HMR 的触发条件与粒度。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-two-halves">19.1 一个产品，两个半区</h2>
+
+  <p>
+    <code>dsh web</code> 启动的 Node 进程是 host 半区；浏览器加载的 Vite SPA
+    （<code>apps/web</code>，包名 <code>@deepseek-ai/dsh-web-frontend</code>）是浏览器半区。
+    两者在 <code>packages/client/</code> 与 <code>packages/host/</code> 两组包里各有一套角色：
+  </p>
+
+  <ul>
+    <li><strong>host 半区</strong>：<code>dsh-host-webserver</code> 提供一个纯
+        <code>node:http</code> 服务器（<code>ctx.webServer</code>），只管具名路由、升级路由和唯一
+        的 fallback 座位；<code>dsh-host-frontend-static</code> 占据 fallback 座位，把构建好的
+        <code>apps/web</code> 的 <code>dist/</code> 按 SPA 语义服务出去。host 半区还承载全部
+        <code>ctx.*</code> 业务服务——agents、sessions、settings、commands、skills……第 3 到
+        17 章讲的一切都在这里跑。</li>
+    <li><strong>浏览器半区</strong>：<code>dsh-client-web</code> 是启动壳，
+        <code>dsh-client-modules</code> 是模块系统，<code>dsh-client-web-react</code> 把壳运行时
+        接到 React，<code>dsh-client-runtime</code> 提供 Session/Workspace 对象层，三十余个
+        <code>ui-*</code> 包是特性插件。</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="浏览器与 host 两半架构图">
+      <rect x="10" y="16" width="400" height="360" rx="12" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="210" y="42" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">浏览器半区（Vite SPA）</text>
+      <text x="210" y="60" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">@deepseek-ai/dsh-web-frontend</text>
+
+      <rect x="30" y="74" width="170" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="115" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">client-web 启动壳</text>
+      <text x="115" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">AppWebEntry().run()</text>
+
+      <rect x="215" y="74" width="180" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="305" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">client-modules</text>
+      <text x="305" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">window.__DSH_BOOT__ 图 → 懒 CJS 表</text>
+
+      <rect x="30" y="132" width="170" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="115" y="151" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">client-runtime</text>
+      <text x="115" y="167" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Session / Workspace 对象层</text>
+
+      <rect x="215" y="132" width="180" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="305" y="151" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">web-react</text>
+      <text x="305" y="167" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">createSlotRenderer / hooks 绑定</text>
+
+      <rect x="30" y="196" width="365" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="212" y="218" text-anchor="middle" style="fill:var(--accent-2)" font-size="11" font-weight="700">三十余个 ui-* 特性插件（也是插件树上的行）</text>
+      <text x="212" y="236" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ui-slots · ui-theme · ui-layout · ui-conversation · ui-tool · ui-settings* ·</text>
+      <text x="212" y="249" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ui-subagent · ui-workflow-run · ui-commands · ui-skill …</text>
+
+      <rect x="30" y="270" width="365" height="42" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="212" y="288" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">client-connection（wire 消费层）</text>
+      <text x="212" y="303" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ctx.connection · readiness host.describe（细节第 20 章）</text>
+
+      <text x="212" y="340" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9" font-style="italic">数据：冷读 projection cache + 实时 session/projection 帧</text>
+
+      <rect x="490" y="16" width="400" height="360" rx="12" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="690" y="42" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">host 半区（Node 进程）</text>
+
+      <rect x="510" y="74" width="170" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="595" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">host-webserver</text>
+      <text x="595" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">plain node:http · ctx.webServer</text>
+
+      <rect x="695" y="74" width="175" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="782" y="93" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">host-frontend-static</text>
+      <text x="782" y="109" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">fallback 座位 → apps/web dist/</text>
+
+      <rect x="510" y="196" width="360" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="690" y="218" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">ctx 服务：agents / sessions / settings / commands / skills …</text>
+      <text x="690" y="236" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">第 3–17 章的全部能力面都在这半区跑</text>
+
+      <rect x="510" y="270" width="360" height="42" rx="6" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="690" y="288" text-anchor="middle" style="fill:var(--warn)" font-size="11" font-weight="700">/api FetchHandler：Typert interceptor 认领 → apiproxy 回退</text>
+      <text x="690" y="303" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">第 20 章展开</text>
+
+      <line x1="410" y1="290" x2="490" y2="290" style="stroke:var(--muted)" stroke-width="2.5"/>
+      <polygon points="490,290 482,286 482,294" style="fill:var(--muted)"/>
+      <text x="450" y="278" text-anchor="middle" style="fill:var(--fg)" font-size="9">HTTP POST</text>
+
+      <line x1="490" y1="316" x2="410" y2="316" style="stroke:var(--accent-2)" stroke-width="2.5"/>
+      <polygon points="410,316 418,312 418,320" style="fill:var(--accent-2)"/>
+      <text x="450" y="334" text-anchor="middle" style="fill:var(--accent-2)" font-size="9">WebSocket 下行 ×2</text>
+
+      <line x1="245" y1="66" x2="770" y2="66" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <polygon points="770,66 762,62 762,70" style="fill:var(--muted)"/>
+      <text x="507" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">GET 静态资源：index.html miss 回落（SPA 路由）+ index taps 注入 boot 清单</text>
+    </svg>
+    <figcaption>两半架构：host 是 plain node:http + 静态 dist + 全部 ctx 服务；浏览器是自带插件树的 SPA。箭头只标通道位置，协议细节在第 20 章。</figcaption>
+  </figure>
+
+  <p>
+    这张图里最容易被忽略的一条线是「GET 静态资源」上的小注释：frontend-static 服务 index.html
+    时会先过 webserver 的 <code>applyIndexTaps</code>——启动清单（boot manifest）就是这样进入
+    页面的。浏览器拿到 index 后要做的事，下一节展开。
+  </p>
+
+  <h2 id="sec-host-half">19.2 host 半区：webserver 与 frontend-static</h2>
+
+  <p>
+    <code>dsh-host-webserver</code> 刻意「不认识任何 harness 概念」：它是一个默认导出的
+    <code>WebServer</code> 插件（config 只有 <code>host</code> 与 <code>port</code>），提供
+    <code>ctx.webServer</code>。别的插件向它注册具名 HTTP 路由（<code>register</code>，exact 或
+    prefix）、升级路由（<code>registerUpgrade</code>，按精确路径匹配 WebSocket）和唯一的 fallback
+    处理器（<code>registerFallback</code>，第二个注册者抛错）。匹配顺序固定：全表 exact →
+    最长 prefix → fallback。<code>/api</code> 桥、下行 WebSocket、插件 bundle 路由、HMR 事件流
+    全是<strong>别的插件注册进来的路由</strong>——webserver 自己一个文件都不服务。
+    <code>host</code> 只接受 <code>127.0.0.1</code>（默认姿态）和 <code>0.0.0.0</code>
+    （刻意的网络暴露）；绑定失败（如 EADDRINUSE）在激活时抛出，让 Loader 组合带着绑定诊断一起失败。
+  </p>
+
+  <p>
+    <code>dsh-host-frontend-static</code> 是 fallback 座位的出厂占用者：遍历出界 403、任意
+    miss 以 HTTP 200 回落 <code>index.html</code>（SPA 路由）、未知扩展名按
+    <code>application/octet-stream</code> 发出、无匹配路由的非 GET/HEAD 答 405。
+    <code>distIndex</code> 由组装应用（<code>dsh-web-app</code> bundle）从前端包的 exports
+    解析，部署永远不硬编码。座位是单主人且 effect 作用域的：这个插件 dispose，座位释放，
+    webserver 回到 404。
+  </p>
+
+  <h2 id="sec-browser-half">19.3 浏览器半区也是插件：从 __DSH_BOOT__ 到 app-shell</h2>
+
+  <p>
+    浏览器壳的入口是 <code>packages/client/web</code>（<code>@deepseek-ai/dsh-client-web</code>）
+    的 <code>AppWebEntry(el).run()</code>。它分两段 boot，也就是仓库文档说的 web2：
+  </p>
+
+  <ol>
+    <li><strong>模块面</strong>：基于 host 推进页面的入口图
+        <code>window.__DSH_BOOT__</code> 搭起 <code>dsh-client-modules</code> 的
+        <code>ClientModuleLoader</code>，并行预取 <code>immediately</code> 层。此时 bundle
+        的执行<strong>只是注册工厂</strong>，不产生副作用。</li>
+    <li><strong>插件面</strong>：挂载 vendored Cordis Loader，把模块系统从它的
+        <code>internal</code> 契约注入——vendored 侧唯一的消费点是 <code>EntryTree.import</code>，
+        换掉 internal 就等于换掉「插件代码怎么到达」。图上每行一个 loader entry，外加壳自有的
+        app-shell 装配 entry；AppRoot 等到 settle（Loader 静默 + 每个 entry fiber ACTIVE）一次性
+        渲染完整 UI。</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 880 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="浏览器壳两段式 boot 时序">
+      <rect x="10" y="20" width="130" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="75" y="42" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">index.html</text>
+      <text x="75" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">含 index taps 注入</text>
+
+      <line x1="140" y1="46" x2="175" y2="46" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="175,46 167,42 167,50" style="fill:var(--muted)"/>
+
+      <rect x="175" y="20" width="180" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="265" y="42" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">阶段一：模块面</text>
+      <text x="265" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">__DSH_BOOT__ → ClientModuleLoader</text>
+
+      <rect x="375" y="20" width="200" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="475" y="42" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">执行 bundle = 只注册工厂</text>
+      <text x="475" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">副作用住在工厂闭包里，物化时才跑</text>
+
+      <line x1="355" y1="46" x2="375" y2="46" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="375,46 367,42 367,50" style="fill:var(--muted)"/>
+
+      <line x1="475" y1="72" x2="475" y2="105" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="475,105 471,97 479,97" style="fill:var(--muted)"/>
+
+      <rect x="330" y="105" width="290" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="475" y="127" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">阶段二：插件面</text>
+      <text x="475" y="143" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">vendored Loader + internal 注入 · 每图行一个 entry</text>
+
+      <line x1="620" y1="131" x2="655" y2="131" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="655,131 647,127 647,135" style="fill:var(--muted)"/>
+
+      <rect x="655" y="105" width="215" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="762" y="127" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">settle → AppRoot 一次点亮</text>
+      <text x="762" y="143" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">单 entry 失败 = 留在加载页 + 逐条报告</text>
+
+      <rect x="175" y="180" width="500" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="425" y="200" text-anchor="middle" style="fill:var(--warn)" font-size="10" font-weight="700">壳的自足硬规则</text>
+      <text x="425" y="216" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">启动状态与信号在本包手写（loader-status.ts），kernel 零值 import 任何插件包——加载页在插件挂掉时也得能用</text>
+    </svg>
+    <figcaption>两段式 boot：模块面把 bundle 变成已注册的工厂表，插件面让 vendored Loader 治理 fiber 生命周期；app-shell 是壳自有的伪 entry，像普通插件一样注入等待 slots/sessions/layout。</figcaption>
+  </figure>
+
+  <p>
+    <code>dsh-client-modules</code> 本身值得一句：它是「Node 内部 ESM loader 的浏览器对等物」，
+    实现为懒 CJS 表。执行一个插件 bundle 只是 <code>window.__ModuleLoader__.load({id, factory})</code>
+    注册工厂；模块体的全部副作用（包括 CSS 注入）住在工厂闭包里，物化
+    （<code>factory(require)</code>）时才执行并记入 <code>loadCache</code>。工厂 require 另一个
+    已注册未物化的模块会递归物化它，所以加载顺序不需要外部排序；require 环抛错。Node 那一半扫
+    启用的 Loader entry 里带 web <code>dsh.client</code> 的包，解析各自的
+    <code>exports["./client"]</code>，把构建出的 bundle 连 source map 打进 boot 图、经
+    <code>/plugins</code> 服务——<strong>host 图决定组合，壳一个组合决策都不做</strong>。
+  </p>
+
+  <h2 id="sec-ui-slots">19.4 ui-slots：浏览器 UI 的组合律</h2>
+
+  <p>
+    三十余个 <code>ui-*</code> 包怎么拼成一个界面？答案是 ui-slots 的<strong>槽终端设计</strong>
+    （slot terminal design）。一次 <code>register</code> 同时做四件事：向某个已声明的槽贡献一个
+    组件、声明子槽（声明 = 渲染授权 = 运行时规格，一张表）、可选地挂一个 store 座位、给出注册者
+    的业务面。组件的 props 是四份共享的交集：runtime props（父的 renderSlot 调用点 + 会话标准件
+    + 全局座位）、子渲染 props、store props、业务 props——每份都从单一事实推导，不需要二次同步。
+  </p>
+
+  <p>
+    两种槽值得分清。<strong>keyed 槽</strong>由派发点选 <code>entryKey</code> 路由；
+    <strong>chain 槽</strong>反过来——每个注册自带一个纯 <code>ChainSelect</code> 选择器
+    （可带升序 priority，平局按注册序），第一个返回非 null 的注册当选，其返回值作为
+    <code>matched</code> prop 传给组件；全落空则回到持有者的 <code>renderSlotChain</code> 兜底。
+    侧栏、会话视图、设置页的扩展区都靠这套机制长大。
+  </p>
+
+  <p>
+    分层也干净：<code>dsh-client-web-react</code> 提供 <code>createSlotRenderer</code>（壳装进
+    runtime 的 SlotRenderer 实现）、<code>SessionProvider</code>、唯一的 hook 构造器
+    <code>bindSnapshotSelector</code> 和 <code>useInvoke</code>；<strong>业务插件只依赖
+    ui-slots 的类型，从不依赖 web-react</strong>。快照存储引擎（<code>defineStore</code>）在
+    runtime 包里，宿主与引擎只传递裸 observable 源，hook 绑定全部归渲染机器。
+  </p>
+
+  <h2 id="sec-data-flow">19.5 会话列表与实时流：投影的两张面孔</h2>
+
+  <p>
+    呼应第 5 章：host 侧有一个 <code>ctx.sessionProjections</code> 投影注册表，冷热数据走两条路。
+  </p>
+
+  <ul>
+    <li><strong>冷读</strong>：打开页面时 <code>session.list</code> 之类的列表不必唤醒任何
+        Agent。网关自持两个投影单元（如 <code>sessionListMetadata</code> 缓存「空白→非空白」的
+        单调翻转和最近人类提问时间）；对很小的会话工件（默认 1 KiB 阈值内）还能做一次精确折叠
+        得出 blank 与最近提示。冷会话在列表里保持「只有元数据」，直到你打开或恢复它，host 才
+        附着日志、折叠出日志支持的标题。</li>
+    <li><strong>实时</strong>：附着会话后，客户端从历史尾页的 <code>projections</code> 块种下
+        一份 <code>ProjectionValueStore</code>（带 <code>asOfSeq</code> 水位），此后靠
+        <code>session/projection</code> mux 帧按 <strong>higher-seq-wins</strong> 更新各单元
+        （标题、todos、队列、jobs……）。这些帧是<strong>活推送状态，永不入日志</strong>——第 4 章
+        的「model-visible ⟺ logged」不变量不受影响。</li>
+  </ul>
+
+  <p>
+    runtime 把共享的 host 流扇出到 Session 与 Workspace 拥有者，把每条通用
+    <code>host/remote-event</code> 帧交给 <code>ctx.remote.$dispatch</code>（第 20 章）。会话
+    内容本身由 <code>ConversationNodeAssembler</code> 组装：插件注册业务 Definition，把一个
+    事件映射成稳定的 <code>{kind, id}</code>，在唯一起始事件处建 Context，折叠相关更新，为
+    注册的视图目标产出最终节点——追加只评估一次 Definition、只更新匹配的 Context；翻旧页保留
+    既有 Context 与节点身份。ui-conversation 注册内置 Chat Definition，ui-trajectory 在同一
+    事件窗口上注册独立的 Definition 与目标构建器，两套视图互不消费对方的折叠。
+  </p>
+
+  <h2 id="sec-hmr">19.6 开发态：client 插件热更</h2>
+
+  <p>
+    <code>dsh-client-hmr</code> 让脚本加载的 client 插件可以热替换，但有个前提常被误解：
+    web bundle <strong>无条件挂载</strong> HMR 行，可它自己不重建任何东西。真正触发重建的是单独
+    跑的 <code>pnpm run dev:web</code> watcher 重写 client bundle；没有 watcher，节点侧的
+    stat-poll 观察不到变化，整条链保持空闲。
+  </p>
+
+  <p>
+    有重建时，浏览器半区订阅系统 SSE 通道（<code>GET /plugins/events</code>），每个
+    <code>rebuilt</code> 帧经串行队列重载一个插件：invalidate 旧工厂 → prefetch 新 bundle
+    （旧 fiber 还在服务时注册）→ 删注册表 → 排干旧 fiber → 删自有 style 标签 →
+    <code>entry.refresh()</code> 重导入重挂载。依赖方的重载靠 Cordis 本身：fiber 的激活纪元一变，
+    其服务提供者的 uid 全部串味，替换一个 provider 会级联所有依赖方，客户端零图分析。粒度是
+    粗的<strong>整插件重载</strong>——React 内部状态丢失，数据层（connection/runtime 的
+    fiber、Session 对象）不动；失败的Reload不回滚，entry 停在 FAILED 并在 loader 状态投影里可见。
+  </p>
+
+  <h2 id="sec-recap">19.7 本章回顾</h2>
+  <ul>
+    <li>两半架构：host 半区是 <code>dsh-host-webserver</code>（纯 <code>node:http</code>，路由全靠别的插件注册）+ <code>dsh-host-frontend-static</code>（唯一 fallback 座位，服务 <code>apps/web</code> 的 dist/）；浏览器半区是 Vite SPA。</li>
+    <li>浏览器壳两段式 boot：模块面用 <code>window.__DSH_BOOT__</code> 建 ClientModuleLoader（执行 bundle 只注册工厂），插件面挂 vendored Loader（每图行一个 entry），AppRoot 等 settle 一次点亮。</li>
+    <li>浏览器 UI 一样「everything is a plugin」：三十余个 ui-* 特性插件经 ui-slots 的 register 组合；chain 槽由注册者自带的 ChainSelect 选举；业务插件只依赖 ui-slots 类型。</li>
+    <li>会话列表冷读走 projection cache 与小工件精确折叠（不唤醒 Agent）；实时流走 <code>session/projection</code> 帧 + higher-seq-wins，永不入日志。</li>
+    <li>client HMR 需要单独的 <code>pnpm run dev:web</code> watcher 触发；重载按整插件粒度，依赖方级联靠 fiber 激活纪元。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>以为 webserver 会服务文件——它一个文件都不服务；dist 是 frontend-static 占 fallback 座位服务的，第二个 fallback 注册直接抛错。</li>
+      <li>把 <code>window.__DSH_BOOT__</code> 当成浏览器自己算出来的东西——它是 host 推送的入口图，壳对组合零决策。</li>
+      <li>以为 bundle 一执行副作用就跑了——执行只注册工厂，副作用在物化（factory(require)）时才发生。</li>
+      <li>给业务 UI 插件加 web-react 依赖——类型依赖只该指向 ui-slots；hook 绑定是渲染机器的事。</li>
+      <li>期望 <code>session/projection</code> 帧出现在会话日志里——它们是活推送状态，永不落盘。</li>
+      <li>抱怨 HMR 不生效——先确认有没有单独跑 <code>pnpm run dev:web</code>；HMR 行挂载着但不会自己重建 bundle。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="19">
+    <h2>第 19 章 测验</h2>
+
+    <div class="q" data-id="19-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— dsh-host-webserver 是一个 plain node:http 服务器，提供 ctx.webServer，路由全部由其他插件注册。"
+         data-rationale="B 正确。A 错，webserver 不含任何 harness 概念也不服务文件。C 错，frontend-static 只是占用 fallback 座位的另一个插件。D 错，/api 路由属于 connection 插件。"
+         data-review="sec-host-half">
+      <div class="prompt"><span class="qnum">Q1.</span> host 半区的 HTTP 服务器由谁提供、是什么实现？</div>
+      <label class="opt"><input type="radio" name="q-19-1" value="a"> A. dsh-host-frontend-static 内置的 Express 应用</label>
+      <label class="opt"><input type="radio" name="q-19-1" value="b"> B. dsh-host-webserver：plain node:http，提供 ctx.webServer</label>
+      <label class="opt"><input type="radio" name="q-19-1" value="c"> C. dsh-host-webserver 与 frontend-static 共同实现的服务器</label>
+      <label class="opt"><input type="radio" name="q-19-1" value="d"> D. apps/web 的 Vite dev server 直接当作生产服务器</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— frontend-static 占用 webserver 唯一的 fallback 座位，miss 以 200 回落 index.html（SPA 路由），index 响应过 index taps。"
+         data-rationale="C 正确：这就是 boot 清单进入页面的通道。A 错，座位单主人，第二个注册抛错。B 错，出界遍历是 403。D 错，未知扩展名按 application/octet-stream。"
+         data-review="sec-host-half">
+      <div class="prompt"><span class="qnum">Q2.</span> SPA 的 dist 由谁、按什么语义服务？</div>
+      <label class="opt"><input type="radio" name="q-19-2" value="a"> A. webserver 自己服务，fallback 可多人共享</label>
+      <label class="opt"><input type="radio" name="q-19-2" value="b"> B. frontend-static 服务，出界遍历返回 200</label>
+      <label class="opt"><input type="radio" name="q-19-2" value="c"> C. frontend-static 占唯一 fallback 座位；miss 回落 index.html，index 响应跑 index taps</label>
+      <label class="opt"><input type="radio" name="q-19-2" value="d"> D. frontend-static 服务，未知扩展名一律按 text/html 发出</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-3" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 它是 host 推送给页面的 client 模块入口图；壳零组合决策，名册和 immediately 层都在组装应用里。"
+         data-rationale="A 正确。B 错，模块系统是运行时构建的。C 错，它是图（哪些模块、什么层级），不是 WebSocket。D 错，Vite 构建产物经 /plugins 服务，与该变量无关。"
+         data-review="sec-browser-half">
+      <div class="prompt"><span class="qnum">Q3.</span> <code>window.__DSH_BOOT__</code> 是什么？</div>
+      <label class="opt"><input type="radio" name="q-19-3" value="a"> A. host 推送的浏览器模块入口图（boot graph）</label>
+      <label class="opt"><input type="radio" name="q-19-3" value="b"> B. 浏览器自己扫描出的已加载脚本表</label>
+      <label class="opt"><input type="radio" name="q-19-3" value="c"> C. 下行事件流的 WebSocket 句柄</label>
+      <label class="opt"><input type="radio" name="q-19-3" value="d"> D. Vite 注入的构建产物清单</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-4" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A/B/C 正确。D 错：设计是一次性渲染，单 entry 失败保持在加载页并逐条大声报告，没有渐进可用。"
+         data-review="sec-browser-half">
+      <div class="prompt"><span class="qnum">Q4.</span> 关于两段式 boot，下列说法正确的是？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="a"> A. 阶段一基于 <code>__DSH_BOOT__</code> 构建 ClientModuleLoader 并并行预取 immediately 层</label>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="b"> B. 阶段二挂载 vendored Cordis Loader，模块系统经 internal 契约注入</label>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="c"> C. AppRoot 等 settle 后一次性渲染完整 UI</label>
+      <label class="opt"><input type="checkbox" name="q-19-4" value="d"> D. 单个 entry 失败时先渲染其余插件，保证渐进可用</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-5" data-type="fill" data-accepted='["物化","materialize","materialization","factory(require)"]'
+         data-answer="物化（materialize：factory(require) 执行并记入 loadCache）。"
+         data-rationale="懒 CJS 模型里执行 bundle 只注册工厂；模块体副作用（含 CSS 注入）住在工厂闭包里，物化时才跑。工厂 require 另一个已注册未物化的模块会递归物化它。"
+         data-review="sec-browser-half">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：在懒 CJS 模型里，执行插件 bundle 只是注册工厂；副作用发生在模块被 ______ 的时候。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 业务插件只依赖 ui-slots 的类型；hook 绑定与渲染机器在 web-react，由壳安装。"
+         data-rationale="D 正确：web-react 是壳侧胶水，业务包不依赖它。A/C 把渲染机器当业务依赖，方向反了。B 错，runtime 提供对象服务，不含类型契约槽系统。"
+         data-review="sec-ui-slots">
+      <div class="prompt"><span class="qnum">Q6.</span> 一个普通 ui-* 特性插件的类型依赖应该指向谁？</div>
+      <label class="opt"><input type="radio" name="q-19-6" value="a"> A. web-react</label>
+      <label class="opt"><input type="radio" name="q-19-6" value="b"> B. client-runtime</label>
+      <label class="opt"><input type="radio" name="q-19-6" value="c"> C. web-react 与 ui-slots 二选一即可</label>
+      <label class="opt"><input type="radio" name="q-19-6" value="d"> D. ui-slots</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— chain 槽由注册自带的 ChainSelect 选择器自荐：第一个返回非 null 的注册当选，返回值成为组件的 matched prop。"
+         data-rationale="B 正确。A 描述的是 keyed 槽的路由方式，恰好是反的。C 错，priority 只影响选举顺序，不决定子槽。D 错，全落空回到持有者的 renderSlotChain 兜底，不是崩溃。"
+         data-review="sec-ui-slots">
+      <div class="prompt"><span class="qnum">Q7.</span> chain 槽与 keyed 槽的核心区别是什么？</div>
+      <label class="opt"><input type="radio" name="q-19-7" value="a"> A. chain 槽由派发点选 entryKey，keyed 槽靠选择器</label>
+      <label class="opt"><input type="radio" name="q-19-7" value="b"> B. chain 槽里注册者用 ChainSelect 自荐，第一个非 null 当选；keyed 槽由派发点选 entryKey</label>
+      <label class="opt"><input type="radio" name="q-19-7" value="c"> C. chain 槽只能注册一个组件，keyed 槽可以多个</label>
+      <label class="opt"><input type="radio" name="q-19-7" value="d"> D. chain 槽全落空时整个应用崩溃</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 靠投影缓存（如 sessionListMetadata 单元）加小工件的精确折叠，不恢复、不发布任何 Agent。"
+         data-rationale="C 正确：这是冷读路径的设计。A/B 错，冷列表刻意不附着 Agent——那会带来首次打开的延迟。D 错，SQLite 内容索引服务的是搜索，不是列表排序的投影缓存。"
+         data-review="sec-data-flow">
+      <div class="prompt"><span class="qnum">Q8.</span> 冷会话在列表里的 blank 标记与最近提示时间靠什么得到？</div>
+      <label class="opt"><input type="radio" name="q-19-8" value="a"> A. 恢复该会话的 Agent 后现场询问</label>
+      <label class="opt"><input type="radio" name="q-19-8" value="b"> B. 每次列表请求都重放完整日志</label>
+      <label class="opt"><input type="radio" name="q-19-8" value="c"> C. 投影缓存单元 + 阈值内小工件的精确折叠，不唤醒任何 Agent</label>
+      <label class="opt"><input type="radio" name="q-19-8" value="d"> D. 浏览器端的 localStorage 缓存</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— higher-seq-wins：每会话一个通用值存储，新的更高 seq 覆盖旧的；这是活推送状态，永不写入日志。"
+         data-rationale="A 正确。B 错，seq 旧的新值不会覆盖。C 错，会话内容事件本身在日志里，但 projection 帧不在。D 错，last-wins 是 jobs 镜像一类的策略，投影单元统一 higher-seq-wins。"
+         data-review="sec-data-flow">
+      <div class="prompt"><span class="qnum">Q9.</span> <code>session/projection</code> 帧在客户端按什么规则生效？</div>
+      <label class="opt"><input type="radio" name="q-19-9" value="a"> A. higher-seq-wins，且永不写入会话日志</label>
+      <label class="opt"><input type="radio" name="q-19-9" value="b"> B. last-wins，并作为 SessionEvent 写入日志</label>
+      <label class="opt"><input type="radio" name="q-19-9" value="c"> C. lower-seq-wins，只在冷读时使用</label>
+      <label class="opt"><input type="radio" name="q-19-9" value="d"> D. first-wins，首帧永远优先</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 节点侧 stat-poll 只对真实重建起反应：需要单独跑 pnpm run dev:web watcher 重写 client bundle，否则整条链保持空闲。"
+         data-rationale="B 正确：HMR 行无条件挂载但不自建。A 错，普通 vite dev 不是这个通道。C 错，SSE 只是浏览器半区的接收通道，不触发重建。D 错，刷新页面当然重载一切，但那不是 HMR。"
+         data-review="sec-hmr">
+      <div class="prompt"><span class="qnum">Q10.</span> client 插件的 HMR 什么时候才会真的发生？</div>
+      <label class="opt"><input type="radio" name="q-19-10" value="a"> A. 任何时候编辑源码都会，Vite dev server 自动通知</label>
+      <label class="opt"><input type="radio" name="q-19-10" value="b"> B. 单独的 pnpm run dev:web watcher 重写了 client bundle，节点侧 poll 到真实 rev 变化</label>
+      <label class="opt"><input type="radio" name="q-19-10" value="c"> C. 浏览器订阅 /plugins/events 后每秒自动检查</label>
+      <label class="opt"><input type="radio" name="q-19-10" value="d"> D. 手动刷新页面即可，别无他法</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-11" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 正确：这三条正是「浏览器 UI 也是插件」的证据。C 错——壳的自足是硬规则，kernel 零值 import 插件包，加载状态是手写的；app-shell 是壳自有的伪 entry，但它 inject 等待 slots/sessions/layout，恰是插件姿态。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> 下列哪些说法支持「浏览器 UI 一样 everything is a plugin」？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="a"> A. 浏览器半区挂载 vendored Cordis Loader，boot 图每行一个 loader entry</label>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="b"> B. ui-* 特性插件通过 ui-slots 的 register 组合进扩展槽</label>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="c"> C. 启动壳值 import 了全部 ui-* 插件包</label>
+      <label class="opt"><input type="checkbox" name="q-19-11" value="d"> D. host 图决定组合（名册与 immediately 层在组装应用里），壳零组合决策</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="19-12" data-type="short"
+         data-key-points='["两半边界：host 是 Node 进程（webserver node:http + frontend-static 服务 dist + 全部 ctx 服务），浏览器是 Vite SPA","浏览器壳两段式 boot：__DSH_BOOT__ → ClientModuleLoader（注册工厂），再挂 vendored Loader（每图行一个 entry）","ui-* 特性插件经 ui-slots register 组合；chain 槽靠 ChainSelect 自荐；业务插件只依赖 ui-slots 类型","冷读走 projection cache/小工件折叠不唤醒 Agent；实时走 session/projection 帧 higher-seq-wins 且不入日志","连接通道（POST /api 与两条下行 WebSocket）只点位置，协议细节归第 20 章"]'
+         data-answer="host 半区是 Node 进程：dsh-host-webserver 提供纯 node:http 服务器、路由由各插件注册，dsh-host-frontend-static 占唯一 fallback 座位服务 apps/web 的 dist/，全部 ctx 服务在这半区跑。浏览器半区是 Vite SPA：壳 AppWebEntry 两段式 boot——先用 host 推送的 __DSH_BOOT__ 图建 ClientModuleLoader（执行 bundle 只注册工厂），再挂 vendored Loader 让每图行成为一个 entry；界面由三十余个 ui-* 特性插件经 ui-slots 组合。数据上冷读走 projection cache，实时走 session/projection 帧；与 host 的连接通道（POST /api、两条下行 WebSocket）留待第 20 章。"
+         data-rationale="两半边界 + 两段式 boot + ui-slots 组合 + 两条数据来路，四点齐了这章就立住了。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> 用自己的话把两半架构讲一遍：各自住着什么、浏览器怎么把 UI 长出来、数据从哪来。</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="20-typert-rpc.html"><strong>第 20 章 · Typert 与 RPC 网关</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

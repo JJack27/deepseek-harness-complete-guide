@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 14 章 · 委派与子代理 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 14 章 · 委派与子代理</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="14">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 14 章 · 第三部分 · Capability Seams 专题</div>
+    <h1>委派与子代理</h1>
+    <p class="lede">
+      一个 agent 忙不过来时，dsh 的答案是<strong>委派</strong>：把任务交给子代理（subagent），
+      各自拥有独立会话与上下文。<code>ctx.subagents</code> 是全仓最热闹的一条 seam——
+      与 bash 只许一个 executor 不同，它是一个<strong>多 provider 注册表</strong>：
+      进程内分叉、全新进程内子代理、进程外 ACP、真正的 Codex 与 Claude Code、进程外完整 dsh，
+      七种后端并存于同一个契约之下。本章讲清 provider 谱系、三个模型面工具族、
+      记在 <code>SessionHeader</code> 里的血统（lineage）与深度上限，以及「每轮换新代理」的 Ralph 循环。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能解释 ctx.subagents 为什么是命名注册表（多 provider 共存）而非单服务 seam，并列出七种 provider 的差异</li>
+      <li>能区分 fork 与 spawn 的 seed 边界，说出 in-process-driver 承担了哪些共享机制</li>
+      <li>能按职责拆分 tool-subagent / tool-subagent-control / tool-subagent-report 三个工具族</li>
+      <li>能说明 parentSession + delegationDepth 如何构成血统，以及「血统是数据不是可见性」的含义</li>
+      <li>能描述 Ralph 循环的策略：全新子代理 + 有界结构化 handoff + 共享工作区当长期记忆</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-subagent-seam">14.1 ctx.subagents：一个接口，多种后端</h2>
+
+  <p>
+    <code>docs/subsystems/subagent.md</code> 开篇就点出这条 seam 的特殊性：它<strong>允许多个 provider
+    实现在同一上下文里按名共存</strong>（<code>ctx.subagents</code> 注册表），而 bash 只允许一个 executor。
+    注册表的形态学的是 LLM 适配器注册表（第 10 章 <code>ctx.llm</code>），不是单服务的 bash executor。
+    Service Definition 是 <code>dsh-subagent</code>：它拥有 provider 注册、共享的请求/结果契约、
+    持久 descriptor，以及（可选启用的）continuable 子代理编排。
+  </p>
+
+  <p>
+    provider 侧的核心契约是 <code>start(request): Promise&lt;SubagentRun&gt;</code>——
+    <strong>所有权转移的边界</strong>。fulfill 之前 provider 拥有启动过程，任何失败都必须取消、回滚、
+    静默掉未发布的资源；fulfill 之后调用方拥有 run，必须在所有路径上 <code>dispose()</code>。
+    <code>SubagentRun.result</code> resolve 成 <code>{ output, structured?, stopReason }</code>：
+    子代理层面的失败以非 <code>completed</code> 的 reason resolve，只有 seam 表达不了的基础设施故障才 reject。
+  </p>
+
+  <p>
+    provider 用静态 <code>capabilities</code> 广告四个启动期能力——<code>outputSchema</code>（强制结构化最终结果）、
+    <code>depthLimit</code>（强制 <code>maxDepth</code>）、<code>toolFilter</code>（子代理工具限制）、
+    <code>persona</code>（子代理人格）。服务在子代理<strong>创建之前</strong>校验请求与能力，
+    缺能力就响亮拒绝（<code>UNSUPPORTED_CAPABILITY</code>），绝不「先收下再装没看见」。
+  </p>
+
+  <h2 id="sec-providers">14.2 provider 谱系：七种后端</h2>
+
+  <table>
+    <thead><tr><th>provider（注册名）</th><th>子代理跑在哪</th><th>看得到父会话吗</th></tr></thead>
+    <tbody>
+      <tr><td><code>subagent-spawn-in-process</code>（spawn）</td><td>当前进程内全新 <code>Agent</code></td><td>看不到：空对话起步，但继承 cwd、血统与模型</td></tr>
+      <tr><td><code>subagent-fork-in-process</code>（fork）</td><td>当前进程内</td><td>看到<strong>已完成的轮</strong>（seed 是父日志截至最后一个 <code>turn/end</code> 的连续前缀）</td></tr>
+      <tr><td><code>subagent-acp</code>（acp）</td><td>全新子进程，作为 ACP 客户端驱动任意 Agent Client Protocol 代理</td><td>看不到</td></tr>
+      <tr><td><code>subagent-codex</code>（codex）</td><td>子进程里的 <code>codex app-server --stdio</code>，每次一个临时线程</td><td>看不到</td></tr>
+      <tr><td><code>subagent-claude-code</code>（claude-code）</td><td>官方 Claude Agent SDK 起的 <code>claude</code> 可执行文件</td><td>看不到</td></tr>
+      <tr><td><code>subagent-dsh-sdk</code></td><td>子进程里的<strong>完整 dsh 运行时</strong>（<code>dsh-jsonrpc-agent</code> bin），经 TypeScript SDK 走 stdio JSON-RPC</td><td>看不到</td></tr>
+      <tr><td colspan="3">另有一个不出现在注册表里的共享件：<code>subagent-in-process-driver</code>——spawn 与 fork 共用的运行驱动（下一节）。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>fork 的 seed 边界</strong>是这条家族里最精巧的一处。父代理发起委派时，它当前的
+    tool-calling 轮还没结束：日志里有 assistant 的工具调用，却没有配对的工具结果，也没有 <code>turn/end</code>。
+    直接照抄原始日志会给子代理一份<strong>不平衡的非法会话</strong>。fork 因此只取「截至最后一个
+    <code>turn/end</code> 的连续前缀」——子代理看到所有已完成的轮、完全看不到进行中的轮；
+    父代理一个轮都没完成时 seed 为空，fork 退化为 spawn。seed 只转移对话历史：
+    子代理仍拿到全新的扁平注册 scope，<strong>不继承</strong>父代理的工具限制或权限。
+  </p>
+
+  <p>
+    两个进程内 provider 的其余机制全部收在 <code>subagent-in-process-driver</code> 的
+    <code>startInProcessRun</code> 里：深度校验 → <code>ctx.agents.create</code>（带必需的取消信号）
+    → 未发布 setup 窗口里装 persona / 工具过滤 / 结构化输出运行时 → 发布子代理 →
+    <code>child.followup(prompt)</code> + <code>child.whenIdle()</code> 驱动一个任务 →
+    读子代理自己的输出（最后一条非空 assistant 消息，或累计 assistant 文本）。
+    深度检查也在驱动内部：父深度 + 1 写进子代理 header（下一节）。
+  </p>
+
+  <p>
+    三个进程外后端（acp、codex、claude-code）都经 <code>ctx.subprocess</code> spawn 子进程
+    （第 12 章的底座），工作目录取委派父会话的 cwd——绝不取服务器进程自己的 cwd，
+    因为一个服务器进程服务多个工作区的会话。<code>dsh-sdk</code> 后端则让子代理是一个
+    <strong>完整的对等 harness</strong>：自己的 cordis.yml 组合、会话持久化、模型路由与工具；
+    它与 ACP 后端的差别在线缆与子代理契约——ACP 驱动「任意 ACP 代理」，SDK 驱动「特指 harness 运行时」。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">委派出去的权限边界</div>
+    <p>
+      两条进程内委派路径都在<strong>委派边界</strong>上固定子代理的权限范围：快照父会话的显式沙箱
+      覆盖，并把子代理的审批策略钉在 <code>'never'</code>（只要审批能力在组合里）——被委派的子代理
+      只在继承的沙箱范围内行动，任何 ask（例如 <code>sandbox_permissions</code> 升级）都被确定性拒绝，
+      而不是等一个没人在看的提示。这些值以 <code>source: 'delegation'</code> 的
+      <code>sandbox/mode</code> / <code>approval/policy</code> 事件写进子代理自己的日志——
+      子代理的有效策略凭自己的日志即可重建。子代理还会收到一条 <code>subagent:delegation</code>
+      运行时上下文陈述：范围已固定，需要更大权限时在回复里说明限制，而不是重试。
+    </p>
+  </div>
+
+  <h2 id="sec-subagent-tools">14.3 工具族：发起、控制、报告</h2>
+
+  <p>
+    模型面由三个包分担，方向各不相同：
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>方向</th><th>工具与要点</th></tr></thead>
+    <tbody>
+      <tr><td><code>tool-subagent</code></td><td>父 → 子（发起）</td><td>每个插件实例把<strong>一个 provider 绑到一个工具名</strong>（默认 <code>subagent</code>）；模型拿不到 provider 选择器，要暴露第二种传输就再挂一个改名实例。前台调用等 <code>run.result</code> 并总在返回前 <code>run.dispose()</code>；<code>backgroundMode</code> 选 <code>one-shot</code>（后台时注册普通 Task，返回 jobId）或 <code>continuable</code>（默认后台，返回持久 childId）。<code>maxDepth</code> 默认 3（0 禁止委派）。</td></tr>
+      <tr><td><code>tool-subagent-control</code></td><td>父 → 子（续话）</td><td>全局注册一次的 <code>send_message</code> / <code>interrupt_agent</code> / <code>list_agents</code>（列表工具经可分离的 <code>./list-agents</code> 插件）。消息成为子代理的下一个 FIFO 轮（<code>Agent.followup()</code>），不能重定向进行中的轮；<code>interrupt_agent</code> 只停当前轮（<code>keepInbox</code>），排队的消息留着、已发布的后代继续跑。</td></tr>
+      <tr><td><code>tool-subagent-report</code></td><td>子 → 父（报告）</td><td>只在 continuable 子代理 scope 内注册的 <code>report</code> 工具——经 <code>registerContinuableSetup</code> 贡献安装，根会话、一次性子代理、远端 provider、兄弟 scope 都看不到它。它不收收件人参数：<code>exec.agent</code> 就是发送者凭证，服务从子代理持久的 <code>parentSession</code> 推导唯一收件人。scope 内注册刻意活过子代理的 <code>toolFilter</code>——委派白名单删不掉唯一的回程通道。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    continuable 子代理的世界里还有一个「结算通知」：当子代理的驻留（Activation）结束，
+    编排管理器会在父代理自己的轮流里告诉它「子代理做完了它要做的全部」——附上停止原因与最终
+    assistant 内容。这条通知<strong>无条件投递</strong>：不取决于子代理有没有调过 <code>report</code>，
+    因为最需要交代收场的结局（token 耗尽、模型失败、取消、拆除）恰恰是子代理没来得及选择的时候。
+  </p>
+
+  <h2 id="sec-lineage">14.4 血统：parentSession 与 delegationDepth</h2>
+
+  <p>
+    子代理不是无根的：本地 run 在发布子 agent/会话时，把 <code>request.parent.session.id</code>
+    记进子会话 header 的 <code>parentSession</code> 字段；进程内驱动把<strong>父深度 + 1</strong>
+    写进子会话 header 的 <code>delegationDepth</code>。这两个字段是 durable 的——随会话持久化，
+    冷恢复后依然成立。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="子代理谱系与深度">
+      <rect x="30" y="110" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="105" y="138" text-anchor="middle" style="fill:var(--accent)" font-size="12.5" font-weight="700">父会话</text>
+      <text x="105" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">delegationDepth = 0</text>
+
+      <rect x="240" y="60" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="315" y="88" text-anchor="middle" style="fill:var(--accent-2)" font-size="12.5" font-weight="700">子代理 A</text>
+      <text x="315" y="108" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">parentSession=父 · depth=1</text>
+
+      <rect x="240" y="175" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="315" y="203" text-anchor="middle" style="fill:var(--accent-2)" font-size="12.5" font-weight="700">子代理 B（后台）</text>
+      <text x="315" y="223" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">parentSession=父 · depth=1</text>
+
+      <rect x="460" y="60" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="535" y="88" text-anchor="middle" style="fill:var(--fg)" font-size="12.5" font-weight="700">孙代理</text>
+      <text x="535" y="108" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">parentSession=A · depth=2</text>
+
+      <rect x="460" y="175" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--fail)" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="535" y="200" text-anchor="middle" style="fill:var(--fail)" font-size="12" font-weight="700">depth=3：上限</text>
+      <text x="535" y="220" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">maxDepth 默认 3，再派生被拒</text>
+
+      <line x1="180" y1="130" x2="237" y2="100" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,98 232,97 236,104" style="fill:var(--muted)"/>
+      <line x1="180" y1="160" x2="237" y2="203" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,205 232,204 236,197" style="fill:var(--muted)"/>
+      <line x1="390" y1="95" x2="457" y2="95" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="460,95 452,91 452,99" style="fill:var(--muted)"/>
+      <line x1="390" y1="210" x2="457" y2="210" style="stroke:var(--fail)" stroke-width="1.8" stroke-dasharray="5 4"/>
+
+      <text x="105" y="270" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">血统记在 SessionHeader：深度权威且单调——恢复的子代理不能被重新计为顶层</text>
+      <text x="420" y="292" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">血统是数据不是可见性：parentSession 不给 B 看 A 的对话，只给服务做投递授权与列表</text>
+    </svg>
+    <figcaption>谱系图：每层派生把 parentSession 与 delegationDepth 写进子会话 header；深度超限即拒绝。</figcaption>
+  </figure>
+
+  <p>
+    深度语义有三条要记牢。第一，<strong>持久 header 权威且单调</strong>：运行时选项可以加深计数、
+    永远不能调浅——恢复的子代理不能被重新计为顶层。第二，<strong>上限在每次 start 时检查</strong>：
+    工具在 cap 处仍然可见（模型看得到工具存在），但被拒的派生以错误 tool result 返回；
+    <code>maxDepth</code> 设 0 即禁止委派。进程外 provider 可以配 <code>'provider-managed'</code>
+    ——预算属于子代理那侧的 harness，父侧不发 cap。第三，<strong>血统是数据，不是可见性</strong>：
+    <code>inheritsParentContext</code> 只描述子代理是否<strong>看得到</strong>父会话完成的对话历史
+    （fork 看到、spawn 与进程外 provider 看不到），不表示继承工具、服务或权限；
+    <code>parentSession</code> 也不给兄弟之间任何互相可见性——它服务的是投递授权（谁可以向这个子代理发消息）、
+    报告路由（report 送给谁）与 <code>list_agents</code> 的目录遍历。
+  </p>
+
+  <div class="demo" data-demo="lineageDepth">
+    <div class="demo-title">试一试 —— 子代理派生与 delegationDepth</div>
+    <button data-run>派生一层子代理</button>
+    <div class="demo-output empty">点击派生。</div>
+  </div>
+
+  <h2 id="sec-continuable">14.5 continuable 子代理与 Activation</h2>
+
+  <p>
+    一次性（one-shot）委派是「问一次、拿一个结果」；continuable 子代理是<strong>持久对话对象</strong>：
+    一个持久 <code>Session</code>，加至多一个进程本地的 <strong>Activation</strong>——后者不是请求、
+    不是 Task、不是结果边界，只是「重建出的子 Agent 的一次驻留纪元」。Agent 收件箱是唯一的轮队列：
+    每条续话（<code>send_message</code>、唤醒式 report、结算通知）都经 <code>Agent.followup()</code>
+    成为下一个 FIFO 轮，绝不转向进行中的轮。驻留中的子代理直接收件（唤醒等待中的 Activation）；
+    不在驻留中的子代理从持久 <code>Session</code> 冷恢复——重建输入是日志里的
+    <code>subagent/descriptor</code> 事件（记录 provider 名、生命周期模式、创建标签、模型路由等），
+    冷恢复不再经过任何 provider。
+  </p>
+
+  <p>
+    编排管理器从 Agent 静默与拥有的子代理集合推导三个内部驻留态：running（有活动轮或未醒收件工作）、
+    waiting（静默但仍拥有未 dispose 的子代理）、settled（全部子代理处置完毕，于是 dispose 掉
+    <code>AgentHandle</code>、移除 Activation）。拆除自顶向下传播取消、自底向上（child-first）释放句柄——
+    一个父代理要等它启动的每个子代理真正处置完才算静默，失控的递归树因此有一个确定的收口。
+  </p>
+
+  <h2 id="sec-ralph">14.6 Ralph 循环：每轮换一个全新的代理</h2>
+
+  <p>
+    委派谱系解决「并行分工」，Ralph 循环解决另一类问题：<strong>长目标的迭代执行</strong>。
+    <code>dsh-tool-ralph</code>（workflow 组）提供模型面的 <code>ralph({ objective, maxRounds? })</code> 工具：
+    一个固定的前台工作流，把一个不可变目标交给一串<strong>全新的子代理</strong>。
+    它演示了「专门的编排策略 = 普通插件」——没有给 <code>agent-loop</code> 加任何 Ralph 模式，
+    一切建在 <code>ctx.workflowEngine</code> 与 <code>ctx.subagents</code> 两个 seam 上
+    （workflow 引擎的完整故事留到第 17 章）。
+  </p>
+
+  <p>循环的规则：</p>
+  <ul>
+    <li>每轮经配置的 <code>subagentProvider</code>（默认 <code>spawn</code>）启动一个子代理；该 provider 必须支持结构化输出、且报告 <code>inheritsParentContext: false</code>——每轮都是干净的头脑。</li>
+    <li>每个子代理只收到：不可变目标、当前轮次与上限、「共享工作区即权限」指令、<strong>上一轮的结构化 handoff 报告</strong>。父会话对话与更早的子代理会话一概不做 seed——<strong>工作区就是长期记忆</strong>。</li>
+    <li>报告是结构化的：<code>status: continue | complete | blocked</code>，加非空摘要、证据、下一步与阻塞说明；序列化后受 <code>maxHandoffChars</code>（默认 16384 字符）封顶。无效、缺失或超限的报告让工作流失败，而不是被截断或误判为轮数耗尽。</li>
+    <li>终局结果 <code>complete</code> / <code>blocked</code> / <code>budget-limited</code> 连同最后一轮有界报告与轮数返回；渲染明确标注这是<strong>工作代理的自述</strong>，不是独立认证。轮数上限默认 256（部署配置兼作调用覆盖的天花板）。</li>
+    <li>普通子代理失败产生错误（点名失败轮次、保留上一份成功 handoff），Ralph 不重试该轮；取消同样是错误，partial output 永远不算成功。</li>
+  </ul>
+
+  <p>
+    把 Ralph 放在本章末尾，因为它把本章所有主题串成了一句话：<strong>委派的单位是会话，
+    记忆的单位是工作区，传递的单位是有界的结构化报告</strong>。每轮全新的子代理意味着上下文永不膨胀
+    （第 15 章的主题在这里提前有了答案）；handoff 有界意味着轮间状态可控；
+    血统与深度照常记录——Ralph 的子代理们是父代理直接派生的 depth-1 兄弟序列，不是越来越深的链。
+  </p>
+
+  <h2 id="sec-recap">14.7 本章回顾</h2>
+  <ul>
+    <li><code>ctx.subagents</code> 是多 provider 注册表 seam（学 <code>ctx.llm</code>，不是单服务 bash）：spawn / fork / acp / codex / claude-code / dsh-sdk 六个注册名 + 共享的 in-process-driver。</li>
+    <li>provider 契约以 <code>start()</code> 为所有权转移边界：fulfill 前 provider 负责回滚，fulfill 后调用方必须 <code>dispose()</code>；能力四项在启动前校验，缺则响亮拒绝。</li>
+    <li>fork 的 seed 是截至最后一个 <code>turn/end</code> 的连续前缀——子代理永远拿到平衡的会话；seed 只给历史，不给工具限制或权限。</li>
+    <li>工具三族：<code>tool-subagent</code>（per-provider 发起，one-shot/continuable 两种后台策略）、<code>tool-subagent-control</code>（send_message / interrupt_agent / list_agents）、<code>tool-subagent-report</code>（子域 report 回程，活过 toolFilter）。</li>
+    <li>血统 = <code>SessionHeader.parentSession</code> + <code>delegationDepth</code>（权威、单调、持久）；深度上限防递归失控；血统是数据不是可见性。</li>
+    <li>委派边界固定子代理权限：审批钉 'never'、沙箱覆盖快照成事件写进子日志，子代理收到 <code>subagent:delegation</code> 陈述。</li>
+    <li>continuable 子代理 = 持久 Session + 进程本地 Activation；收件箱是唯一 FIFO，结算通知无条件投递。</li>
+    <li>Ralph 循环 = 全新子代理序列 + 有界结构化 handoff + 工作区当长期记忆，全部建在两个既有 seam 上。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>以为子代理像 bash 一样只能挂一个实现——<code>ctx.subagents</code> 是命名注册表，多个 provider 并存，工具实例逐个绑定。</li>
+      <li>期待 send_message 能打断子代理当前的轮——它只排队为下一个 FIFO 轮；要停当前轮用 <code>interrupt_agent</code>，且它不处置子代理。</li>
+      <li>把 <code>parentSession</code> 当可见性——血统只服务投递授权与目录；兄弟子代理互相看不见，fork 之外谁也看不见父会话。</li>
+      <li>以为 <code>toolFilter</code> 是权限边界——它是可见性/组合限制；子代理的权限边界在委派时由 delegated policy 固定。</li>
+      <li>给 fork 子代理配 continuable 模式——出厂组合都把 fork 绑在 one-shot 上：子域 report 工具会破坏 KV cache 需要的字节级前缀。</li>
+      <li>把 Ralph 的 complete 当独立认证——那是最后一轮工作代理的自述；渲染器会明确标注这一点。</li>
+      <li>指望 ACP 子代理出现在 <code>list_agents</code> 里——ACP run 没有本地子会话，不在 trace 可枚举的目录中。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="14">
+    <h2>第 14 章测验</h2>
+
+    <div class="q" data-id="14-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 多个命名 provider 可在同一上下文共存；注册表形态学的是 LLM 适配器注册表，不是单服务的 bash executor。"
+         data-rationale="B 正确。A 描述的是 ctx.shell 的单服务形态。C 错——系统提示装配与 provider 注册无关。D 错——恰好相反，共存是它的定义性特征（docs/subsystems/subagent.md 开篇明言）。"
+         data-review="sec-subagent-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> ctx.subagents 与 bash 执行 seam 的关键结构差异是？</div>
+      <label class="opt"><input type="radio" name="q-14-1" value="a"> A. 它没有 Service Definition，只有工具</label>
+      <label class="opt"><input type="radio" name="q-14-1" value="b"> B. 它是命名 provider 注册表：多个实现可共存，而 bash 只允许一个 executor</label>
+      <label class="opt"><input type="radio" name="q-14-1" value="c"> C. 它的 provider 由 system-prompt 装配决定</label>
+      <label class="opt"><input type="radio" name="q-14-1" value="d"> D. 它禁止多 provider 共存，防止会话漂移</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 截至最后一个 turn/end 的连续前缀：父代理进行中的轮没有配对结果，照抄会给子代理不平衡的非法会话。"
+         data-rationale="C 正确。A 错——原始日志含无结果的工具调用，不平衡。B 会漏掉已完成轮。D 无此机制：seed 是一次性快照，此后父日志不再进入子上下文。"
+         data-review="sec-providers">
+      <div class="prompt"><span class="qnum">Q2.</span> fork provider 给子代理的 seed 是什么？</div>
+      <label class="opt"><input type="radio" name="q-14-2" value="a"> A. 父会话完整原始日志，包括进行中的轮</label>
+      <label class="opt"><input type="radio" name="q-14-2" value="b"> B. 只有一条任务说明，没有任何历史</label>
+      <label class="opt"><input type="radio" name="q-14-2" value="c"> C. 截至最后一个 turn/end 的连续前缀——所有已完成轮、零进行中内容</label>
+      <label class="opt"><input type="radio" name="q-14-2" value="d"> D. 父会话的实时流：子代理持续看到父代理新日志</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A、C、D 正确：subprocess-e2b 不在列表里（它替换的是 ctx.subprocess 的 provider，不是子代理 provider），其余六个都是注册名。B 错——in-process-driver 是共享运行驱动，不是注册表成员。"
+         data-review="sec-providers">
+      <div class="prompt"><span class="qnum">Q3.</span> 下列哪些是 ctx.subagents 注册表里的 provider 名？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="a"> A. spawn 与 fork</label>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="b"> B. in-process-driver</label>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="c"> C. acp、codex、claude-code</label>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="d"> D. dsh-sdk</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— start() fulfill 是所有权转移边界：之前 provider 必须回滚未发布资源，之后调用方必须在每条路径上 dispose()。"
+         data-rationale="A 正确。B 错——dispose 是调用方义务，provider 卸载也不收回已发布的 run。C 错——子代理层失败以非 completed 的 stopReason resolve。D 错——恰好相反：启动前校验、缺能力响亮拒绝。"
+         data-review="sec-subagent-seam">
+      <div class="prompt"><span class="qnum">Q4.</span> provider 契约 <code>start(request)</code> 的所有权语义是？</div>
+      <label class="opt"><input type="radio" name="q-14-4" value="a"> A. fulfill 前 provider 负责回滚；fulfill 后调用方拥有 run 并必须 dispose()</label>
+      <label class="opt"><input type="radio" name="q-14-4" value="b"> B. provider 在 run 结束后自动 dispose，调用方无需关心</label>
+      <label class="opt"><input type="radio" name="q-14-4" value="c"> C. 子代理失败时 result 必须 reject</label>
+      <label class="opt"><input type="radio" name="q-14-4" value="d"> D. 能力不足时先创建子代理再静默降级</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— report 无收件人参数：exec.agent 是发送者凭证，服务从子代理持久 parentSession 推导唯一收件人（启动它的那个 Agent）。"
+         data-rationale="D 正确。A 错——它恰恰不在工具 schema 里，收件人是推导的。B 错——这是 send_message 的方向；report 是子到父。C 无此机制且与设计相反：scope 内注册就是要活过 toolFilter，保证回程通道删不掉。"
+         data-review="sec-subagent-tools">
+      <div class="prompt"><span class="qnum">Q5.</span> continuable 子代理调 <code>report</code> 时，报告送给谁？</div>
+      <label class="opt"><input type="radio" name="q-14-5" value="a"> A. 模型在参数里指定的任意 agent</label>
+      <label class="opt"><input type="radio" name="q-14-5" value="b"> B. 最近的任意祖先，由运行时挑选</label>
+      <label class="opt"><input type="radio" name="q-14-5" value="c"> C. toolFilter 可以把 report 从子代理工具面删掉</label>
+      <label class="opt"><input type="radio" name="q-14-5" value="d"> D. 启动它的那个 Agent：从子代理持久的 parentSession 推导，不需要也不接受收件人参数</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 正确：深度权威且单调（只可加深）、maxDepth 默认 3 且 0 禁止委派、拒绝以错误 tool result 呈现（工具在 cap 处仍可见）。C 错——是显式批准/会话 sandbox-mode 事件那套优先级，与深度无关；深度只来自父深度加一。"
+         data-review="sec-lineage">
+      <div class="prompt"><span class="qnum">Q6.</span> 关于 delegationDepth，哪些说法成立？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="a"> A. 持久 SessionHeader.delegationDepth 权威且单调：运行时只能加深不能调浅</label>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="b"> B. tool-subagent 的 maxDepth 默认 3，设 0 即禁止委派</label>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="c"> C. 子代理可以把继承的深度改小，只要任务更简单</label>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="d"> D. 达到上限时工具仍在，被拒的派生返回错误 tool result</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 它只说明子代理是否看得到父会话完成的对话历史（fork 看到、spawn 看不到），不表示继承工具、服务或权限。"
+         data-rationale="B 正确：glossary 式的精确表述。A 把描述字段当强制机制。C 错——工具限制经 toolFilter 显式配置，不从 parentSession 派生。D 错——授权凭证是活的 Agent 身份与 durable parentSession，不是这个字段。"
+         data-review="sec-lineage">
+      <div class="prompt"><span class="qnum">Q7.</span> 「血统是数据不是可见性」的意思是？</div>
+      <label class="opt"><input type="radio" name="q-14-7" value="a"> A. parentSession 让子代理自动读到父会话日志</label>
+      <label class="opt"><input type="radio" name="q-14-7" value="b"> B. inheritsParentContext 只是描述：说明能否看到父会话完成历史，而非继承工具、服务或权限</label>
+      <label class="opt"><input type="radio" name="q-14-7" value="c"> C. 记了 parentSession 的子代理自动获得父代理的工具白名单</label>
+      <label class="opt"><input type="radio" name="q-14-7" value="d"> D. 血统字段是唯一的授权凭证，runtime 不再校验调用者</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 子代理的审批策略被钉在 never：任何 ask（如 sandbox_permissions 升级）被确定性拒绝，而不是等一个没人看的提示。"
+         data-rationale="C 正确。A 方向反了。B 错——部署默认沙箱从不复制：没切换过的父不写 sandbox/mode，子代理动态跟随部署默认。D 错——每个 in-process 子代理都收到 subagent:delegation 陈述，说明范围固定、需要更大权限时报限制而不是重试。"
+         data-review="sec-providers">
+      <div class="prompt"><span class="qnum">Q8.</span> 被委派的子代理请求 sandbox_permissions 升级时会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-14-8" value="a"> A. 弹出审批提示，等用户决定</label>
+      <label class="opt"><input type="radio" name="q-14-8" value="b"> B. 继承父会话当前策略并重试</label>
+      <label class="opt"><input type="radio" name="q-14-8" value="c"> C. 被确定性拒绝：委派边界把审批钉在 never，子代理只应报告限制</label>
+      <label class="opt"><input type="radio" name="q-14-8" value="d"> D. 静默放行一次以保持流程</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-9" data-type="fill"
+         data-accepted='["Activation","activation","activation 纪元"]'
+         data-answer="Activation（子代理持久 Session 至多对应一个的进程本地驻留纪元）。"
+         data-rationale="Activation 不是请求、Task 或结果边界；Agent 收件箱是唯一轮队列，续话经 Agent.followup() 排队，驻留中的直接收件、不在驻留中的冷恢复。填 Task 或 run 都混淆了一次性 run 与驻留纪元。"
+         data-review="sec-continuable">
+      <div class="prompt"><span class="qnum">Q9.</span> 填空：一个 continuable 子代理有持久 Session，外加至多一个进程本地的 ______——重建出的子 Agent 的一次驻留纪元。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-10" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— send_message 经 Agent.followup() 成为子代理的下一个 FIFO 轮：进行中的轮不受影响，消息等它结束。"
+         data-rationale="A 正确。B 是 interrupt_agent 的语义（且它不处置子代理、已发布后代继续跑）。C 错——本调用不返回子代理回复，transcript 才是它做了什么的来源。D 错——投递失败是错误 tool result，明确说消息未送达。"
+         data-review="sec-subagent-tools">
+      <div class="prompt"><span class="qnum">Q10.</span> 子代理正在跑一个长任务时，父代理 send_message 了一条新指令，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-14-10" value="a"> A. 消息排队为下一个 FIFO 轮，当前轮跑完才轮到它</label>
+      <label class="opt"><input type="radio" name="q-14-10" value="b"> B. 当前轮立即被中止并替换为新指令</label>
+      <label class="opt"><input type="radio" name="q-14-10" value="c"> C. 本调用返回子代理的回复</label>
+      <label class="opt"><input type="radio" name="q-14-10" value="d"> D. 消息被静默丢弃</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-11" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B、C、D。"
+         data-rationale="B、C、D 正确：Ralph 是 ctx.workflowEngine + ctx.subagents 上的普通插件、工作区是长期记忆、complete 是工作代理自述而非认证。A 错——每轮全新子代理（inheritsParentContext 必须为 false），不继承对话；A 项描述与设计相反。"
+         data-review="sec-ralph">
+      <div class="prompt"><span class="qnum">Q11.</span> 关于 Ralph 循环，哪些说法成立？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="a"> A. 每轮子代理继承父代理完整对话以保持连续性</label>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="b"> B. 它是普通插件：建在 ctx.workflowEngine 与 ctx.subagents 上，agent-loop 没有 Ralph 模式</label>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="c"> C. 工作区是长期记忆；父对话与更早子会话不做 seed</label>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="d"> D. 轮间状态只经有界的结构化 handoff 传递（status/summary/evidence/next steps/blocker）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-12" data-type="fill"
+         data-accepted='["spawn","spawn provider","subagentProvider: spawn"]'
+         data-answer="spawn（tool-ralph 配置 subagentProvider 的默认值）。"
+         data-rationale="Ralph 要求 provider 支持结构化输出并报告 inheritsParentContext: false；spawn 是默认。fork 不满足后者（它带父历史），acp 等远端后端则可以配置但不是默认。"
+         data-review="sec-ralph">
+      <div class="prompt"><span class="qnum">Q12.</span> 填空：Ralph 每轮经配置的 subagentProvider 启动全新子代理，默认 provider 是 ______。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-13" data-type="short"
+         data-key-points='["ctx.subagents 是命名 provider 注册表，六种后端共存一个契约","fork/spawn 的 seed 边界（截至最后一个 turn/end 的前缀）与共享 in-process-driver","工具三族分工：发起（per-provider 绑定）/ 控制（send_message 等）/ 报告（子域 report）","血统与深度：parentSession + delegationDepth 权威单调持久，血统是数据不是可见性","Ralph：全新子代理 + 有界结构化 handoff + 工作区当长期记忆"]'
+         data-answer="按三点组织：结构上，ctx.subagents 是多 provider 注册表（spawn/fork/acp/codex/claude-code/dsh-sdk 共存，共享 in-process-driver），工具三族分别管发起、父到子控制、子到父报告；数据上，每次派生把 parentSession 与 delegationDepth=父+1 写进子会话 header（权威、单调、持久），深度超限拒绝派生，血统只服务投递授权与目录，不给可见性；策略上，Ralph 每轮起全新子代理、只传有界结构化 handoff、以共享工作区为长期记忆。"
+         data-rationale="结构 + 血统数据 + Ralph 策略三条线都在，你就掌握了委派世界的全貌；下一章转向另一个维度的压力——上下文。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> 用自己的话总结：委派 seam 的结构（provider 谱系与工具分工）、血统数据的语义，以及 Ralph 循环用什么代替对话记忆。</div>
+      <textarea class="short" placeholder="你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正覆盖了某个要点才勾选它——少选伤害校准，多选只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="15-context-pressure.html"><strong>第 15 章 · 上下文压力管理</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

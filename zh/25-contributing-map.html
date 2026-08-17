@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 25 章 · 贡献地图与专家导航 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 25 章 · 贡献地图</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="25">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 25 章 · 第五部分 · 工程与贡献</div>
+    <h1>贡献地图与专家导航</h1>
+    <p class="lede">
+      最后一章做两件事：把「在这个仓库里留下一次改动」需要的流程地图补齐——Agent Notes 决策
+      账本、双语文档契约、PR 标签与栈规则；然后把全书二十五章拼成一张导航图，让「我想改 X，
+      先读 Y」变成一次查表。读完这章，你就从「读懂 dsh 的人」变成「能在 dsh 里开工的人」。
+      这是收官章，图要慢慢看。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出 Agent Note 的生命周期目录（proposed / implemented / rejected / archived）、六个 class 与「非平凡改动同 PR 必带 Note」的规则。</li>
+      <li>解释 archived 树的冻结契约：永不编辑、不当现权威，由 <code>verify-archived-agent-notes</code> 执行。</li>
+      <li>描述双语文档的配对结构（<code>*.md</code> + <code>*.zh.md</code> + <code>*.i18n.yaml</code>）与「一个事实一个家」的层级税。</li>
+      <li>复述 PR 规则：一个 <code>kind/*</code>、全部 material <code>area/*</code>、原生 Issue Type、栈式 PR 的 <code>--force-with-lease</code> 纪律。</li>
+      <li>用全书导航图把「我想改 X」定位到「先读 Y」的包、事件或注册表。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-agent-notes">25.1 Agent Notes：决策的账本</h2>
+
+  <p>
+    <code>.agents/notes/</code> 只住一种文档：记录一个影响代码库的决策——<strong>为什么这么定、
+    放弃了什么</strong>——这些代码和常规文档带不动的东西。路径本身就是元数据：
+    <code>{lifecycle}/{class}/yyyy-mm-dd-topic-title.md</code>。生命周期四个目录：
+    <code>proposed/</code>（实现前评审的提案）、<code>implemented/</code>（已发布的决策，且
+    <strong>随代码保持现势</strong>——代码挪了文件、改了默认值，同一改动里要把 Note 的事实更新）、
+    <code>rejected/</code>（被否决的提案，只在其理由仍能挡住一个有诱惑力的错误时保留，否则三元组
+    整体删除）、<code>archived/</code>（冻结的历史，见下）。class 是封闭集，由
+    <code>scripts/agent-note-tree.ts</code> 与分类门禁执行：<code>feature</code> / <code>bug-fix</code> /
+    <code>simplification</code> / <code>architecture</code> / <code>process</code> / <code>testing</code>
+    ——分界线是「architecture 管我们发布的源码，process 管围着代码的工具与流程」，而
+    <code>refactor</code> 被刻意排除（与 simplification 重叠）。
+  </p>
+
+  <p>
+    写作时机是一条硬规则：<strong>每个非平凡改动必须在同一个 PR 里新增或更新至少一条 Agent
+    Note</strong>。非平凡指改了行为、架构、跨文件/包的契约、流程或工具、测试策略、盘上/线上/配置
+    格式，或任何维护者可能重开的决策。更新已拥有该决策的 Note 即可满足规则，不要造重复；纯机械/
+    局部的编辑豁免。文件格式由 <code>verify-agent-note-format</code>（doc-sync 的一部分）执行：头两
+    行精确是 <code># Agent Note: &lt;title&gt;</code> 与 <code>Status: &lt;status&gt;</code>
+    （proposed / implemented / <code>rejected — 一行理由</code>，状态必须与所在目录一致）；正文以
+    <code>## Problem</code> 开篇；implemented 骨架是 Problem → Decision → … → Alternatives
+    considered → Consequences，且禁止出现 Proposal/Plan/Acceptance criteria 这类规格腔。
+    <strong>每条 Note 必须有 <code>## Alternatives considered</code></strong>：没记录「打败了什么」
+    的决策是在邀请重审——这正是 Agent Notes 存在要防止的失败。Note 之间的互链用相对 markdown
+    链接，绝不裸写编号，所以链接可被机械校验、搬目录也不死。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">archived 是冻结的</div>
+    <p>
+      一条 implemented Note 在决策已完整落地、理由 unlikely 再指导未来工作时归档：整个英/中/sidecar
+      三元组搬进 <code>archived/{class}/</code>，加一行 <code>Archived: YYYY-MM-DD</code>，此后
+      <strong>永不编辑、翻译、重排、更新、移动或删除</strong>，也不当作当前行为的权威。文档门禁跳过
+      归档源；活跃文档仍可有意引用它作为历史。执行者是
+      <code>verify-archived-agent-notes</code>：封闭 class 树、完整三元组、归档元数据、sidecar 哈希与
+      append-only 冻结清单。归档用校准过的 dsh-archive-agent-notes 工作流判断，不数字数不看年龄。
+    </p>
+  </div>
+
+  <h2 id="sec-bilingual-docs">25.2 双语文档与 doc-sync</h2>
+
+  <p>
+    这个仓库的文档是英中双份平行：<code>*.md</code> 与 <code>*.zh.md</code> 逐节镜像，旁边一份
+    <code>*.i18n.yaml</code> sidecar 记录配对状态；配对契约由 <code>docs/i18n/README.md</code> 拥有，
+    <code>verify-translation-pairing</code> 校验。日常双语工作按 docs/AGENTS.md 走：术语引导、单遍
+    active-agent 翻译重录 sidecar；只有<strong>显式用户调用</strong>才跑 <code>dsh-translate-docs</code>
+    技能。Git 侧还有配对 merge driver（pre-commit / pre-merge-commit 校验暂存记录）。
+  </p>
+
+  <p>
+    docs/AGENTS.md 的层级税只有一句：<strong>一个事实一个家</strong>。根 AGENTS.md 只放常备命令
+    （每条一到三行、链去它的家）；architecture.md 是有序地图；subsystems/ 一子系统一页类型参考；
+    Agent Notes 放决策理由；postmortem/ 是唯一允许战史叙事的层；cookbook/ 放带编号验证步骤的
+    how-to；包 README 是每包契约（含 Model Experience）；生成参考（tool-catalog、config-catalog、
+    module-graph 等）从源码再生、新鲜度受门禁。写作规则里最常咬人的四条：文档写<strong>当前状态
+    不写变更史</strong>（避免「以前/现在/不再」，故事进 Note 或 postmortem）；<strong>一段一个
+    物理行</strong>（verify-md-wrap）；围栏 <code>ts</code> 块必须可编译（doc-typecheck），贴类型
+    用 <code>ts type-equiv</code> 并登记 manifest 防漂移；跨引用用相对 markdown 链接
+    （verify-md-links）。字数预算由 <code>verify-doc-budgets</code> 把守，红了先搬迁、再压缩、
+    实在不够才提 manifest 里的天花板。这一整套连同目录再生、JSDoc、Agent Note 校验，都聚合在
+    <code>pnpm run doc-sync</code>（第 23 章）。
+  </p>
+
+  <p>
+    文档网站是投影不是家：<code>website/</code> 只拥有 VitePress 配置、呈现资产与发布清单
+    （<code>website/docs.ts</code> 把 docs/ 各层源映射进两个 locale 的路由树），Markdown 留在
+    所属层，投影写进被忽略的 <code>website/.generated/</code>——永不手编。改这个子树跑
+    <code>pnpm docs:check</code>。
+  </p>
+
+  <h2 id="sec-pr-rules">25.3 PR 规则、标签与栈</h2>
+
+  <p>
+    AGENTS.md 对 PR 历史的要求是「刻意选择」：<strong>独立改动拆开提交</strong>；修 bug 优先在
+    引入它的 PR 里修，而不是向前传播。独立 PR 与官方栈评审后可以 merge-forward 或 rebase；
+    改写历史用 <code>--force-with-lease</code>，远端动了就中止，<strong>绝不裸
+    <code>--force</code></strong>；进行中的 merge-forward 在拿更新的 base 前先保存自己的 checkpoint
+    （依据 <code>.agents/notes/implemented/process/2026-08-02-native-github-stacks-and-optional-rebases.md</code>，
+    配套技能 dsh-merging-stacked-prs）。推送前按 dsh-pre-push-checks 技能选最小检查集
+    （第 23 章的证据面对应）；<code>gh stack sync</code> 之后立即验证，检查不过不合并。
+  </p>
+
+  <p>
+    标签税：每个 PR 恰好一个 <code>kind/*</code>（改动种类），所有实质涉及的 <code>area/*</code>，
+    加上原生 GitHub Issue Type——分类学由
+    <code>.agents/notes/implemented/process/2026-08-08-unified-github-label-taxonomy.md</code> 拥有。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">先读 CONTRIBUTING.md：外部 PR 的当前状态</div>
+    <p>
+      仓库根的 CONTRIBUTING.md 写明：DeepSeek Harness 仍处早期、活跃开发中，<strong>目前不接受外部
+      pull request</strong>。参与方式是生态式的——在 GitHub Discussions 报问题/投票；写让你兴奋的
+      插件并给 GitHub 项目挂 <code>dsh-plugin</code> topic；写博客与 how-to；回答社区问题。仓库的
+      立场是：官方仓库的包并不天然比社区包重要——这个仓库更像一个想法、一个官方展示、一个灵感来源。
+      所以上一节与本章的 PR 规则，对你意味着两层用法：在你的检出/fork 里按同一套纪律走完整流程
+      （最小检查集、同 PR 的 Note 与快照），以及用 out-of-tree 插件（第 24 章）参与生态。
+    </p>
+  </div>
+
+  <h2 id="sec-book-map">25.4 全书导航图</h2>
+
+  <p>
+    二十五章叠成五层，下层是上层的地基：没有 Cordis 心智读不懂事件流，没有事件流读不懂 loop，
+    没有 loop 读不懂工具管道，没有 seam 读不懂执行世界的整体搬迁，没有前四部分读不懂测试与门禁
+    在保护什么。右边那张速查表把最常见的「我想改 X」映射到入口——注意每一行都指向
+    <strong>扩展点、事件或 seam</strong>，没有一行指向 agent-loop 本体。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 660" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="全书五部分地图与改动速查表">
+      <text x="14" y="24" style="fill:var(--fg-dim)" font-size="13" font-weight="700">五个部分（自下而上叠加）</text>
+
+      <rect x="14" y="560" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="28" y="584" style="fill:var(--accent)" font-size="13" font-weight="700">第一部分 · 基础（第 1-3 章）</text>
+      <text x="28" y="604" style="fill:var(--fg)" font-size="11">dsh 全景 · Cordis 心智 · 运行时组装</text>
+      <text x="28" y="620" style="fill:var(--fg-dim)" font-size="11">一切的地基：插件、Context、启动链</text>
+
+      <line x1="179" y1="560" x2="179" y2="538" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,532 173,542 185,542" style="fill:var(--muted)"/>
+
+      <rect x="14" y="460" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="28" y="484" style="fill:var(--accent)" font-size="13" font-weight="700">第二部分 · 核心流水（第 4-10 章）</text>
+      <text x="28" y="504" style="fill:var(--fg)" font-size="11">会话日志 · 持久化 · agent/scope · loop</text>
+      <text x="28" y="520" style="fill:var(--fg)" font-size="11">工具管道 · system prompt · LLM 层</text>
+
+      <line x1="179" y1="460" x2="179" y2="438" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,432 173,442 185,442" style="fill:var(--muted)"/>
+
+      <rect x="14" y="360" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="28" y="384" style="fill:var(--accent)" font-size="13" font-weight="700">第三部分 · 能力面（第 11-17 章）</text>
+      <text x="28" y="404" style="fill:var(--fg)" font-size="11">seam 三角色 · 执行世界 · fs · 子代理</text>
+      <text x="28" y="420" style="fill:var(--fg)" font-size="11">上下文压力 · 人类面 · 能力巡礼</text>
+
+      <line x1="179" y1="360" x2="179" y2="338" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,332 173,342 185,342" style="fill:var(--muted)"/>
+
+      <rect x="14" y="260" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="28" y="284" style="fill:var(--accent)" font-size="13" font-weight="700">第四部分 · 产品端与协议（第 18-21 章）</text>
+      <text x="28" y="304" style="fill:var(--fg)" font-size="11">CLI/boot · Web UI · Typert RPC</text>
+      <text x="28" y="320" style="fill:var(--fg)" font-size="11">ACP / JSON-RPC SDK / Python</text>
+
+      <line x1="179" y1="260" x2="179" y2="238" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="179,232 173,242 185,242" style="fill:var(--muted)"/>
+
+      <rect x="14" y="160" width="330" height="72" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="28" y="184" style="fill:var(--accent-2)" font-size="13" font-weight="700">第五部分 · 工程与贡献（第 22-25 章）</text>
+      <text x="28" y="204" style="fill:var(--fg)" font-size="11">测试五通道 · 门禁与约定 · 扩展实战</text>
+      <text x="28" y="220" style="fill:var(--fg)" font-size="11">贡献地图（你在这里）</text>
+
+      <rect x="14" y="60" width="330" height="76" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="28" y="84" style="fill:var(--pass)" font-size="13" font-weight="700">毕业之后</text>
+      <text x="28" y="104" style="fill:var(--fg)" font-size="11">docs/architecture.md → capability-seams.md</text>
+      <text x="28" y="120" style="fill:var(--fg)" font-size="11">→ agent-loop/src/agent.ts 全文</text>
+
+      <line x1="179" y1="160" x2="179" y2="140" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="4 3"/>
+      <polygon points="179,136 173,144 185,144" style="fill:var(--muted)"/>
+
+      <text x="384" y="24" style="fill:var(--fg-dim)" font-size="13" font-weight="700">我想改 X → 先读 Y（查表）</text>
+
+      <rect x="384" y="36" width="502" height="596" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+
+      <rect x="398" y="48" width="216" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="406" y="64" style="fill:var(--fg-dim)" font-size="11" font-weight="700">我想改……</text>
+      <rect x="626" y="48" width="246" height="24" rx="4" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="634" y="64" style="fill:var(--fg-dim)" font-size="11" font-weight="700">先读 / 先走……</text>
+
+      <text x="406" y="94" style="fill:var(--fg)" font-size="11">loop 行为</text>
+      <text x="634" y="94" style="fill:var(--accent)" font-size="11">agent/* 事件与扩展点（不改 loop）</text>
+
+      <text x="406" y="120" style="fill:var(--fg)" font-size="11">加模型可见输入</text>
+      <text x="634" y="120" style="fill:var(--accent)" font-size="11">新 session event（SessionEventMap）</text>
+
+      <text x="406" y="146" style="fill:var(--fg)" font-size="11">持久化格式</text>
+      <text x="634" y="146" style="fill:var(--accent)" font-size="11">SessionEventMap / SESSION_FORMAT_VERSION</text>
+
+      <text x="406" y="172" style="fill:var(--fg)" font-size="11">换执行环境</text>
+      <text x="634" y="172" style="fill:var(--accent)" font-size="11">fs / subprocess provider（seam 换实现）</text>
+
+      <text x="406" y="198" style="fill:var(--fg)" font-size="11">加一个模型工具</text>
+      <text x="634" y="198" style="fill:var(--accent)" font-size="11">ctx.tools.register + defineTool（24 章）</text>
+
+      <text x="406" y="224" style="fill:var(--fg)" font-size="11">新模型供应商</text>
+      <text x="634" y="224" style="fill:var(--accent)" font-size="11">LlmAdapter + ctx.llm.registerAdapter</text>
+
+      <text x="406" y="250" style="fill:var(--fg)" font-size="11">改 system prompt</text>
+      <text x="634" y="250" style="fill:var(--accent)" font-size="11">ctx.systemPrompt.section()</text>
+
+      <text x="406" y="276" style="fill:var(--fg)" font-size="11">拦 / 包工具调用</text>
+      <text x="634" y="276" style="fill:var(--accent)" font-size="11">tools/pre-execute · execute · result</text>
+
+      <text x="406" y="302" style="fill:var(--fg)" font-size="11">加人类命令</text>
+      <text x="634" y="302" style="fill:var(--accent)" font-size="11">ctx.commands（packages/interaction/commands）</text>
+
+      <text x="406" y="328" style="fill:var(--fg)" font-size="11">加后台作业</text>
+      <text x="634" y="328" style="fill:var(--accent)" font-size="11">ctx.jobs.start（长任务运行时）</text>
+
+      <text x="406" y="354" style="fill:var(--fg)" font-size="11">浏览器 UI</text>
+      <text x="634" y="354" style="fill:var(--accent)" font-size="11">ui-slots（packages/client/ui-slots）</text>
+
+      <text x="406" y="380" style="fill:var(--fg)" font-size="11">Web Chat 业务节点</text>
+      <text x="634" y="380" style="fill:var(--accent)" font-size="11">ConversationNodeDefinition + chat 渲染器</text>
+
+      <text x="406" y="406" style="fill:var(--fg)" font-size="11">RPC 面</text>
+      <text x="634" y="406" style="fill:var(--accent)" font-size="11">Typert 类型图 + gateway（20 章）</text>
+
+      <text x="406" y="432" style="fill:var(--fg)" font-size="11">子代理</text>
+      <text x="634" y="432" style="fill:var(--accent)" font-size="11">ctx.subagents provider registry（14 章）</text>
+
+      <text x="406" y="458" style="fill:var(--fg)" font-size="11">定时驱动一轮</text>
+      <text x="634" y="458" style="fill:var(--accent)" font-size="11">followup(source: cron)（17 章）</text>
+
+      <text x="406" y="484" style="fill:var(--fg)" font-size="11">接 MCP 服务器</text>
+      <text x="634" y="484" style="fill:var(--accent)" font-size="11">dsh-mcp-client + insert overlay（24 章）</text>
+
+      <text x="406" y="510" style="fill:var(--fg)" font-size="11">权限 / 审批</text>
+      <text x="634" y="510" style="fill:var(--accent)" font-size="11">tools/pre-execute 返回 ask（16 章）</text>
+
+      <text x="406" y="536" style="fill:var(--fg)" font-size="11">上下文压力</text>
+      <text x="634" y="536" style="fill:var(--accent)" font-size="11">compaction seam + agent/pre-step（15 章）</text>
+
+      <line x1="398" y1="552" x2="872" y2="552" style="stroke:var(--muted)" stroke-width="1"/>
+
+      <text x="406" y="578" style="fill:var(--fg-dim)" font-size="11">改完之后（每一行都一样）</text>
+      <text x="406" y="602" style="fill:var(--pass)" font-size="11">按证据面选检查（23 章）· 同 PR 补 keyless 快照（22 章）</text>
+      <text x="406" y="622" style="fill:var(--pass)" font-size="11">非平凡改动带 Agent Note（25.1）</text>
+    </svg>
+    <figcaption>全书收官导航图。左：五个部分自下而上互相依赖，顶部是毕业路线；右：常见改动到入口的速查表——每一行都落在扩展点、事件或 seam 上，没有一行指向 agent-loop 本体；表尾是所有改动共用的收尾义务。</figcaption>
+  </figure>
+
+  <div class="box key">
+    <div class="box-title">把速查表读成一句话</div>
+    <p>
+      行为上扩展点、数据上事件流、实现上 provider seam：想改的如果不是这三者之一，先回
+      docs/architecture.md 找到它属于谁——「找不到入口」几乎总是「读错了层」的症状。
+    </p>
+  </div>
+
+  <h2 id="sec-graduation">25.5 毕业路线</h2>
+
+  <p>
+    读完全书，按这个顺序把知识压实成肌肉记忆：
+  </p>
+
+  <table>
+    <thead><tr><th>步</th><th>做什么</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>通读 <code>docs/architecture.md</code></td><td>把 25 章压回一份有序地图：组合、核心包、loop、seam、扩展点——改 packages/ 前的必读。</td></tr>
+      <tr><td>2</td><td>读 <code>docs/capability-seams.md</code></td><td>三角色模式的一次集中复习，之后每个新能力都按它定位。</td></tr>
+      <tr><td>3</td><td>通读 <code>packages/core/agent-loop/src/agent.ts</code> 全文</td><td>亲眼看见第 6-7 章的 turn/step、inbox 准入与全部拦截点在代码里的样子。</td></tr>
+      <tr><td>4</td><td>跑一遍 <code>pnpm run test:snapshot</code></td><td>无密钥走完整个组装转录回放；看它绿，感受金标准体系。</td></tr>
+      <tr><td>5</td><td>提你的第一个 PR</td><td>从第 24 章三遍实战里挑一个小改动（或一个新插件），按第 23 章选最小检查集，带 Note 与快照。若走外部路线：当前 CONTRIBUTING.md 不收外部 PR——那就 fork 里走完整流程，或以 <code>dsh-plugin</code> 生态参与。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    最后一条提醒：你此刻读到的所有事实都以仓库为准。门禁清单会变、包会挪、事件会长——
+    真正不变的是这本书教的定位方法：找到事实的家，读它，然后改它。
+  </p>
+
+  <h2 id="sec-recap">25.6 本章回顾</h2>
+  <ul>
+    <li>Agent Notes 是决策账本：<code>proposed/implemented/rejected/archived</code> × 六个 class；非平凡改动同 PR 必带；<code>## Alternatives considered</code> 强制；implemented 保持现势、archived 永久冻结不当权威。</li>
+    <li>双语文档 = <code>*.md</code> + <code>*.zh.md</code> + <code>*.i18n.yaml</code> 配对；一个事实一个家；当前状态不写变更史；一段一个物理行；<code>doc-sync</code> 聚合全部文档门禁；只有显式调用才跑 dsh-translate-docs；website/ 只是投影。</li>
+    <li>PR：独立改动拆开、修引入 PR；一个 <code>kind/*</code> + 全部 material <code>area/*</code> + 原生 Issue Type；栈可 merge-forward/rebase，改写只用 <code>--force-with-lease</code>；推送前 dsh-pre-push-checks 选最小集。</li>
+    <li>CONTRIBUTING.md 当前不收外部 PR：参与方式是 Discussions、博客、与挂 <code>dsh-plugin</code> topic 的插件生态。</li>
+    <li>导航口诀：行为上扩展点、数据上事件流、实现上 provider seam；改完按证据面选检查、同 PR 补 keyless 快照、带 Agent Note。</li>
+    <li>毕业路线：architecture.md → capability-seams.md → agent.ts 全文 → <code>test:snapshot</code> → 第一个 PR。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>把 archived Note 当现权威引用——它是冻结历史；当前行为查 implemented Note 与源码。</li>
+      <li>非平凡 PR 不带 Agent Note——硬规则；更新已拥有的 Note 即可，别造重复。</li>
+      <li>给 implemented Note 写「应该/迁移计划/验收清单」——规格腔被格式门禁拒绝，它只写已发布的事实。</li>
+      <li>文档里写「以前/现在/不再」——变更史进 Note 与 postmortem，当前文档只写当前机制。</li>
+      <li>栈式 PR 用裸 <code>--force</code>——只用 <code>--force-with-lease</code>，远端动了就中止。</li>
+      <li>以为外部可以直接投 PR——先读 CONTRIBUTING.md；当前窗口是 Discussions 与 dsh-plugin 生态。</li>
+      <li>改持久化格式时忘了 required-on-read 与 <code>SESSION_FORMAT_VERSION</code> 的结构变化规则——先回第 4 章与 <code>SessionEventMap</code>。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="25">
+    <h2>第 25 章测验</h2>
+
+    <div class="q" data-id="25-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 每个非平凡改动必须在同一个 PR 里新增或更新至少一条 Agent Note。"
+         data-rationale="C 正确。A 把义务推迟到下个 PR。B 只有纯机械/局部编辑豁免，改行为不豁免。D 说反了：更新已拥有该决策的 Note 即满足规则，造重复才被禁止。"
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q1.</span> 「非平凡改动必带 Agent Note」的确切要求是？</div>
+      <label class="opt"><input type="radio" name="q-25-1" value="a"> A. 决策落地后的下一个 PR 里补一条</label>
+      <label class="opt"><input type="radio" name="q-25-1" value="b"> B. 只有架构级改动才需要，行为改动豁免</label>
+      <label class="opt"><input type="radio" name="q-25-1" value="c"> C. 同一个 PR 里新增或更新至少一条；更新已拥有该决策的 Note 即可</label>
+      <label class="opt"><input type="radio" name="q-25-1" value="d"> D. 每个行为改动都必须新建一条，不许复用旧 Note</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 正确：archived 三元组永久冻结、不当现权威；implemented 随代码保持事实现势；互链用相对 markdown 链接。C 错：implemented 里禁止 Proposal/Plan/Acceptance criteria 等规格腔章节，格式门禁会拒绝。"
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于 Agent Note 的规则，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="a"> A. archived 三元组永不编辑、翻译、移动或删除</label>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="b"> B. implemented 的 Note 随代码同改动更新事实（路径、名称、结构）</label>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="c"> C. implemented 的 Note 应包含迁移计划与验收清单</label>
+      <label class="opt"><input type="checkbox" name="q-25-2" value="d"> D. Note 之间用相对 markdown 链接互链，不裸写编号</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— architecture 管发布的源码结构，process 管围着代码的工具与流程（门禁、包管理器、vendoring）。"
+         data-rationale="B 正确，这是 README 里点名的分界线。A 都算运行时结构。C 是 testing。D 是 feature。另外 refactor 被刻意排除，由 simplification 的判据覆盖。"
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q3.</span> 一条关于「改 lint 门禁与包管理器配置」的决策，class 归哪类？</div>
+      <label class="opt"><input type="radio" name="q-25-3" value="a"> A. architecture</label>
+      <label class="opt"><input type="radio" name="q-25-3" value="b"> B. process</label>
+      <label class="opt"><input type="radio" name="q-25-3" value="c"> C. testing</label>
+      <label class="opt"><input type="radio" name="q-25-3" value="d"> D. feature</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 每条 Note 必须有 Alternatives considered：没记录打败了什么的决策是在邀请重审。"
+         data-rationale="C 正确，这是 Agent Notes 存在要防止的失败。A/B/D 都不是强制段落；Testing/Deferred/Related 可以有但不强制。"
+         data-review="sec-agent-notes">
+      <div class="prompt"><span class="qnum">Q4.</span> 每条 Agent Note 都必须携带的段落是？</div>
+      <label class="opt"><input type="radio" name="q-25-4" value="a"> A. ## Testing</label>
+      <label class="opt"><input type="radio" name="q-25-4" value="b"> B. ## Related</label>
+      <label class="opt"><input type="radio" name="q-25-4" value="c"> C. ## Alternatives considered</label>
+      <label class="opt"><input type="radio" name="q-25-4" value="d"> D. ## Migration plan</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-5" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A/B/C 正确：双语对是 md + zh.md + i18n.yaml 且逐节镜像；dsh-translate-docs 只在显式用户调用时跑；website/ 只拥有配置与投影，Markdown 留在所属层。D 错：一段恰好一个物理行，verify-md-wrap 强制软换行习惯。"
+         data-review="sec-bilingual-docs">
+      <div class="prompt"><span class="qnum">Q5.</span> 关于双语文档体系，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="a"> A. 配对结构是 *.md + *.zh.md + *.i18n.yaml</label>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="b"> B. dsh-translate-docs 只在显式用户调用时运行</label>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="c"> C. website/ 只拥有 VitePress 配置与发布清单，Markdown 留在所属层</label>
+      <label class="opt"><input type="checkbox" name="q-25-5" value="d"> D. 段落可以任意折行，门禁只查拼写</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 战史叙事只属于 postmortem/；常规文档写当前机制，历史进 Note 或 postmortem。"
+         data-rationale="B 正确，这是层级税的一home 原则。A 的决策理由归 Agent Notes。C 的类型定义归 subsystems。D 的逐步 how-to 归 cookbook/。"
+         data-review="sec-bilingual-docs">
+      <div class="prompt"><span class="qnum">Q6.</span> 「一个事实一个家」：事故复盘的故事性叙述属于哪一层？</div>
+      <label class="opt"><input type="radio" name="q-25-6" value="a"> A. 根 AGENTS.md</label>
+      <label class="opt"><input type="radio" name="q-25-6" value="b"> B. postmortem/（唯一允许战史叙事的层）</label>
+      <label class="opt"><input type="radio" name="q-25-6" value="c"> C. subsystems/</label>
+      <label class="opt"><input type="radio" name="q-25-6" value="d"> D. cookbook/</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-7" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A/C/D 都是 PR 规则原文。B 错：改写历史只用 --force-with-lease，远端动了就中止，绝不裸 --force。"
+         data-review="sec-pr-rules">
+      <div class="prompt"><span class="qnum">Q7.</span> 关于 PR 与栈，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="a"> A. 一个 PR 恰好一个 kind/* 标签，所有 material area/*，原生 Issue Type</label>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="b"> B. 栈式改写历史时可以直接 --force</label>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="c"> C. 独立改动拆开；修 bug 优先在引入它的 PR 里修</label>
+      <label class="opt"><input type="checkbox" name="q-25-7" value="d"> D. gh stack sync 之后立即验证，检查不过不合并</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— CONTRIBUTING.md 明说当前不接受外部 PR；参与方式是 Discussions、博客与 dsh-plugin 生态。"
+         data-rationale="A 正确，且仓库明言官方包不天然比社区包重要。B/C/D 与 CONTRIBUTING.md 相反。"
+         data-review="sec-pr-rules">
+      <div class="prompt"><span class="qnum">Q8.</span> 当前 CONTRIBUTING.md 对外部贡献的说法是？</div>
+      <label class="opt"><input type="radio" name="q-25-8" value="a"> A. 暂不接受外部 PR；以 Discussions、内容创作与挂 dsh-plugin topic 的插件参与</label>
+      <label class="opt"><input type="radio" name="q-25-8" value="b"> B. 欢迎直接投 PR，无额外要求</label>
+      <label class="opt"><input type="radio" name="q-25-8" value="c"> C. 只接受核心算法类 PR</label>
+      <label class="opt"><input type="radio" name="q-25-8" value="d"> D. 外部贡献只能通过 Python SDK</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-9" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 持久化格式属于 SessionEventMap 与 SESSION_FORMAT_VERSION 的结构变化规则。"
+         data-rationale="D 正确（第 4 章）。A 是 UI 面。B 是人类命令。C 是浏览器槽位。查表能力就是把这行找对。"
+         data-review="sec-book-map">
+      <div class="prompt"><span class="qnum">Q9.</span> 查表：你要改会话的持久化格式，入口在哪里？</div>
+      <label class="opt"><input type="radio" name="q-25-9" value="a"> A. ui-slots</label>
+      <label class="opt"><input type="radio" name="q-25-9" value="b"> B. ctx.commands</label>
+      <label class="opt"><input type="radio" name="q-25-9" value="c"> C. conversation.chat.node 渲染器</label>
+      <label class="opt"><input type="radio" name="q-25-9" value="d"> D. SessionEventMap / SESSION_FORMAT_VERSION</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 浏览器 UI 的扩展面是 ui-slots（packages/client/ui-slots）；业务行才走 ConversationNodeDefinition。"
+         data-rationale="B 正确。A 是协议网关。C 是 LLM 供应商接入。D 是工具注册表。"
+         data-review="sec-book-map">
+      <div class="prompt"><span class="qnum">Q10.</span> 查表：给 Web 客户端加一块新的界面区域，先看什么？</div>
+      <label class="opt"><input type="radio" name="q-25-10" value="a"> A. Typert 类型图</label>
+      <label class="opt"><input type="radio" name="q-25-10" value="b"> B. ui-slots（packages/client/ui-slots）</label>
+      <label class="opt"><input type="radio" name="q-25-10" value="c"> C. LlmAdapter</label>
+      <label class="opt"><input type="radio" name="q-25-10" value="d"> D. ctx.tools.register</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-11" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B、C、D。"
+         data-rationale="B/C/D 都是毕业路线的步骤。A 错在起手就改 loop——第 7、23 章反复强调插件不改 loop，新行为上扩展点；毕业第一步是读 architecture.md。"
+         data-review="sec-graduation">
+      <div class="prompt"><span class="qnum">Q11.</span> 毕业路线包含哪些步骤？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="a"> A. 直接改 agent-loop 实现一个新特性</label>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="b"> B. 通读 docs/architecture.md 与 docs/capability-seams.md</label>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="c"> C. 通读 packages/core/agent-loop/src/agent.ts 全文</label>
+      <label class="opt"><input type="checkbox" name="q-25-11" value="d"> D. 跑一遍 pnpm run test:snapshot，再提第一个 PR</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="25-12" data-type="short"
+         data-key-points='["行为类改动上文档化扩展点（事件、注册表），不改 loop","数据/模型可见类改动走新 session event，保证可从日志重建","实现可替换类改动走 provider seam（三角色齐全）","收尾义务：按证据面选检查、同 PR 补 keyless 快照、非平凡改动带 Agent Note"]'
+         data-answer="先用口诀定位：行为上扩展点、数据上事件流、实现上 provider seam——找不到入口通常意味着读错了层，回 docs/architecture.md 找到事实的家。改完按证据面选最小检查集，模型/用户可见变化同 PR 补 keyless 快照，非平凡改动带 Agent Note。"
+         data-rationale="能复述口诀加收尾义务，导航图就长在你身上了。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> 用自己的话说明：接手一个新需求时，你如何用本书的导航方法定位入口并收尾？</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">全书完。回到<a href="index.html"><strong>目录</strong></a>，或去仓库里读 docs/architecture.md 开始你的第一次真实改动。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

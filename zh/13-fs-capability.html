@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 13 章 · 文件系统能力：fs seam 与观测策略 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 13 章 · 文件系统能力</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="13">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 13 章 · 第三部分 · Capability Seams 专题</div>
+    <h1>文件系统能力：fs seam 与观测策略</h1>
+    <p class="lede">
+      模型改文件的每一笔都经过同一条缝：<code>ctx.fs</code>。它是执行世界的文件那一半——
+      十二个存储原语、三个可替换 provider（本机 / 沙箱 / E2B）、一组挂在事件闸门上的观测策略，
+      以及一个四层分明的工具栈。本章除了讲清 seam 本身，还要回答一个更微妙的问题：
+      「先读后写」这类<strong>策略</strong>为什么不做成服务，而做成 <code>fs/*</code> 事件上的伴生插件。
+      读完你能顺着一次 <code>edit</code> 调用，从工具 schema 一路讲到 provider 的原子提交。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能列出 <code>FileSystem</code> 的原语分组（解析身份 / 执行世界坐标 / 读取 / 原子变更）并说出版本守卫为什么是可选的</li>
+      <li>能对比三个 provider：fs-local、fs-sandbox（只围写、读放行）、fs-e2b（远端世界）</li>
+      <li>能解释 <code>fs/*</code> 三个事件的分工，以及 fs-observation-policy 如何用「单槽决策 + 不调 next()」实现先读后写</li>
+      <li>能说明 tool-fs 与 tool-fs-search 为什么一个走 <code>ctx.fs</code>、一个走 <code>ctx.subprocess</code> 里的 ripgrep</li>
+      <li>能描述 str_replace_editor 的编辑模型：view/create/str_replace/insert、唯一字面匹配、无 replace_all</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-fs-seam">13.1 ctx.fs：十二个原语与可选版本守卫</h2>
+
+  <p>
+    <code>FileSystem</code>（<code>ctx.fs</code>，包 <code>dsh-fs</code>）定义「一个执行世界里的存储原语」，
+    不说怎么做。后端子类化它、实现<strong>十二个原语</strong>。按职责分组记最快：
+  </p>
+  <table>
+    <thead><tr><th>分组</th><th>原语</th><th>要点</th></tr></thead>
+    <tbody>
+      <tr><td>身份解析</td><td><code>resolve(path, opts?)</code></td><td>把路径解析成稳定的 <code>FsTarget</code>（不透明 <code>targetKey</code> + <code>displayPath</code>）；同一文件经不同路径到达必须得到同一 <code>targetKey</code>。<code>opts.cwd</code> 是相对路径的基（调用方传会话工作区）。</td></tr>
+      <tr><td>执行世界坐标</td><td><code>processPath</code> / <code>fileUrl</code> / <code>contains</code></td><td>给出「这个世界里的子进程能打开的规范绝对路径」「这个世界的 file: URI」「父子包含判定」——消费者永远不解析 <code>targetKey</code>。</td></tr>
+      <tr><td>元数据</td><td><code>stat</code> / <code>lstat</code> / <code>listDir</code></td><td><code>stat</code> 只回元数据不回内容；<code>lstat</code> 不跟随最后的符号链接（消费者可先拒掉仓库自带的 symlink）；<code>listDir</code> 一层、稳定名序、绝不读内容。</td></tr>
+      <tr><td>读取</td><td><code>readText</code> / <code>streamText</code> / <code>readBytes</code></td><td>文本读负责 UTF-8 解码与二进制/NUL 拒绝（<code>FS_NOT_TEXT</code>）；流式读跨块解码留在 provider；<code>readBytes</code> 的 <code>maxBytes</code> 必填——已知或发现的超限直接 <code>FS_TOO_LARGE</code>，绝不无界缓冲。</td></tr>
+      <tr><td>原子变更</td><td><code>writeText</code> / <code>editText</code></td><td>原子创建/替换与字面编辑；<code>expected</code> 守卫<strong>可选</strong>——省略即无条件，提供则按 <code>createIfAbsent</code> / <code>replaceIfVersion</code> / <code>{ version }</code> 做 CAS。变更总在后端的每目标锁内，无条件也只是去掉版本前置条件，不去掉原子性。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    这个包同时拥有 <code>fs/*</code> 策略事件词汇——这一点放到 13.3 展开。整条 seam 的姿态被 README
+    概括为「fsspec 风格的存储原语，比字节级 <code>cat</code>/<code>open</code> 高半级」：
+    <strong>单独挂上 <code>ctx.fs</code>，它就是一个完整、无约束的存储缝</strong>；策略是后来叠上去的一层。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">为什么版本守卫是可选的</div>
+    <p>
+      因为「无策略的裸 provider」是合法形态。守卫参数的缺席不是「忘了」，
+      而是契约的一部分：省略 = 无条件创建或覆盖。策略插件（13.3）的职责恰恰是<strong>把守卫填进来</strong>——
+      它把「这个 agent 观察到什么版本」转换成 provider 的 CAS 前置条件。
+      分层由此成立：provider 管原子性与一致性，策略管授权逻辑。
+    </p>
+  </div>
+
+  <h2 id="sec-fs-providers">13.2 三个 provider：local、sandbox、e2b</h2>
+
+  <p>
+    <code>fs-local</code>（<code>LocalFileSystem</code>）是本机实现，也是另外两家的基座：
+  </p>
+  <ul>
+    <li><strong>身份</strong>：<code>targetKey</code> 是文件的 <code>realpath</code>——两条路径经符号链接到达同一文件即同一身份，写入落在链接目标上（保留链接）。版本是 <code>dev:ino:size:mtimeNs:ctimeNs</code> 派生的不透明令牌。</li>
+    <li><strong>原子写</strong>：在目标旁的私有 staging 目录里以 <code>wx</code>（<code>0o600</code>）独占建临时文件，fsync 后发布；已有文件的 mode 被保留，Windows 上替换走 <code>ReplaceFileW</code> 保住原 DACL。<code>createIfAbsent</code> 用硬链接做「原子不替换发布」——初始探测之后并发出现的文件被保留并以 <code>FS_NOT_OBSERVED</code> 拒绝。</li>
+    <li><strong>字面编辑</strong>：同一原语上的原子读-改-写，按目标串行；LF 规范化匹配、按文件主流 CRLF/LF 风格写回；空 <code>oldString</code>、零匹配（<code>FS_EDIT_NOT_FOUND</code>）、无 <code>replace_all</code> 的多匹配（<code>FS_AMBIGUOUS_EDIT</code>）都拒绝。</li>
+  </ul>
+
+  <p>
+    <code>fs-sandbox</code>（<code>SandboxedFileSystem</code>）继承 local 的<strong>全部</strong>机制，
+    只在 <code>writeText</code>/<code>editText</code> 上加一道每调用模式围栏：
+    <code>read-only</code> 拒绝一切变更（结构化 <code>FS_SANDBOX_DENIED</code>）；<code>workspace-write</code>
+    只允许目标规范化后落在可写根内——工作区根加平台临时区，与 Seatbelt 配置文件<strong>同一个
+    <code>writableRoots</code> 函数</strong>派生，fs 围栏与 bash runner 因此不会漂移；
+    <code>danger-full-access</code> 直接放行。<strong>读永远放行</strong>——所有模式都允许读。
+    它加载时替换 fs-local 即完成切换，模型工具一行不改。
+  </p>
+
+  <p>
+    <code>fs-e2b</code> 把同一份契约落在第 12 章的远端世界：相对路径按 <code>ctx.e2b.cwd</code> 解析、
+    GNU <code>realpath -mz</code> 供规范身份、写经 staging 目录 + 同文件系统原子 rename 发布。
+    它不复制、不挂载、不同步宿主工作区——给 <code>cwd</code> 一个宿主路径只会造出同名远端目录。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">威胁模型：策略围栏，不是内核边界</div>
+    <p>
+      fs-sandbox README 特意声明：这道围栏是<strong>可信代码里的一次检查，检查对象是模型控制的路径</strong>。
+      操作本身（open、rename）是 seam 自己的，只有目标路径不可信，所以「规范化再判包含」就是完整答案；
+      写前原地再规范化收窄了残留 TOCTOU。对抗性代码的内核级隔离是 <code>ctx.shell</code> 沙箱路线的职责
+      （第 12 章）——两家用同一份 <code>sandboxPolicy</code>，但机制与威胁模型不同。
+    </p>
+  </div>
+
+  <h2 id="sec-observation-policy">13.3 观测策略：挂在 fs/* 事件闸门上</h2>
+
+  <p>
+    「谁在读写什么、写之前读过没有」是产品策略，不是存储原语。dsh 的解法是
+    <strong>四层栈</strong>：工具/执行器（<code>tool-fs</code>）→ 策略（<code>fs-observation-policy</code>）
+    → provider 契约（<code>dsh-fs</code>）→ provider（<code>fs-local</code> 等）。
+    策略层<strong>没有服务</strong>：它不注册 <code>ctx.fsPolicy</code>，工具也不注入它——
+    它只注册 <code>fs/*</code> 事件的三个监听器，而事件词汇归 Definition 所有。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="fs seam 与事件闸门">
+      <rect x="20" y="15" width="660" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="350" y="36" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">工具层（Consumer）</text>
+      <text x="350" y="54" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool-fs（read · write · edit · read_image）· tool-str-replace-editor · tool-fs-search</text>
+
+      <line x1="240" y1="63" x2="240" y2="88" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,91 236,83 244,83" style="fill:var(--muted)"/>
+
+      <rect x="90" y="95" width="300" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="240" y="118" text-anchor="middle" style="fill:var(--accent)" font-size="12.5" font-weight="700">ctx.fs（Service Definition）</text>
+      <text x="240" y="138" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">十二原语 + fs/* 事件词汇的所有者</text>
+
+      <rect x="430" y="95" width="250" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="555" y="118" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">fs-observation-policy</text>
+      <text x="555" y="138" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">伴生插件：只注册 fs/* 监听器，无服务</text>
+
+      <line x1="393" y1="124" x2="427" y2="124" style="stroke:var(--warn)" stroke-width="1.8" stroke-dasharray="5 4"/>
+      <polygon points="430,124 422,120 422,128" style="fill:var(--warn)"/>
+      <text x="410" y="112" text-anchor="middle" style="fill:var(--warn)" font-size="10">fs/* 事件闸门</text>
+
+      <line x1="240" y1="153" x2="240" y2="178" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,181 236,173 244,173" style="fill:var(--muted)"/>
+
+      <rect x="20" y="185" width="660" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="350" y="206" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Provider（实现 ctx.fs）</text>
+      <text x="350" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">fs-local（本机） · fs-sandbox（写围栏，继承 local） · fs-e2b（远端，共享 ctx.e2b）</text>
+
+      <line x1="555" y1="63" x2="555" y2="88" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="555,91 551,83 559,83" style="fill:var(--muted)"/>
+      <text x="555" y="80" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">绕过 ctx.fs：经 ctx.subprocess spawn 打包的 rg</text>
+
+      <text x="350" y="262" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">卸下策略插件：工具不坏，落回无约束的裸 provider；装回来，策略重新生效——事件闸门的意义</text>
+    </svg>
+    <figcaption>fs 四层栈：策略不注入服务，只挂在 Definition 拥有的 fs/* 事件闸门上；搜索工具绕开 ctx.fs 直连 subprocess。</figcaption>
+  </figure>
+
+  <p>三个事件（由 <code>dsh-fs</code> 声明、<code>tool-fs</code> 派发、策略插件倾听）：</p>
+  <table>
+    <thead><tr><th>事件</th><th>形态</th><th>fs-observation-policy 的监听器做什么</th></tr></thead>
+    <tbody>
+      <tr><td><code>fs/write-intent</code></td><td>单槽决策 waterfall</td><td>未观察/观察到缺席 → <code>{ kind: 'createIfAbsent' }</code>；观察到存在 → <code>{ kind: 'replaceIfVersion', version }</code>。<strong>完全决策，不调 <code>next()</code></strong>。</td></tr>
+      <tr><td><code>fs/edit-intent</code></td><td>单槽决策 waterfall</td><td>未观察 → <code>FS_NOT_OBSERVED</code>；观察到缺席 → <code>FS_NOT_FOUND</code>；观察到存在 → <code>{ version }</code> 作为 CAS 基准。同样不调 <code>next()</code>。</td></tr>
+      <tr><td><code>fs/observed</code></td><td>fire-and-forget 记录</td><td>记下 <code>{ kind: 'present', version }</code> 或 <code>{ kind: 'absent' }</code>——同步、只做副作用的 <code>WeakMap.set</code>。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    观测状态是「先前观察记录」：owner 到目标的弱映射，三态（未观察 / 确认缺席 / 存在于某版本）。
+    成功的读或变更记录「存在」；<code>read</code> 或 <code>str_replace_editor</code> 的 <code>view</code>/<code>str_replace</code>/<code>insert</code>
+    碰到元数据 miss 先记「缺席」再返回 <code>FS_NOT_FOUND</code>。策略自身<strong>不做任何文件 I/O</strong>——
+    它只把观察状态换算成 provider 守卫：存在就供版本，缺席就只放行 <code>createIfAbsent</code>，
+    编辑没有版本基准就直接 <code>FS_NOT_FOUND</code>。窗口化的读观察的是<strong>整个文件</strong>的版本，
+    所以之后的定向编辑只在文件未变期间被允许。
+  </p>
+
+  <div class="demo" data-demo="fsPolicyGate">
+    <div class="demo-title">试一试 —— fs 策略闸门</div>
+    <p>输入一个路径（试试 /repo/src/a.ts、/repo/.env、/etc/passwd）：</p>
+    <input type="text" placeholder="/repo/src/a.ts">
+    <div class="demo-output empty">输入路径。</div>
+  </div>
+
+  <p>
+    「单槽、先注册先得」是刻意的：<code>fs/write-intent</code>/<code>fs/edit-intent</code> 槽位恰容纳一个决策者，
+    本插件占位是默认部署约定而非事件强制的硬性不变量。它<strong>不是</strong>可组合的授权链——
+    分层权限、审计、沙箱拦截属于 <code>tools/execute</code> 管道（第 8 章）。
+    而事件闸门换来的最大红利是<strong>优雅装卸</strong>：策略只经事件影响世界，移除它不会让
+    <code>tool-fs</code> 在服务注入边界上坏掉——工具落回裸 provider（无条件写/编辑、无观测状态），
+    再装回来策略重新叠上。装了 <code>tool-fs</code> 的部署<strong>预期</strong>同时装上它，
+    于是默认行为是先读后写。
+  </p>
+
+  <h2 id="sec-fs-tools">13.4 工具家族：tool-fs 与 tool-fs-search</h2>
+
+  <p>
+    <code>tool-fs</code> 是模型面的读写层：<code>read</code> / <code>read_image</code> / <code>write</code> / <code>edit</code>
+    四个工具<strong>加上执行器本身</strong>。它拥有工具名、schema、参数校验、prompt section、
+    读窗口化（<code>readLimit</code> 默认 2000 行、每行 <code>readMaxLineLength</code> 2000 字符、
+    <code>readMaxBytes</code> 51200 字节）与结果格式化。每次调用的执行序列（README 标了 stat 次数）：
+  </p>
+  <ul>
+    <li><code>read</code>：<code>resolve</code>（传会话 cwd）→ 一次 <code>stat</code>（类型、大小路由、版本）→ <code>readText</code>/<code>streamText</code> → 组行窗口 → <code>ctx.emit('fs/observed')</code>。</li>
+    <li><code>write</code>：<code>resolve</code> → <code>ctx.waterfall('fs/write-intent', …)</code> 拿可选守卫 → <code>writeText(target, content, intent)</code> → <code>fs/observed</code>。（0 stat。）</li>
+    <li><code>edit</code>：<code>resolve</code> → <code>ctx.waterfall('fs/edit-intent', …)</code> → <code>editText(target, edit, intent)</code> → <code>fs/observed</code>。（0 stat。）</li>
+    <li><code>read_image</code>：只在挂了持久 <code>ctx.attachments</code> 且当前路由模型声明图片输入时注册；经有界 <code>readBytes</code> 读 PNG/JPEG/WebP/GIF，经 <code>attachments.saveImage</code> 提交，返回图片块。</li>
+  </ul>
+
+  <p>
+    工具把 <code>exec</code>（工具执行上下文）作为不透明 <code>actor</code> 随每次派发传递——
+    事件里只有 <code>dsh-fs</code> 词汇加不透明 actor，没有模型面概念，也没有 agent/session 归属结构。
+    挂了围栏 provider（<code>ctx.fs.sandboxMode</code> 报告约束）时，write/edit 同样广告
+    <code>sandbox_permissions</code> + <code>justification</code> 升级面，机制与第 12 章 bash 完全同构。
+  </p>
+
+  <p>
+    <code>tool-fs-search</code> 是刻意的<strong>例外</strong>：<code>glob</code> / <code>grep</code>
+    两个发现工具不走 <code>ctx.fs</code> 原语，而是把打包的 <code>@vscode/ripgrep</code> 二进制经
+    <code>ctx.subprocess</code> spawn（<code>--no-config</code> 前置，防宿主 <code>RIPGREP_CONFIG_PATH</code>
+    注入 <code>--pre</code>；模型控制的值都是普通 argv 元素，无 shell 层故无引号问题）。
+    理由写在 README 里：本地工作区发现天然是进程化的 <code>rg</code> 工作流，
+    把搜索放上 <code>ctx.fs</code> 会逼<strong>每个</strong>文件系统后端长出搜索 API。
+    注意它注入 <code>subprocess</code> 而不注入 <code>fs</code>——远端执行世界下的搜索需要工作区同置（co-located）才对模型有意义。
+  </p>
+
+  <h2 id="sec-str-replace-editor">13.5 str_replace_editor：模型改文件的主力编辑器</h2>
+
+  <p>
+    <code>dsh-tool-str-replace-editor</code> 提供独立的 <code>str_replace_editor</code> 工具——
+    可以与持久 bash、一次性 bash、沙箱 bash 或其他终端面自由组合。它的 schema 是四个命令：
+  </p>
+  <table>
+    <thead><tr><th>命令</th><th>行为</th></tr></thead>
+    <tbody>
+      <tr><td><code>view</code></td><td>文件视图用一基行号并<strong>原样保留 tab</strong>——显示出来的文本就是合法的字面替换输入；目录视图省略隐藏、依赖与 Python 缓存条目，向下两级。</td></tr>
+      <tr><td><code>create</code></td><td>建新文件。</td></tr>
+      <tr><td><code>str_replace</code></td><td>替换一段字面文本：要求<strong>恰好一次唯一匹配</strong>，零次或多次匹配都报错，且错误只用公开的 <code>old_str</code> 词汇表述。<strong>没有 <code>replace_all</code> 参数</strong>。</td></tr>
+      <tr><td><code>insert</code></td><td>沿选定的零基插入边界插入，不添加隐式行尾换行。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    编辑模型的取向很清楚：<strong>精确优于宽松</strong>。没有正则、没有 replace-all、
+    编辑区外的 tab 原样保留、匹配以显示文本为准——这些约束共同保证「模型看到什么就能替换什么」，
+    一次 <code>view</code> 的输出就是下一次 <code>str_replace</code> 的合法输入。
+    元数据 miss 会先记「确认缺席」再返回 <code>FS_NOT_FOUND</code>，所以外部删除过的路径可以用
+    <code>create</code> 经挂载策略的守卫式建文件恢复；但缺席<strong>不授权</strong> <code>str_replace</code> 或 <code>insert</code>。
+  </p>
+
+  <p>
+    它不是旁路：每一次变更都走 <code>fs/write-intent</code> 或 <code>fs/edit-intent</code>，
+    解析当前会话沙箱策略，把强制执行委托给挂载的文件系统与策略插件。
+    换句话说，str_replace_editor 是「编辑模型」的拥有者，而原子性、版本守卫、沙箱围栏
+    全部来自 13.1–13.3 的那台机器——这正是 seam 分层的收益：编辑器换掉，策略照常工作；
+    provider 换掉，编辑器照常工作。
+  </p>
+
+  <h2 id="sec-recap">13.6 本章回顾</h2>
+  <ul>
+    <li><code>ctx.fs</code> 十二原语分五组：身份解析、执行世界坐标、元数据、读取、原子变更；版本守卫可选——省略即无条件，原子性永在。</li>
+    <li>三个 provider：fs-local（realpath 身份、staging + 原子发布、DACL 保留）、fs-sandbox（只围写、读放行、<code>FS_SANDBOX_DENIED</code>、与 Seatbelt 共享 <code>writableRoots</code>）、fs-e2b（远端世界、无宿主同步）。</li>
+    <li>策略不是服务：<code>fs-observation-policy</code> 只挂 <code>fs/*</code> 事件闸门——两个单槽决策 waterfall（不调 <code>next()</code>）+ 一个 fire-and-forget 记录事件；装卸优雅，工具永不在注入边界坏掉。</li>
+    <li>观测状态 = 先前观察记录；窗口化读观察整文件版本；「先读后写」由观察记录换算成 provider CAS 守卫。</li>
+    <li><code>tool-fs</code> 是工具兼执行器（read/write/edit/read_image + 窗口化 + <code>fs/*</code> 派发）；<code>tool-fs-search</code> 刻意绕开 ctx.fs，用打包 ripgrep 经 <code>ctx.subprocess</code>。</li>
+    <li><code>str_replace_editor</code>：view/create/str_replace/insert，唯一字面匹配、无 replace-all、tab 保留，变更全部经 <code>fs/*</code> 闸门。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>给 <code>ctx.fs</code> 加搜索方法——搜索是 rg 工作流，放进 provider 契约会逼每个后端实现一遍。</li>
+      <li>把观测策略当授权链往 <code>fs/*</code> 上再叠一层决策者——槽是单槽、先注册先得；分层拦截属于 <code>tools/execute</code>。</li>
+      <li>期望观测状态跨会话存活——<code>WeakMap</code> 是进程内弱引用，resume 后要重新 <code>read</code>。</li>
+      <li>以为 fs-sandbox 围住了读——所有模式读放行，围栏只在 <code>writeText</code>/<code>editText</code> 上。</li>
+      <li>给 str_replace_editor 找 replace_all——故意没有；多匹配是错误，模型应换更长的锚文本。</li>
+      <li>以为 <code>readBytes</code> 会截断——<code>maxBytes</code> 必填，超限直接 <code>FS_TOO_LARGE</code>，从不无界缓冲。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="13">
+    <h2>第 13 章测验</h2>
+
+    <div class="q" data-id="13-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— resolve 返回稳定 FsTarget（不透明 targetKey + displayPath）；同一文件经不同路径必须得到同一 targetKey。"
+         data-rationale="B 正确。A 错——spec 里没有 path 字段，路径解析成 target 后才执行。C 错——processPath 才给出子进程可开的规范路径，targetKey 刻意不透明。D 错——lstat 不跟随最后的符号链接，正是为了让消费者能拒掉 symlink。"
+         data-review="sec-fs-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>ctx.fs.resolve(path, opts)</code> 的产物与身份规则是？</div>
+      <label class="opt"><input type="radio" name="q-13-1" value="a"> A. 一个字符串路径，直接当 spec.path 用</label>
+      <label class="opt"><input type="radio" name="q-13-1" value="b"> B. 稳定的 FsTarget：不透明 targetKey + displayPath；同一文件不同路径同 key</label>
+      <label class="opt"><input type="radio" name="q-13-1" value="c"> C. 一个可直接被子进程打开的绝对路径</label>
+      <label class="opt"><input type="radio" name="q-13-1" value="d"> D. 解析后的符号链接目标列表</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 省略 expected 的 write/edit 仍走后端每目标锁，是无条件的原子变更；可选去掉的只是版本前置条件。"
+         data-rationale="C 正确。A 错——守卫缺席是契约明确定义的合法形态（裸 provider）。B 错——无守卫时 create 与 overwrite 都允许。D 错——原子性从不取决于守卫。"
+         data-review="sec-fs-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> 省略 writeText/editText 的 expected 守卫意味着什么？</div>
+      <label class="opt"><input type="radio" name="q-13-2" value="a"> A. 调用被拒绝：守卫是必需参数</label>
+      <label class="opt"><input type="radio" name="q-13-2" value="b"> B. 只能创建新文件，不能覆盖</label>
+      <label class="opt"><input type="radio" name="q-13-2" value="c"> C. 无条件的原子变更——去掉的是版本前置条件，不是原子性</label>
+      <label class="opt"><input type="radio" name="q-13-2" value="d"> D. 提交延后到 dispose 时批量落盘</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A、C、D 正确：fs-sandbox 只在 writeText/editText 上加模式围栏，读全部放行；可写根与 Seatbelt 配置同出一个 writableRoots 函数。B 错——拒绝是结构化 FsError（FS_SANDBOX_DENIED），进程内围栏知道自己拒了什么，无需像 bash 那样从 stderr 方言推断。"
+         data-review="sec-fs-providers">
+      <div class="prompt"><span class="qnum">Q3.</span> 关于 fs-sandbox，下列哪些说法成立？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="a"> A. 它继承 LocalFileSystem 的全部机制，只在变更两个原语上加每调用围栏</label>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="b"> B. read-only 模式下读取也需要先经过围栏检查</label>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="c"> C. 可写根集与 Seatbelt 配置出自同一个 writableRoots 函数，fs 与 bash 不会围到不同根</label>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="d"> D. 拒绝以结构化 FS_SANDBOX_DENIED 报告，不做 stderr 文本推断</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 因为策略经事件闸门参与而非方法注入：移除它工具只是落回无约束裸 provider，不会在注入边界坏掉。"
+         data-rationale="B 正确：这就是事件闸门相对强制方法服务的意义（README: graceful add/remove is the whole point）。A 错——工具照常工作，只是无条件写/编辑。C 错——完全相反。D 错——读窗口化与渲染都是工具自己的职责，与策略无关。"
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q4.</span> 从组合里卸掉 fs-observation-policy（保留 tool-fs 与 fs-local）会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-13-4" value="a"> A. tool-fs 注册失败，工具消失</label>
+      <label class="opt"><input type="radio" name="q-13-4" value="b"> B. 工具照常工作，落回裸 provider：无条件写/编辑、无观测状态</label>
+      <label class="opt"><input type="radio" name="q-13-4" value="c"> C. 全部写操作被拒绝，直到重新装回策略</label>
+      <label class="opt"><input type="radio" name="q-13-4" value="d"> D. read 工具失去行窗口化能力</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-5" data-type="fill"
+         data-accepted='["FS_NOT_OBSERVED","fs_not_observed","not_observed"]'
+         data-answer="FS_NOT_OBSERVED（edit requires reading … first）。"
+         data-rationale="未观察目标上的 edit-intent 槽抛 FS_NOT_OBSERVED；工具层错误包装附上恢复指引「read the file, then retry」。观察到缺席则报 FS_NOT_FOUND——两个码语义不同，分别对应「从没读过」与「读过但确认不在」。"
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：模型对一个从未读过的文件直接发起 edit，fs/edit-intent 决策者抛出的错误码是 ______。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— fs/write-intent 与 fs/edit-intent 是单槽决策 waterfall，监听者完全决策、从不调 next()；fs/observed 是 fire-and-forget。"
+         data-rationale="D 正确。A 错——恰恰相反，waterfall 监听者必须调 next() 才是第 2 章的通用规则，单槽决策是这里的例外形态（完全决策者）。B 错——事件词汇归 dsh-fs，tool-fs 只是派发者。C 错——fs/observed 在操作成功之后发，同步副作用式记录。"
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q6.</span> fs/write-intent 与 fs/edit-intent 的 waterfall 语义有什么特别之处？</div>
+      <label class="opt"><input type="radio" name="q-13-6" value="a"> A. 它们是普通瀑布：监听者必须调 next() 委托给下一个</label>
+      <label class="opt"><input type="radio" name="q-13-6" value="b"> B. 它们由 fs-observation-policy 声明，tool-fs 倾听</label>
+      <label class="opt"><input type="radio" name="q-13-6" value="c"> C. 它们必须发出 fs/observed 之后才能决策</label>
+      <label class="opt"><input type="radio" name="q-13-6" value="d"> D. 单槽决策：监听者完全决策、不调 next()，槽位先注册先得</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 搜索经 ctx.subprocess spawn 打包的 @vscode/ripgrep；把搜索放上 ctx.fs 会逼每个后端长搜索 API。"
+         data-rationale="A 正确且理由正是 README 原话。B 错——它注入 subprocess（和 tools/systemPrompt），刻意不注入 fs。C 错——二进制随 npm 依赖打包，注册无条件、无需可用性探测。D 错——timeoutMs 是协作预算，经 exec.signal 由 tool-call-timeout-policy 强制，subprocess 的 terminate 升级是硬杀。"
+         data-review="sec-fs-tools">
+      <div class="prompt"><span class="qnum">Q7.</span> glob/grep 为什么不走 ctx.fs 原语？</div>
+      <label class="opt"><input type="radio" name="q-13-7" value="a"> A. 本地发现天然是进程化 rg 工作流；放上 provider 契约会逼每个文件系统后端实现搜索 API</label>
+      <label class="opt"><input type="radio" name="q-13-7" value="b"> B. 因为 ctx.fs 没有列出目录的原语</label>
+      <label class="opt"><input type="radio" name="q-13-7" value="c"> C. 因为 ripgrep 需要宿主安装并做加载期探测</label>
+      <label class="opt"><input type="radio" name="q-13-7" value="d"> D. 因为搜索没有超时保护，只能在工具层做</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-8" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B、C、D。"
+         data-rationale="B、C、D 正确：read_image 要求 ctx.attachments 与声明图片输入的路由模型；tool-fs 的字段是 snake_case；read 默认且上限 2000 行。A 错——write/edit 走 0 次 stat，守卫来自事件闸门的观察记录，不必现场探测。"
+         data-review="sec-fs-tools">
+      <div class="prompt"><span class="qnum">Q8.</span> 关于 tool-fs 的执行器，哪些说法成立？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="a"> A. write 与 edit 每次先做一次 stat 探测版本</label>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="b"> B. read_image 只在挂了 ctx.attachments 且路由模型声明图片输入时注册</label>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="c"> C. 工具参数字段名用 snake_case（file_path 等）对齐既有工具 schema</label>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="d"> D. read 一次调用默认最多返回 2000 行（readLimit 兼为上限）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 它要求唯一字面匹配、拒绝零/多匹配且没有 replace_all；view 的输出就是合法的替换输入。"
+         data-rationale="C 正确：这是编辑模型的刻意取向。A 错——没有 replace_all，多匹配是错误。B 错——view 保留 tab，保证显示文本即字面输入。D 错——变更照走 fs/write-intent / fs/edit-intent，策略与围栏照常生效。"
+         data-review="sec-str-replace-editor">
+      <div class="prompt"><span class="qnum">Q9.</span> str_replace_editor 的编辑模型核心是？</div>
+      <label class="opt"><input type="radio" name="q-13-9" value="a"> A. 正则替换，支持 replace_all 批量</label>
+      <label class="opt"><input type="radio" name="q-13-9" value="b"> B. view 输出会把 tab 展开为空格以便匹配</label>
+      <label class="opt"><input type="radio" name="q-13-9" value="c"> C. 唯一字面匹配：零/多匹配都报错、无 replace_all，一次 view 的文本即下次替换的合法输入</label>
+      <label class="opt"><input type="radio" name="q-13-9" value="d"> D. 它绕过 fs/* 闸门直接调 provider，换取速度</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 观测状态是进程内 WeakMap，不跨会话持久；恢复的会话必须重新 read 才能获得守卫基准。"
+         data-rationale="B 正确（README: Observed state does not survive a session resume——持久化被明确推迟）。A 反了：窗口化读观察整文件版本，授权后续的定向编辑。C 错：直接 ctx.fs 读不派发 fs/observed，之后 guarded edit 仍 FS_NOT_OBSERVED。D 错：授权的是版本新鲜度，不是视图完整性——任何窗口读都授权整文件覆盖（若未变）。"
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q10.</span> 会话经持久化恢复后，模型直接对昨天读过的文件发起 edit，结果如何？</div>
+      <label class="opt"><input type="radio" name="q-13-10" value="a"> A. 正常执行：观察记录持久化在会话日志里</label>
+      <label class="opt"><input type="radio" name="q-13-10" value="b"> B. FS_NOT_OBSERVED：观察状态是进程内弱映射，resume 后要先重新 read</label>
+      <label class="opt"><input type="radio" name="q-13-10" value="c"> C. 正常执行：窗口化读授权的是整个文件，与进程边界无关</label>
+      <label class="opt"><input type="radio" name="q-13-10" value="d"> D. FS_STALE_VERSION：版本令牌在重启后必然失效</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-11" data-type="fill"
+         data-accepted='["createIfAbsent","createifabsent","create_if_absent"]'
+         data-answer="createIfAbsent（无替换发布的原子建文件）。"
+         data-rationale="未观察或确认缺席时，write-intent 决策者解析为 createIfAbsent：发布走原子 no-replace 路径（local 用硬链接 staging 文件），初始探测之后并发出现的文件被保留而非覆盖。replaceIfVersion 是已观察到存在时的选择。"
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q11.</span> 填空：对一个从未观察过（或确认缺席）的目标发起 write，策略把守卫解析为 { kind: ______ }。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-12" data-type="short"
+         data-key-points='["四层栈：tool-fs（工具+执行器）→ fs-observation-policy（策略）→ dsh-fs（契约+事件词汇）→ provider（local/sandbox/e2b）","策略无服务：只挂 fs/* 事件闸门（两个单槽决策 + 一个 fire-and-forget 记录），装卸优雅","版本守卫可选：观测状态换算成 provider CAS 前置条件，先读后写由此实现","搜索例外：tool-fs-search 经 ctx.subprocess spawn 打包 ripgrep，不给 provider 加搜索 API","str_replace_editor 的唯一字面匹配编辑模型，变更仍走 fs/* 闸门"]'
+         data-answer="按四层栈作答：工具层拥有 schema 与读窗口化并派发 fs/* 事件；策略层无服务、只挂事件闸门，把观测记录（未观察/缺席/存在版本）换算成 createIfAbsent、replaceIfVersion 或拒绝；契约层拥有十二原语与事件词汇；provider 层可换 local/sandbox/e2b。搜索工具是例外，走 subprocess+ripgrep。str_replace_editor 提供唯一字面匹配的编辑模型，同样经闸门。"
+         data-rationale="四层栈 + 事件闸门 + 可选守卫是本章的脊柱；能复述它们，第 12 章的执行世界与本章的文件世界就拼成了完整平面。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> 用自己的话讲一遍文件栈的四层分工，以及「先读后写」是如何在不给 provider 加策略方法的前提下实现的。</div>
+      <textarea class="short" placeholder="你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正覆盖了某个要点才勾选它——少选伤害校准，多选只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="14-subagents.html"><strong>第 14 章 · 委派与子代理</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

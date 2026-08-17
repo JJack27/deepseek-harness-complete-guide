@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 15 章 · 上下文压力管理：compaction、spill、context 插件 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 15 章 · 上下文压力</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="15">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 15 章 · 第三部分 · Capability Seams 专题</div>
+    <h1>上下文压力管理：compaction、spill、context 插件</h1>
+    <p class="lede">
+      第 7 章的 turn/step 循环假设每个请求都装得下全部历史——但上下文窗口是有限的，
+      而一次 <code>bash</code> 输出、一次网页抓取就能瞬间塞满它。dsh 用三道闸回答这个问题：
+      <strong>spill</strong> 在结果产生时就外置超大输出，<strong>pruner</strong> 在压力触发时修剪工具结果，
+      <strong>compaction</strong> 在仍然超压时把旧历史摘要成 checkpoint。本章逐个拆开这三道闸，
+      并补上压力视角下的最后一环：排队等准入的 <code>agent.inject()</code> 注入。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能画出三道闸的触发时机与代价排序：spill（结果产生时）、pruner（压力触发后、选区之前）、compaction（摘要替换）</li>
+      <li>能解释 compaction 的表面契约——为什么唯一的表面变更是带 <code>surfaceOp: replace</code> 的 <code>user/message</code>，而 <code>compaction/*</code> 事件全部 log-only</li>
+      <li>能配置 <code>dsh-compaction-basic</code> 的阈值与保留策略（<code>thresholdRatio</code> / <code>retainRatio</code> / <code>modelPolicies</code>），并说明摘要调用如何复用 KV 缓存</li>
+      <li>能区分 pruner 的「修剪」与 spill 的「外置」：一个改写表面节点，一个把全文移出上下文只留 locator</li>
+      <li>能说出 <code>/compact</code> 是人类命令而非模型工具，以及 <code>agent.inject()</code> 的排队与准入语义</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-problem">15.1 问题：窗口有限，工具结果瞬间塞满</h2>
+
+  <p>
+    上下文窗口是模型一次请求能看到的全部：系统提示、工具 schema、路由信息、assistant 完成、
+    工具结果、缓冲中的上下文和 steering。第 9 章你看到系统提示怎么装配；第 8 章你看到工具结果
+    怎么落进 <code>tool/result</code> 表面事件。把它们放在一起就出现一个工程问题：
+    <strong>历史是单调增长的，而窗口不是</strong>。一次不带限制的 <code>grep -r</code>、
+    一次抓取完整网页、一份巨大的测试输出，都可以在一个 step 之内把后续请求挤爆。
+  </p>
+
+  <p>
+    dsh 的答案不是给 agent-loop 加分支，而是三个各自独立的插件家族，挂在现有的扩展点上：
+  </p>
+  <ul>
+    <li>
+      <code>packages/spill/</code>——<strong>spill</strong>：在工具结果产生时（<code>tools/post-execute</code>）
+      把超大纯文本结果外置到 storage，模型上下文里只留有界预览加 locator（定位符）。
+    </li>
+    <li>
+      <code>packages/compaction/compaction-tool-result-pruner/</code>——<strong>pruner</strong>：
+      压力触发之后、选择摘要区间之前，把超预算的 <code>tool/result</code> 表面节点改写成
+      「开头 + 省略标记 + 结尾」。
+    </li>
+    <li>
+      <code>packages/compaction/</code>（其余三包）——<strong>compaction</strong>：
+      把较旧的历史区间摘要成一个 checkpoint 消息，替换掉被遮蔽的区间。
+    </li>
+  </ul>
+
+  <p>
+    三者的分工边界写进了组 README 的角色表：测量（这次请求到底多大）属于 LLM 家族的
+    <code>ctx.tokenMeter</code>，不属于任何一个闸门；spill 只管存储与定位（不管保留策略、不管取回 API）；
+    compaction 只管「何时算太大」与「怎么摘要」的契约，具体策略由后端实现。这是第 11 章
+    capability seam 方法论的一次成组应用。
+  </p>
+
+  <h2 id="sec-three-gates">15.2 三道闸：时机与代价</h2>
+
+  <p>
+    把三个家族放进同一个工具结果的生命周期里，顺序就清楚了。
+    <strong>闸 1（spill）是预防闸</strong>：它在 <code>tools/post-execute</code> 拦截最终结果，
+    超过 <code>maxInlineBytes</code> 的纯文本在进入上下文之前就被外置——大输出根本不会进窗口。
+    <strong>闸 2（pruner）和闸 3（compaction）是响应闸</strong>：只有当 <code>ctx.tokenMeter</code>
+    报告的压力越过阈值（或 provider 确认了窗口溢出），pruner 才先修剪超预算的工具结果，
+    重新测量；仍超压时 compaction 才做摘要替换。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 660 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="上下文压力三道闸">
+      <rect x="30" y="40" width="180" height="58" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="120" y="63" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">工具执行</text>
+      <text x="120" y="82" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">tools/post-execute</text>
+
+      <line x1="120" y1="98" x2="120" y2="128" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="120,131 116,123 124,123" style="fill:var(--muted)"/>
+
+      <rect x="30" y="131" width="180" height="58" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="120" y="154" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">上下文窗口累积</text>
+      <text x="120" y="173" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">surface · ctx.tokenMeter 测量</text>
+
+      <line x1="120" y1="189" x2="120" y2="219" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="120,222 116,214 124,214" style="fill:var(--muted)"/>
+
+      <rect x="30" y="222" width="180" height="58" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="120" y="245" text-anchor="middle" style="fill:var(--warn)" font-size="13" font-weight="700">压力触发</text>
+      <text x="120" y="264" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">agent/pre-step · agent/request-error</text>
+
+      <rect x="320" y="30" width="310" height="78" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="475" y="54" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">闸 1 · spill（预防）</text>
+      <text x="475" y="73" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">超大纯文本结果外置到 storage</text>
+      <text x="475" y="89" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">上下文只留有界预览 + locator · 零模型调用</text>
+
+      <line x1="210" y1="69" x2="316" y2="69" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="319,69 311,65 311,73" style="fill:var(--muted)"/>
+
+      <rect x="320" y="214" width="310" height="66" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="475" y="238" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">闸 2 · pruner（修剪）</text>
+      <text x="475" y="257" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">超预算 tool/result 改写为 head + 标记 + tail</text>
+      <text x="475" y="272" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">原始事件保留在日志 · 零模型调用</text>
+
+      <line x1="210" y1="251" x2="316" y2="251" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="319,251 311,247 311,255" style="fill:var(--muted)"/>
+
+      <rect x="320" y="290" width="310" height="62" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="475" y="313" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">闸 3 · compaction（摘要）</text>
+      <text x="475" y="332" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">一次辅助 llm.stream 调用，旧区间替换成 checkpoint</text>
+      <text x="475" y="346" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">checkpoint 回到表面，窗口重新可写</text>
+
+      <line x1="475" y1="280" x2="475" y2="287" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="475,290 471,282 479,282" style="fill:var(--muted)"/>
+      <text x="500" y="288" style="fill:var(--fg-dim)" font-size="10">仍超阈值</text>
+    </svg>
+    <figcaption>三道闸：spill 在结果产生时预防；pruner 与 compaction 在压力触发后依次响应。先零调用，后一次辅助调用。</figcaption>
+  </figure>
+
+  <p>
+    这个排序也是<strong>代价经济学</strong>：spill 和 pruner 都不调用模型——一个换存储，
+    一个做纯文本切片；compaction 要付一次辅助 <code>llm.stream()</code> 调用，还要使被替换区间的
+    KV 缓存失效。所以仓库把它们排成「越贵越靠后」：pruner 修剪后如果重新测量已经低于压力，
+    compaction-basic 会直接跳过摘要。反过来，有些情况三道闸都无能为力：compaction 的 README 明说，
+    单个不可分割的巨大单元（非工具节点、不可修剪的工具单元）以及系统提示/工具 schema 本身超窗，
+    都不在表面压缩的契约内——那是装配层（第 9 章）要控制的事。
+  </p>
+
+  <h2 id="sec-compaction-seam">15.3 compaction seam：ctx.compaction 的契约</h2>
+
+  <p>
+    <code>packages/compaction/compaction/</code> 是 Service Definition 包：
+    <code>CompactionEngine</code>（<code>ctx.compaction</code>）定义<strong>压缩做什么</strong>——
+    判断历史何时过大、把较旧区间摘要成单个表面节点——而不说<strong>怎么做</strong>。三个操作全部抽象：
+  </p>
+  <table>
+    <thead><tr><th>成员</th><th>语义</th></tr></thead>
+    <tbody>
+      <tr><td><code>compactIfNeeded(agent, trigger, signal)</code></td><td>自动压缩入口，<code>trigger</code> 是 <code>pressure</code> 或 <code>context-overflow</code>；返回 <code>CompactionResult</code>，无安全区间时返回 <code>null</code></td></tr>
+      <tr><td><code>compactNow(agent, signal)</code></td><td>显式压缩：即使低于自动压力也摘要一个有用的平衡区间；同步预约空闲轮次准入，以 <code>turn: null</code> 记录独立 bracket</td></tr>
+      <tr><td><code>compactRegion(start, end, agent, signal?)</code></td><td>强制摘要表面位置区间 <code>[start, end]</code>（闭区间 seq）；注意是<strong>表面位置区间</strong>而非数值 seq 区间——一次 replace 之后表面顺序不再跟随 seq 顺序</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    契约里最值得背下来的是<strong>表面契约</strong>。第 4 章讲过 <code>SurfaceEventType</code>
+    是封闭联合：只有 <code>user/message</code>、<code>assistant/message</code>、<code>tool/result</code>
+    能携带 <code>surfaceOp</code>，所以 <code>compaction/*</code> 事件<strong>不可能出现在表面上</strong>。
+    一次成功的压缩是这样五步：
+  </p>
+  <ol>
+    <li>追加 <code>compaction/start</code>（log-only）——取得锁；</li>
+    <li>摘要选中的区间；</li>
+    <li>追加 <code>compaction/summary</code>（log-only），携带摘要、区间、被遮蔽的 seq、token 计数与 provider/model 调用信封；</li>
+    <li>追加<strong>一条</strong> <code>user/message</code>，source 为 <code>compactCheckpointSource(compactionId)</code>、携带 <code>surfaceOp: { op: 'replace', start, end }</code>——这是整个操作<strong>唯一的表面变更</strong>；</li>
+    <li>追加 <code>compaction/end</code>（log-only）——释放锁。</li>
+  </ol>
+
+  <p>
+    于是 <code>deriveMessages()</code> 渲染出的模型历史是：checkpoint 摘要（user 角色、
+    以 <code>&lt;compacted-summary&gt;</code> 标签框住）加上保留的近期节点；被遮蔽的原始事件
+    仍留在追加式日志里，回放是确定性的。锁本身就是日志记录：一个没有配对的
+    <code>compaction/start</code> 就是 busy 信号，崩溃后留下的是可检测的孤儿锁，
+    而不是一个谎称压缩已完成的 <code>compaction/end</code>。
+  </p>
+
+  <p>
+    还有两处第 11 章方法论的变体值得注意。其一，Definition 导出
+    <code>toolPairingBalancedBefore/After(session, seq)</code> 边界助手：安全切边不能穿过
+    未应答的 assistant 工具调用，这个「配对平衡」的校验逻辑归 Definition 所有，
+    供所有后端复用。其二，这个 Definition 一反「只依赖 cordis」的惯例，
+    依赖了 <code>dsh-session</code> 和 <code>dsh-llm</code>——因为它的动词定义在
+    <code>Session</code> 上、输出是 <code>ContentBlock</code> 词汇，绕不开这两个包。
+    这个偏差是刻意的，记录在 compaction capability-seam Agent Note 里。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">为什么唯一表面变更是那条 user/message</div>
+    <p>
+      因为模型可见 ⟺ 已日志（第 4 章不变量）。摘要要让模型看到，就必须以表面事件的形式存在；
+      而锁、账本、调用信封这些实现细节模型不需要看到，所以全部 log-only。
+      <code>compactCheckpointSource(compactionId)</code> 把 checkpoint 与它的
+      <code>compaction/*</code> 事务关联起来，<code>isCompactCheckpointSource()</code>
+      让客户端程序在不知道后端身份的前提下认出这个标记。
+    </p>
+  </div>
+
+  <h2 id="sec-compaction-basic">15.4 compaction-basic：压力、保留与摘要后端</h2>
+
+  <p>
+    <code>dsh-compaction-basic</code> 是基础后端（Service Provider）：它需要
+    <code>ctx.llm</code>、<code>ctx.tokenMeter</code> 和 <code>ctx.sessions</code>，
+    拥有完整的压缩策略。压力测量委托给单例 <code>ctx.tokenMeter</code>——它在同一个已消费日志
+    版本上给「最新规范日志信封 + 当前表面」定价，所以 step 边界的压力<strong>已经包含</strong>
+    系统提示、工具、路由、assistant 完成、工具结果、缓冲上下文和 steering 的实际消耗。
+    阈值不是绝对 token 数，而是按<strong>当前路由的模型窗口</strong>解析：
+    <code>floor(routedContextWindow × thresholdRatio)</code>。这解释了为什么同一份
+    compact 插件能安全服务不同容量的模型。
+  </p>
+
+  <p>
+    触发路径有两条：默认 <code>auto: true</code> 时，串行的 <code>agent/pre-step</code>
+    监听器在请求推导<strong>之前</strong>检查压力；provider 确认的窗口溢出则从
+    <code>agent/request-error</code> 进入，走独立的溢出恢复路径（先修剪，再做一次最大的
+    平衡头部缩减）。保留策略压缩「最旧的完整表面单元」并保留近期尾部，
+    切边走 Definition 的配对平衡助手；失控 turn 内部的旧 step 不受 turn 边界保护。
+  </p>
+
+  <p>
+    摘要本身是一次<strong>直接的一击 <code>ctx.llm.stream()</code> 调用</strong>，不是 loop step
+    （所以逐调用拦截发生在 <code>llm/stream</code>，而不是 <code>agent/request</code>）。
+    它逐字重放会话自己的系统提示、工具 schema 和被遮蔽区间的消息——包括图片引用——
+    再把压缩指令作为最后一条 user 消息追加。由于前缀与上次路由请求逐字节一致，
+    provider 的暖前缀缓存<strong>被复用</strong>，只有末尾指令和摘要是未缓存的。
+    调用带 <code>GenerateOptions.purpose: 'compaction'</code>（DeepSeek adapter 会发送
+    <code>x-deepseek-harness-compact: 1</code> 归因头，不动模型可见体）；只有返回文本进入
+    checkpoint，推理与工具调用被排除——否则会泄漏私有推理或制造孤儿调用。
+  </p>
+
+  <table>
+    <thead><tr><th>Config 键</th><th>默认</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>thresholdRatio</code></td><td><code>0.8</code></td><td>在 <code>floor(路由窗口 × 比例)</code> 处压缩</td></tr>
+      <tr><td><code>retainRatio</code></td><td><code>0.16</code></td><td>按路由窗口比例保留近期表面（与 <code>retainTokens</code> 互斥）</td></tr>
+      <tr><td><code>retainTokens</code></td><td>—</td><td>绝对 token 预算保留近期表面，必须低于解析出的阈值</td></tr>
+      <tr><td><code>summarizationProvider</code> / <code>summarizationModel</code></td><td><code>''</code></td><td>成对设置摘要模型；留空则回退到最新日志请求目标、再到 agent 目标</td></tr>
+      <tr><td><code>maxTokens</code></td><td><code>8192</code></td><td>摘要调用的生成上限</td></tr>
+      <tr><td><code>compactionRetries</code></td><td><code>1</code></td><td>压力仍超阈值时的额外尝试次数</td></tr>
+      <tr><td><code>maxOverflowRetries</code></td><td><code>1</code></td><td>窗口溢出后的最大重试次数（<code>0</code> 只关闭恢复）</td></tr>
+      <tr><td><code>modelPolicies</code></td><td><code>[]</code></td><td>对精确 <code>{ provider, model }</code> 对的部分策略覆盖</td></tr>
+      <tr><td><code>auto</code></td><td><code>true</code></td><td>注册 step 边界压力与溢出恢复监听器；<code>false</code> 为纯手动</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    所有键都是可选的、在插件加载时校验（未知键、重复目标、互斥保留形式、
+    <code>retainRatio</code> 不低于 <code>thresholdRatio</code> 都会加载失败）——这是
+    「misconfiguration fails loud」与「无写死调参」两条仓库约定的标准体现。想换摘要实现，
+    子类化 <code>BasicCompactionEngine</code> 并覆写受保护的 <code>summarize()</code>——
+    这是唯一的子类钩子，压力、保留、事件账本都留在基类。
+  </p>
+
+  <h2 id="sec-pruner">15.5 compaction-tool-result-pruner：无模型修剪</h2>
+
+  <p>
+    <code>dsh-compaction-tool-result-pruner</code> 注册 <code>ctx.toolResultPruner</code>，
+    是 compaction-basic 的<strong>可选伴生插件</strong>，不是后端也不是模型工具。
+    compact-basic 通过可选的 <code>ctx.get('toolResultPruner')</code> 读取它，
+    所以两个包可以独立组装——加载顺序上把它放在 compact-basic <strong>之前</strong>作为兄弟插件即可启用。
+  </p>
+
+  <p>
+    它做的事情纯语法、零模型调用：<code>pruneSession(session)</code> 扫描当前表面的一个稳定快照，
+    把每个超预算的 <code>tool/result</code> 替换成一条新追加的 <code>tool/result</code>，
+    携带 <code>surfaceOp: { op: 'replace', start: 原seq, end: 原seq }</code> 与
+    <code>sourceEventSeqs: [原seq]</code>。替换结果完整复制原事件数据、只改 <code>content</code>：
+    保留 head、固定的省略标记 <code>[... tool result middle pruned ...]</code>、保留 tail。
+    <strong>原始事件保留在追加式日志里</strong>，供持久化、回放和精确日志检查。
+  </p>
+
+  <p>
+    三个配置键都是 Unicode 码点数：<code>thresholdChars</code>（默认 <code>8192</code>）、
+    <code>headChars</code>（默认 <code>4096</code>）、<code>tailChars</code>（默认 <code>1024</code>），
+    约束 <code>head + 标记 + tail ≤ threshold</code>，保证第二次扫描不再产生替换。
+    两个要点防止误解：其一，<strong>低于压力的 step 检查从不修剪</strong>——pruner 只在压力或溢出
+    触发合格之后、区间选择之前运行，修剪完 compact-basic 重新测量，若已安全就跳过摘要；
+    其二，字符预算不是 token 预算——「修剪是否解除了请求压力」的裁决权仍在
+    <code>ctx.tokenMeter</code>。
+  </p>
+
+  <h2 id="sec-command-compact">15.6 command-compact：/compact 是人类命令</h2>
+
+  <p>
+    组 README 的「已知限制」第一条写得直白：<strong>Human command, not a model tool</strong>。
+    dsh <em>没有</em>模型可见的 compact 工具——触发压缩的模型侧入口不存在，
+    自动压力与人类命令是仅有的两个入口。<code>dsh-command-compact</code> 在
+    <code>ctx.commands</code> 上注册一个全局命令：无参数的 <code>/compact</code> 调用
+    <code>ctx.compaction.compactNow(agent, signal)</code>，即使低于自动压力也摘要一个有用的平衡区间，
+    然后报告被替换的历史条目数与估算 token。带任何参数返回用法错误；无可压缩历史返回
+    <code>No compactable history yet.</code>。
+  </p>
+
+  <p>
+    注意命令执行时发生了什么：<strong>没有模型轮次</strong>。斜杠输入与直接结果不进入模型请求
+    （也不消耗 token），但每次已解析的调用都会在该 agent 的会话上记录 log-only 的
+    <code>command/run</code> / <code>command/done</code> 事件对——
+    <code>command/done.sourceEventSeq</code> 指向事务的 <code>compaction/summary</code> 事件，
+    让展示层能把命令生命周期折叠到对应 checkpoint 上，而不必解析结果文本。
+    <code>ManualCompactionError</code> 的封闭错误码（<code>busy | changed | summary | commit |
+    persistence</code>）被翻译成稳定的直接错误文案。
+  </p>
+
+  <p>
+    为什么不让模型自己压缩？因为入口的<strong>所有者是人类的控制面</strong>：
+    命令平面不经模型轮次直接分发，这正是下一章的主角。这里先记下伏笔：
+    <code>/compact</code> 的「不经模型、仍写日志」是命令平面的标准形态。
+  </p>
+
+  <h2 id="sec-spill">15.7 spill：外置而非裁剪</h2>
+
+  <p>
+    pruner 的策略是「保头保尾砍中间」——对日志类输出足够，但有些结果的价值恰恰在全文：
+    模型之后可能要用 <code>grep</code> 在里面搜索、用 <code>read</code> 分段读。
+    spill 家族回答这个问题：<strong>把全文移出上下文，留下 locator</strong>。
+    三个包的角色表：
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>角色</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-spill</code></td><td>Service Definition</td><td><code>ctx.spillStore</code> 抽象服务 + 词汇类型（<code>SaveTextSpill</code> / <code>SpillRef</code> / branded 的 <code>SpillLocator</code>）</td></tr>
+      <tr><td><code>dsh-spill-local</code></td><td>Service Provider</td><td>会话作用域的私有本地文件存储</td></tr>
+      <tr><td><code>dsh-spill-policy</code></td><td>Consumer</td><td><code>tools/post-execute</code> 转换器，决定何时外置并组装通知</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    seam 只拥有存储：<code>saveText(input)</code> 逐字持久化 <code>input.content</code>，
+    返回 <code>SpillRef</code>（locator、写入字节数、取回提示），真正的存储失败会 reject。
+    它<strong>没有</strong>保留策略（那是 util 家族的 <code>dsh-output-retention</code>）、
+    <strong>没有</strong>工具结果替换（那是 spill-policy）、<strong>没有</strong>取回/搜索 API——
+    后端的 <code>retrievalHint</code> 告诉模型拿到 locator 该做什么。
+    <code>SpillLocator</code> 是 branded 类型，对模型渲染为不透明字符串：
+    spill-local 返回本地路径，未来的远端后端可以返回 URI、数据库键或命令令牌，
+    policy 与工具消费者一行不改。
+  </p>
+
+  <p>
+    <code>dsh-spill-local</code> 的存储布局是安全设计的范本：文件落在
+    <code>&lt;root&gt;/session-&lt;hash&gt;/&lt;random&gt;-&lt;safeName&gt;</code>——
+    <code>root</code> 缺省时是 OS 临时目录下懒创建的 0700 私有目录（可预测且全局可读的 root
+    会让其他本地用户读到外置输出或植入符号链接）；<code>session-&lt;hash&gt;</code> 是
+    <code>sha256(sessionId)</code> 前缀，让同一会话的外置文件成组、将来可按会话清理；
+    文件名带不可预测的十六进制前缀，写入用独占 + 仅属主（<code>open(path, 'wx', 0o600)</code>），
+    任何已存在的路径（包括植入的符号链接）都会失败。
+  </p>
+
+  <p>
+    <code>dsh-spill-policy</code> 是唯一的 Consumer：一个 <code>tools/post-execute</code>
+    转换器。它只做四件事——让工具先跑（<code>next()</code> 委托）、只在结果是纯文本且超过
+    <code>maxInlineBytes</code> 时动作、把全文经 <code>ctx.spillStore</code> 外置、
+    用「有界 head/tail 预览 + 通知」替换模型可见结果，整体不超过预算：
+  </p>
+  <pre><code>&lt;retained head/tail preview&gt;
+
+(Omitted N bytes. Full formatted result stored at: /…/session-…/…-web_fetch.txt.
+Use read with offset/limit, or grep this path to search within it.)</code></pre>
+
+  <p>
+    豁免清单同样重要：嵌套执行（<code>exec.parent</code> 存在）、被接受的值替换、
+    <code>read</code> 工具的结果（避免 <code>read → spill → 再 read</code> 的循环）、
+    非 <code>accept</code> 决策、含任何非文本 block 的结果——全部原样放行。
+    一切是 best-effort：没有会话 owner、没挂 backend、<code>saveText</code> 被拒，
+    都记一条警告并保留内联结果——外置失败绝不把成功调用变成 <code>isError</code> 或藏起结果。
+    另外它还有第二条臂：监听 <code>tools/code-dispatch-log</code>，给 Code Mode
+    <code>run_code</code> 子调用结果的<strong>持久日志副本</strong>施加同一上限
+    （第 17 章会再遇到 Code Mode）。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">关键点</div>
+    <p>
+      阈值是<strong>策略不是常数</strong>：<code>maxInlineBytes</code> 是加载时校验的 Config 键，
+      单位 UTF-8 字节；<strong>不设置就整体禁用</strong>（插件什么都不注册）。
+      替换结果的字节数永远不超过上限——通知本身的字节成本从预算里预留，预览收缩来凑，
+      所以外置从不增加字节。
+    </p>
+  </div>
+
+  <div class="demo" data-demo="spillOffload">
+    <div class="demo-title">试一试 —— 超大工具结果的 spill 外置</div>
+    <p>拖动滑块改变工具结果大小（阈值 64 KB）：</p>
+    <input type="range" min="4" max="200" value="10">
+    <div class="demo-output empty">拖动试试。</div>
+  </div>
+
+  <h2 id="sec-context-plugins">15.8 context 组：注入排队，等待准入</h2>
+
+  <p>
+    压力管理的最后一环是「往窗口里加东西的人」。<code>packages/context/</code> 组是
+    一批<strong>不定义工具、只添加模型可见请求上下文</strong>的产品插件：
+    <code>agent-instructions</code>（工作区指令链，默认随 agent spine 演示 bundle 组装、可经
+    bundle 配置禁用）、<code>time-context</code>（当前时间与经过时间）、
+    <code>tmux-context</code>（tmux 位置上下文）、<code>session-reference</code>
+    （其他会话的有界快照，<code>ctx.sessionReferenceResolver</code>）。
+    第 9 章你从装配角度看过它们；压力视角下的问题是：<strong>这些内容何时进入请求？</strong>
+  </p>
+
+  <p>
+    答案是 <code>agent.inject(message)</code> 的排队语义：它把<strong>非唤醒的
+    next-step 上下文</strong>排进收件箱。运行中的 driver 在<strong>最近的下一个 pre-step 边界</strong>
+    认领它；空闲的 driver 把它挂起，直到 <code>followup()</code> 或 <code>steer()</code> 唤醒。
+    它甚至可能错过一个请求——如果那个请求的 pre-step 已经认领了自己的批次。
+    <code>docs/architecture.md</code> 的「Where new behavior goes」表把这总结成一行：
+    <em>Add model-visible context → call <code>agent.inject()</code>; it lands in the next
+    admitted request</em>。注入的内容以 <code>user/message</code> 事件落日志，
+    所以第 4 章的 model-visible ⟺ logged 不变量对它照常成立——
+    本章你已经见过证据：一次手动的 <code>/compact</code> 期间，空闲注入的上下文可以落在
+    <code>compaction/start</code> 与 <code>compaction/end</code> 之间，且位置式替换让它
+    在 checkpoint 之后仍然可见。
+  </p>
+
+  <p>
+    压力视角还有两个交叉点。第一，<code>ctx.tokenMeter</code> 的定价包含缓冲上下文与
+    steering——排着队的注入<strong>已经被计入</strong>压力，不会免费。第二，压缩会重置上下文插件：
+    <code>agent-instructions</code> 的作用域在它的上下文事件离开可见表面后被重新武装，
+    下一个进入的 pre-step 重组当前基线；skill 目录（第 17 章）同理，在被压缩遮蔽后由下一次
+    完整观察重建。三道闸收窄窗口，context 插件在新的空间里重建必要的上下文——
+    这两股力量的配合才是完整的压力管理。
+  </p>
+
+  <h2 id="sec-recap">15.9 本章回顾</h2>
+  <ul>
+    <li>三道闸按时机分工：spill 在 <code>tools/post-execute</code> 预防（外置超大纯文本，留预览 + locator）；pruner 在压力/溢出合格后修剪超预算 <code>tool/result</code>；compaction 在仍超压时摘要替换。</li>
+    <li>代价排序：spill 与 pruner 零模型调用，compaction 付一次辅助 <code>llm.stream()</code> 调用并使被替换区间缓存失效；pruner 修剪后若低于压力则跳过摘要。</li>
+    <li>compaction 表面契约：<code>compaction/start → compaction/summary → user/message（surfaceOp replace，唯一表面变更）→ compaction/end</code>；锁是日志 bracket，孤儿 start 即 busy。</li>
+    <li><code>compaction-basic</code> 策略全在 Config：<code>thresholdRatio</code>（默认 0.8，按路由窗口解析）、<code>retainRatio</code>/<code>retainTokens</code>、<code>modelPolicies</code>、<code>auto</code>；摘要逐字重放前缀以复用 KV 缓存。</li>
+    <li>pruner 替换保留原始事件；字符预算不是 token 预算，裁决权在 <code>ctx.tokenMeter</code>；低于压力从不修剪。</li>
+    <li>没有模型可见的 compact 工具：<code>/compact</code> 是 <code>ctx.commands</code> 上的人类命令，不经模型轮次，但记录 log-only 的 <code>command/run</code>/<code>command/done</code>。</li>
+    <li>spill seam 只管存储：<code>saveText</code> → <code>SpillRef</code>（branded <code>SpillLocator</code> + retrievalHint）；策略（<code>maxInlineBytes</code>，缺省即禁用）与文件布局（0700 root、sha256 会话前缀、独占 0600 写入）分属 spill-policy 与 spill-local。</li>
+    <li><code>agent.inject()</code> 排队非唤醒上下文，落在下一个被准入的请求；注入计入 tokenMeter 压力，压缩后由上下文插件重建目录与指令基线。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>以为有模型可见的 compact 工具——没有；入口只有自动压力/溢出与人类的 <code>/compact</code> 命令。</li>
+      <li>把 pruner 和 spill 混为一谈：pruner 改写表面节点（head + 标记 + tail，原始事件在日志里），spill 把全文移出上下文、留下可取回的 locator。</li>
+      <li>以为 <code>compaction/*</code> 事件会出现在表面上——封闭联合只允许 <code>user/message</code> / <code>assistant/message</code> / <code>tool/result</code> 携带 <code>surfaceOp</code>。</li>
+      <li>把阈值当 token 数硬编码：compaction 阈值按<strong>路由模型的窗口容量</strong>解析比例，pruner 阈值是字符数；策略全部走 Config 并在加载时校验。</li>
+      <li>期望压缩能解决一切溢出：不可分割单元、系统提示/工具 schema 超窗不在表面压缩契约内。</li>
+      <li>给 <code>spill-policy</code> 的豁免清单漏项：嵌套执行、<code>read</code> 结果、非文本 block、非 accept 决策都原样放行——尤其 <code>read</code> 是为了防外置循环。</li>
+      <li>以为注入立即生效：<code>agent.inject()</code> 排队等下一个被准入的请求，空闲时要等 <code>followup()</code>/<code>steer()</code> 唤醒。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="15">
+    <h2>第 15 章测验</h2>
+
+    <div class="q" data-id="15-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— spill-policy 挂在 tools/post-execute，在结果进入上下文之前就把超大纯文本外置，是预防闸。"
+         data-rationale="B 正确。A 错：pruner 只在压力或溢出触发合格之后运行。C 错：compaction 在阈值越过后摘要替换。D 错：ctx.tokenMeter 只测量不开闸，而且它是 LLM 家族的服务，不属于三道闸。"
+         data-review="sec-three-gates">
+      <div class="prompt"><span class="qnum">Q1.</span> 三道闸中，哪一道在工具结果<strong>产生时</strong>就动手？</div>
+      <label class="opt"><input type="radio" name="q-15-1" value="a"> A. compaction-tool-result-pruner</label>
+      <label class="opt"><input type="radio" name="q-15-1" value="b"> B. spill-policy（tools/post-execute）</label>
+      <label class="opt"><input type="radio" name="q-15-1" value="c"> C. compaction-basic</label>
+      <label class="opt"><input type="radio" name="q-15-1" value="d"> D. ctx.tokenMeter</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-2" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A、C。"
+         data-rationale="A、C 正确：成功的压缩以一条带 surfaceOp replace 的 user/message 替换旧区间（唯一表面变更），被遮蔽的原始事件留在追加式日志里供回放。B 错：compaction/summary 是 log-only 事件，永远不上表面。D 错：SurfaceEventType 是封闭联合，compaction/* 根本不能携带 surfaceOp。"
+         data-review="sec-compaction-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于成功 compaction 的表面契约，下列哪些说法正确？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="a"> A. 模型看到的变更是：一条 user/message 携带 <code>surfaceOp: { op: 'replace', start, end }</code> 与 checkpoint 摘要</label>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="b"> B. <code>compaction/summary</code> 事件携带摘要出现在表面上</label>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="c"> C. 被遮蔽的原始事件仍留在追加式日志里，回放是确定性的</label>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="d"> D. 压缩后 <code>deriveMessages()</code> 会同时渲染原始区间和摘要两份内容</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-3" data-type="fill"
+         data-accepted='["ctx.tokenMeter","tokenMeter","token meter"]'
+         data-answer="ctx.tokenMeter（dsh-token-meter 提供的单例测量服务）。"
+         data-rationale="测量是独立服务：compaction-basic 在同一个已消费日志版本上委托 ctx.tokenMeter 给最新规范信封与当前表面定价，所以压力已包含系统提示、工具、缓冲上下文等实际消耗。填 compaction 或 pruner 都不对——它们消费测量，不拥有测量。"
+         data-review="sec-compaction-basic">
+      <div class="prompt"><span class="qnum">Q3.</span> 填空：compaction-basic 的压力测量委托给 ______ 服务，由它在 step 边界给完整请求定价。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 一次直接的一击 ctx.llm.stream() 调用，逐字重放会话自己的系统提示、工具与被遮蔽区间消息，复用 provider 的暖前缀缓存。"
+         data-rationale="C 正确：重放前缀与上次路由请求逐字节一致，只有末尾指令和摘要输出是未缓存的；调用带 purpose 为 compaction。A 错：它不是 loop step，逐调用拦截发生在 llm/stream 而非 agent/request。B 错：不会 spawn 子代理。D 错：compaction-basic 用真实模型调用，模板后端只是可覆写 summarize() 的另一种实现。"
+         data-review="sec-compaction-basic">
+      <div class="prompt"><span class="qnum">Q4.</span> compaction-basic 的摘要调用是怎么发出的？</div>
+      <label class="opt"><input type="radio" name="q-15-4" value="a"> A. 作为一个普通 loop step 走 agent/request 扩展点</label>
+      <label class="opt"><input type="radio" name="q-15-4" value="b"> B. spawn 一个专门的摘要子代理来执行</label>
+      <label class="opt"><input type="radio" name="q-15-4" value="c"> C. 一次直接的一击 <code>ctx.llm.stream()</code> 调用，逐字重放会话前缀，以复用 provider 的 KV 缓存</label>
+      <label class="opt"><input type="radio" name="q-15-4" value="d"> D. 不调用模型，用固定模板拼接摘要</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 有界 head、固定省略标记、有界 tail；原始事件保留在追加式日志中。"
+         data-rationale="B 正确：替换节点用 surfaceOp replace 只改 content，原始 tool/result 仍在日志里供回放。A 错：日志是追加式的，不可能删除原始事件。C 错：外置到 storage 并留 locator 是 spill 的事。D 错：修剪发生在自动压力或溢出触发合格之后，不只限于 /compact；且低于压力的检查从不修剪。"
+         data-review="sec-pruner">
+      <div class="prompt"><span class="qnum">Q5.</span> pruner 处理一个超预算工具结果后，模型与日志各看到什么？</div>
+      <label class="opt"><input type="radio" name="q-15-5" value="a"> A. 模型看到 head + tail；原始事件从日志中删除</label>
+      <label class="opt"><input type="radio" name="q-15-5" value="b"> B. 模型看到 head + 省略标记 + tail 的替换节点；原始事件保留在日志里</label>
+      <label class="opt"><input type="radio" name="q-15-5" value="c"> C. 模型看到一个 locator，全文被外置到 storage</label>
+      <label class="opt"><input type="radio" name="q-15-5" value="d"> D. 修剪只在人类执行 /compact 时发生</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— ctx.commands 上的人类斜杠命令，调用 compactNow()；dsh 没有模型可见的 compact 工具。"
+         data-rationale="D 正确：README 明言 Human command, not a model tool。A 错：dsh 刻意不注册模型侧压缩工具。B 错：命令不经模型轮次，斜杠输入与直接结果都不进模型请求。C 错：入口只有自动压力/溢出与人类命令两个，没有第三方程序 API 作为「模型工具」。"
+         data-review="sec-command-compact">
+      <div class="prompt"><span class="qnum">Q6.</span> <code>/compact</code> 在 dsh 里是什么？</div>
+      <label class="opt"><input type="radio" name="q-15-6" value="a"> A. 模型可见的 compact 工具的人类别名</label>
+      <label class="opt"><input type="radio" name="q-15-6" value="b"> B. 一条发给模型的特殊提示词</label>
+      <label class="opt"><input type="radio" name="q-15-6" value="c"> C. 三个触发入口之一，另两个是模型工具与定时器</label>
+      <label class="opt"><input type="radio" name="q-15-6" value="d"> D. <code>ctx.commands</code> 上的人类命令：不经模型轮次直接调用 <code>compactNow()</code>，同时记录 log-only 的命令生命周期事件</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A、B、C 都是明确豁免：嵌套执行走 dispatch-log 臂、read 被跳过是为了避免 read → spill → 再 read 的循环、含非文本 block 的结果整体不动。D 恰好相反——超过 maxInlineBytes 的纯文本结果正是策略要外置的对象。"
+         data-review="sec-spill">
+      <div class="prompt"><span class="qnum">Q7.</span> spill-policy 会把下列哪些结果<strong>原样放行</strong>（不外置）？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="a"> A. 嵌套执行（<code>exec.parent</code> 存在）的结果</label>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="b"> B. <code>read</code> 工具的超大结果</label>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="c"> C. 混有图片 block 的结果</label>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="d"> D. 超过 <code>maxInlineBytes</code> 的纯文本结果</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-8" data-type="fill"
+         data-accepted='["SpillLocator","spillLocator","SpillLocator (branded)"]'
+         data-answer="SpillLocator（branded 类型，对模型渲染为不透明字符串）。"
+         data-rationale="SpillLocator 用 dsh-brand 的 branded 类型声明：spill-local 渔回本地路径，未来的远端后端可返回 URI 或键，policy 与工具消费者不感知后端身份。裸 string 不满足「跨边界 id 要 branded」的仓库约定。"
+         data-review="sec-spill">
+      <div class="prompt"><span class="qnum">Q8.</span> 填空：spill 返回给模型的定位符类型是 branded 的 ______，对模型渲染为不透明字符串。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 排队非唤醒的 next-step 上下文：运行中的 driver 在最近的下一个 pre-step 边界认领，空闲时挂起直到 followup()/steer() 唤醒。"
+         data-rationale="C 正确，这也是 architecture.md 的原文语义（lands in the next admitted request）。A 错：inject 是非唤醒的。B 错：唤醒式 next-step 输入是 steer()。D 错：它可能错过一个请求——那个请求的 pre-step 已经认领了自己的批次。"
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q9.</span> <code>agent.inject(message)</code> 的语义是什么？</div>
+      <label class="opt"><input type="radio" name="q-15-9" value="a"> A. 立即修改下一个正在飞行的模型请求</label>
+      <label class="opt"><input type="radio" name="q-15-9" value="b"> B. 排队唤醒式 next-step 输入：空闲 agent 立刻同步开一个 turn</label>
+      <label class="opt"><input type="radio" name="q-15-9" value="c"> C. 排队非唤醒的 next-step 上下文，落在下一个被准入的请求</label>
+      <label class="opt"><input type="radio" name="q-15-9" value="d"> D. 直接追加进会话日志并同步通知所有监听器</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-10" data-type="short"
+         data-key-points='["三道闸的时机：spill 在结果产生时（tools/post-execute），pruner 与 compaction 在压力/溢出触发后","代价排序：spill 与 pruner 零模型调用，compaction 一次辅助 llm.stream 调用并使被替换区间 KV 缓存失效","compaction 表面契约：唯一表面变更是带 surfaceOp replace 的 user/message checkpoint，compaction/* 全部 log-only","补充环节：ctx.tokenMeter 计入缓冲注入；agent.inject() 排队等准入；压缩后上下文插件重建基线"]'
+         data-answer="三道闸按时机与代价分工：spill 是预防闸，在 tools/post-execute 把超大纯文本外置到 storage，上下文只留预览 + branded locator，零模型调用；压力触发后 pruner 先把超预算 tool/result 改写成 head + 标记 + tail（原始事件保留），仍超压时 compaction 用一次辅助 llm.stream 调用把旧区间替换成 checkpoint（唯一表面变更是带 surfaceOp replace 的 user/message，compaction/* 事件 log-only，锁即日志 bracket）。测量独立于闸门：ctx.tokenMeter 把缓冲注入也计入压力；agent.inject() 排队等下一个被准入的请求；压缩遮蔽后 agent-instructions 与 skill 目录重建基线。"
+         data-rationale="抓住时机、代价、表面契约、测量与注入四个层面，你就掌握了 dsh 的完整压力管理图景。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q10.</span> 用自己的话说明三道闸各自的触发时机与代价，以及 compaction 的表面契约；再补上测量（tokenMeter）与注入（agent.inject）在这一图景中的位置。</div>
+      <textarea class="short" placeholder="你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正覆盖了某个要点才勾选它——少选伤害校准，多选只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="16-human-plane.html"><strong>第 16 章 · 人类协作面</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

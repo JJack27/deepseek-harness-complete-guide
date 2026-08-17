@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 20 章 · Typert 与 RPC 网关 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 20 章 · Typert 与 RPC</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="20">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 20 章 · 第四部分 · 产品端与协议</div>
+    <h1>Typert 与 RPC 网关</h1>
+    <p class="lede">
+      上一章留下了那条线：浏览器和 host 之间有一个 <code>/api</code> 通道。本章把它拆开：
+      浏览器↔host 的 RPC 怎么做到端到端类型安全？答案叫 Typert——构建期从类型生成「类型图」，
+      运行期用注册表消费它。再往上，gateway 认领新式 Remote 端点、apiproxy 承接遗留面，
+      两条只下行的 WebSocket 负责事件。读完你会知道一个方法调用从浏览器到
+      <code>ctx</code> 服务的每一跳。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出 Typert 三件套的分工：generator（构建期）→ loader（发现）→ registry（<code>ctx.typert</code>）。</li>
+      <li>描述 <code>/api</code> 上的一次调用如何被 interceptor 认领或回落到 apiproxy。</li>
+      <li>解释 remotes 的 <code>createApiRemoteAgentResolver</code> 统一了什么策略。</li>
+      <li>画出通道全貌：unary/respond 的 POST、<code>events.mux</code> 与 <code>events.host</code> 双下行、readiness 判定。</li>
+      <li>说明 <code>/api</code> browser-trust fence 为什么盯住 Host 头（DNS-rebinding 防护）。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-problem">20.1 问题：端到端类型安全的 RPC</h2>
+
+  <p>
+    Web UI 的 RPC 有个结构性难题：调用方在浏览器（TypeScript，Client 编译面），被调方在
+    Node（TypeScript，Host 编译面），中间是 HTTP 与 JSON。常规做法要么手写两份接口再祈祷它们
+    不漂移，要么上 codegen 生成整套客户端。dsh 的答案是 <strong>Typert</strong>：让构建期工具
+    从<strong>源码类型树</strong>生成一份与编译器无关的类型图（<code>FaceModel</code>、
+    <code>TypeGraph</code>），运行期以注册表形态消费它——浏览器一侧拿到的调用面
+    （<code>ctx.remote</code>）和 Node 一侧暴露的调用面（<code>ctx.typertGateway</code>）
+    共享同一份生成的 <code>InvocationDescriptor</code> 契约。
+  </p>
+
+  <p>
+    这个设计同时守住了第 23 章会展开的边界纪律：业务包把方法用 <code>@Remote</code> 或
+    <code>@RemoteScope</code> 标在 Host 服务类上，不需要依赖任何 RPC 运行时；生成的声明把
+    <code>TYPERT</code> 暴露成 <code>unknown</code>，贡献业务包不必依赖类型注册表本身。
+  </p>
+
+  <h2 id="sec-typert-pipeline">20.2 Typert 三件套：generator → loader → registry</h2>
+
+  <p>
+    <code>packages/typert/</code> 三个包按「分析 / 发现 / 存储」分层：
+  </p>
+
+  <table>
+    <thead><tr><th>包</th><th>角色</th><th>Cordis key</th></tr></thead>
+    <tbody>
+      <tr><td><code>typert/generator</code></td><td>构建期库：分析 TypeScript 工程，生成运行期工件</td><td>—（无插件）</td></tr>
+      <tr><td><code>typert/loader</code></td><td>扫描 Loader 条目，导入并注册生成的 Host 工件</td><td>消费 <code>ctx.loader</code> 与 <code>ctx.typert</code></td></tr>
+      <tr><td><code>typert/registry</code></td><td>运行期注册表：包反射与可选的活 Zod schema</td><td><code>ctx.typert</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>generator</strong> 用独立的 <code>ts.Program</code>（以 <code>tsconfig.host.json</code>
+    或 <code>tsconfig.client.json</code> 为种子）分析源码，产出与编译器无关的模型，再由
+    emitter 渲染工件。仓库里的 Host tsdown 会带着 workspace Typert 生成跑一遍：产出 Host 反射
+    工件（<code>lib/typert.host.{js,d.ts}</code>，经 <code>package/typert</code> 子路径暴露）
+    以及给 Client 用的 <code>typert.remote-client.*</code> 投影；随后的 Client tsdown 不再启动
+    Typert。发布是<strong>按包 opt-in</strong> 的：没有相应公共导出的业务包不需要任何 Typert 工件。
+    <code>check</code> 模式下分析器对语法/语义诊断、缺失的公共标注、私有的跨包引用都会失败——
+    类型图不允许悄悄缺一块。
+  </p>
+
+  <p>
+    <strong>loader</strong> 是 Node-only 插件：激活时扫描既有 Loader 条目，跟随
+    <code>internal/plugin</code> 生命周期通知，解析每个条目包的 <code>package.json</code>，
+    在它导出 <code>./typert</code> 时导入并校验 <code>TYPERT</code> 清单、把贡献注册进注册表。
+    没有该导出的包直接跳过；藏另一个 Loader 条目后面的嵌套插件要靠 <code>packages</code>
+    配置显式列出。解析与清单按进程生命周期缓存，新加导出要重启。
+  </p>
+
+  <p>
+    <strong>registry</strong> 提供 <code>ctx.typert</code>：包反射按
+    <code>&lt;package&gt;#&lt;face&gt;</code> 键存，schema 按 <code>&lt;package&gt;#&lt;name&gt;</code>
+    键存（保留生产者的 Zod 实例，JSON Schema 在消费端按需投影）。它还有两个独立的归属面：
+    <code>lookups</code>（业务包注册查找声明与默认解析器，Host 组合用 <code>configure()</code>
+    覆盖行为——把第 20.4 节的 Agent/Session 解析策略换掉就是这里）与 <code>contexts</code>
+    （scoped 调用的 Context 身份）。注册即效应：贡献随调用方的 Cordis fiber 一起撤出。
+  </p>
+
+  <h2 id="sec-gateway">20.3 gateway 与 apiproxy：认领与回退</h2>
+
+  <p>
+    <code>packages/api/gateway</code>（<code>@deepseek-ai/dsh-api-gateway</code>）是两面插件：
+    Host 入口提供 <code>ctx.typertGateway</code>，Client 入口
+    （<code>@deepseek-ai/dsh-api-gateway/client</code>）提供 <code>ctx.remote</code>。
+    业务服务继承 <code>TypertRemoteService</code>、给公开方法标 <code>@Remote</code> 或
+    <code>@RemoteScope</code>；Host 侧调用流是：解析当前描述符与 Cordis Service →
+    校验<strong>精确的命名参数</strong> → 经 <code>lookups</code> 解析对象或 Context 身份 →
+    调用业务方法 → 校验返回值。
+  </p>
+
+  <p>
+    两种校验模式要分清。<strong>strict 模式</strong>从 <code>ctx.typert.local</code> 读生成的
+    调用描述符，参数、返回值都按生成 codec 精确校验；<strong>SRC 模式</strong>是给从未有过
+    strict 定义的端点留的开发回退，只解析简单参数名、对非查找参数只验 JSON 安全。关键的红线：
+    <strong>撤回一个已被观察过 strict 定义的端点会直接失败</strong>，而不是悄悄降级到 SRC——
+    校验强度只允许变严。
+  </p>
+
+  <p>
+    Client 侧的 <code>ctx.remote.$mount()</code> 校验并注册一份生成的 Host-for-Client 贡献，
+    为调用方的 fiber 安装具体方法（每个命名空间是带追踪的 <code>remote.&lt;ns&gt;</code> 子
+    Service）。调用时校验位置参数、构造描述符要求的精确命名 <code>args</code>，经
+    <code>ctx.connection.rpc.call('/api', endpoint, …)</code> 发出；返回值先过校验再进应用代码。
+    事件面是 <code>ctx.remote.$on()</code>：合法键恰好是 Host 组装的转发选择（第 20.4 节），
+    监听器类型就是属主包自己的 Cordis <code>Events</code> 声明——第二份签名想漂移都没有落点。
+  </p>
+
+  <p>
+    那<strong>遗留面</strong>怎么办？Host 的 <code>/api</code> FetchHandler 上挂着一个复合
+    handler：gateway 注册的 interceptor <strong>先认领</strong> Remote 端点，没被认领的落到
+    <code>apiproxy</code>（<code>ctx.apiProxy</code>，<code>@deepseek-ai/dsh-host-apiproxy</code>）
+    ——一个 transport 无关的网关，持有四象限 wire 契约
+    （<code>ClientRequest</code>/<code>ServerResponse</code>/<code>ServerRequest</code>/
+    <code>ClientResponse</code>）与庞大的遗留方法族（<code>session.*</code>、
+    <code>workspace.*</code>、<code>settings.*</code>……）。它自己不注册路由：HTTP 载体（第 19
+    章的 connection）负责把请求递过来。迁移是逐方法进行的：迁到 Remote 的方法由 gateway 处理，
+    未迁移的继续走 apiproxy，两边共享同一个 Agent/Session 解析策略——这正是 remotes 存在的理由。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="一次浏览器调用的路径">
+      <rect x="10" y="30" width="170" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="55" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">浏览器调用方</text>
+      <text x="95" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ctx.remote.goal.…(args)</text>
+      <text x="95" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">构造精确命名 args</text>
+
+      <line x1="180" y1="65" x2="220" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="220,65 212,61 212,69" style="fill:var(--muted)"/>
+      <text x="200" y="52" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">HTTP POST</text>
+
+      <rect x="220" y="30" width="180" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="310" y="55" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">/api fence</text>
+      <text x="310" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Host 头：loopback 或</text>
+      <text x="310" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">trustedHosts（防 DNS-rebinding）</text>
+
+      <line x1="400" y1="65" x2="440" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="440,65 432,61 432,69" style="fill:var(--muted)"/>
+
+      <rect x="440" y="14" width="200" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="540" y="37" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">已认领？→ typertGateway</text>
+      <text x="540" y="54" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ctx.typert.local 描述符 · strict 校验</text>
+
+      <rect x="440" y="90" width="200" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="2"/>
+      <text x="540" y="112" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">未认领 → apiproxy</text>
+      <text x="540" y="129" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">遗留方法族（session.* 等）</text>
+
+      <line x1="640" y1="45" x2="680" y2="45" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="680,45 672,41 672,49" style="fill:var(--muted)"/>
+
+      <rect x="680" y="16" width="210" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="785" y="38" text-anchor="middle" style="fill:var(--accent-2)" font-size="11" font-weight="700">api-remotes（BFF）</text>
+      <text x="785" y="55" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">createApiRemoteAgentResolver：</text>
+      <text x="785" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">agent/session 查找策略</text>
+
+      <line x1="785" y1="74" x2="785" y2="110" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="785,110 781,102 789,102" style="fill:var(--muted)"/>
+
+      <rect x="620" y="110" width="270" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="755" y="133" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">ctx 服务（业务 Service）</text>
+      <text x="755" y="150" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">活 Agent 复用 / 冷会话恢复 / 子代理所有权 fence</text>
+      <text x="755" y="164" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">结果再沿原路校验回浏览器</text>
+
+      <rect x="220" y="230" width="670" height="76" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="1.5"/>
+      <text x="555" y="252" text-anchor="middle" style="fill:var(--fg)" font-size="11" font-weight="700">同一份生成的契约两端共享</text>
+      <text x="555" y="270" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">generator（构建期：tsconfig.host.json 种子 → FaceModel/TypeGraph → lib/typert.host.* 与 typert.remote-client.*）</text>
+      <text x="555" y="286" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">loader（导入 ./typert 并校验 TYPERT 清单）→ registry（ctx.typert：&lt;package&gt;#&lt;face&gt; 反射、&lt;package&gt;#&lt;name&gt; schema）</text>
+    </svg>
+    <figcaption>一次浏览器调用的路径：POST /api 先过 browser-trust fence，interceptor 认领的端点进 typertGateway、未认领的落 apiproxy；Agent/Session 身份策略由 api-remotes 统一供给两个网关。</figcaption>
+  </figure>
+
+  <h2 id="sec-remotes">20.4 remotes：Agent/Session 查找策略</h2>
+
+  <p>
+    <code>packages/api/remotes</code>（<code>@deepseek-ai/dsh-api-remotes</code>）是两面 BFF。
+    它的核心导出 <code>createApiRemoteAgentResolver()</code> 把「这个 sessionId/agentId 指的是
+   谁」回答成了唯一一份策略：<strong>复用活 Agent、恢复普通冷会话、对并发的恢复去重、保住
+    subagent 所有权 fence</strong>；同一位解析器同时配置给 Typert 的 <code>agent</code> 与
+    <code>session</code> 查找键。遗留的 Web ApiProxy 取 Agent 默认值和 scope 装配后，
+    <strong>也</strong>用这个解析器处理遗留方法——迁移过与没迁移的方法共享同一份身份策略实现，
+    这是「换网关不换行为」的关键。
+  </p>
+
+  <p>
+    它的 Client 面是浏览器业务包的依赖门面：导入生成的 <code>/remote</code> 工件作为运行期值、
+    经 <code>ctx.remote.$mount()</code> 挂载每份贡献、再导出声明合并；业务包不依赖 gateway 实现
+    或单个 Remote 运行期入口。当前组合挂载了 Goal 贡献和只读的 Host 插件清单贡献
+    （<code>pluginInventory/list</code>）。
+  </p>
+
+  <p>
+    下行事件的白名单也在这里：<code>src/remote-events.ts</code> 的
+    <code>API_REMOTE_FORWARDED_EVENTS</code> 是 Host 转发给消费者的 cordis 事件列表——逐字转发、
+    无投影、无脱敏、不改名——因此它也就是 <code>ctx.remote.$on</code> 的合法键集；Host 面还会拿
+    这个表对 <code>TypertForwardableEvent</code> 断言：不是已声明事件、绑定 AgentScope、或形状
+    非单向的都进不了白名单。转发一个新事件 = 在数组里加一项，类型投影、消费键面、Host 转发循环
+    全部从它派生。
+  </p>
+
+  <h2 id="sec-channels">20.5 通道全貌：POST、双下行与 fence</h2>
+
+  <p>
+    通道一共三种形态。<strong>上行走 HTTP POST</strong>：unary 和 respond 操作都是
+    <code>POST /api/&lt;method&gt;</code>，respond 类（如回答 agent 提问）走
+    <code>POST /api/respond</code> 回执。每个 POST 必须声明 <code>application/json</code>，
+    否则在分发前吃 415——跨站「简单请求」（浏览器不发预检的那种）永远执行不了有副作用的方法。
+  </p>
+
+  <p>
+    <strong>下行是两条只下行的 WebSocket</strong>：<code>/api/events.mux</code> 承载会话级
+    mux 帧（会话事件、投影帧、队列与任务快照……），<code>/api/events.host</code> 承载 host 级
+    帧（workspace 增删、转发 Remote 事件……）。两条 socket 都<strong>只从 host 发向浏览器</strong>，
+    客户端不在其上发送任何应用数据。断任意一条，当前连接 generation 即失败、两条流一起重建；
+    readiness 的判定是「两条 socket 都开着 <em>且</em> <code>host.describe</code> 的 HTTP 调用
+    成功」——成功握手发布的正是 <code>host.describe</code> 的值。普通网络 GET 打到这两个路径
+    得到 426，线上没有 SSE 回退（SSE 编解码器只服务于同进程内载体）。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="下行双通道与 readiness">
+      <rect x="10" y="90" width="180" height="90" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="100" y="122" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">host 半区</text>
+      <text x="100" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">mux 流扇出（会话级）</text>
+      <text x="100" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">host 流（workspace、转发事件）</text>
+
+      <line x1="190" y1="112" x2="560" y2="112" style="stroke:var(--accent-2)" stroke-width="2.5"/>
+      <polygon points="560,112 552,108 552,116" style="fill:var(--accent-2)"/>
+      <text x="375" y="100" text-anchor="middle" style="fill:var(--accent-2)" font-size="10" font-weight="700">WebSocket /api/events.mux（只下行）</text>
+      <text x="375" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">会话事件 · session/projection · session/queue · session/jobs …</text>
+
+      <line x1="190" y1="170" x2="560" y2="170" style="stroke:var(--accent-2)" stroke-width="2.5"/>
+      <polygon points="560,170 552,166 552,174" style="fill:var(--accent-2)"/>
+      <text x="375" y="194" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">WebSocket /api/events.host（只下行）</text>
+
+      <rect x="560" y="90" width="180" height="90" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="650" y="118" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">浏览器半区</text>
+      <text x="650" y="138" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">connection 的流循环</text>
+      <text x="650" y="154" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">断一条 → generation 失败</text>
+      <text x="650" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">→ 两条流全重建</text>
+
+      <rect x="620" y="16" width="270" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="755" y="38" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">readiness = 两条 socket 开 + host.describe 成功</text>
+      <text x="755" y="56" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">握手发布 host.describe 值；普通 GET 到两路径得 426</text>
+
+      <line x1="650" y1="90" x2="730" y2="72" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4,4"/>
+
+      <rect x="10" y="200" width="880" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="450" y="220" text-anchor="middle" style="fill:var(--warn)" font-size="10" font-weight="700">/api browser-trust fence</text>
+      <text x="450" y="237" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">每个请求的 Host 必须是 loopback 权威或命中 trustedHosts；有 Origin 时必须等于 Host 权威，显式 sec-fetch-site: cross-site 拒绝——Host 是 rebinding 唯一伪造不了的请求头</text>
+    </svg>
+    <figcaption>下行双通道：mux 与 host 两条 WebSocket 只下行、断任一即整代重建；readiness 同时要求 host.describe 成功。fence 覆盖全部 /api 请求与 WebSocket 升级。</figcaption>
+  </figure>
+
+  <p>
+    <strong>fence</strong> 是唯一横在两条 WebSocket 升级和所有 <code>/api</code> 请求前的门。
+    它的核心比较是 <strong>Host 头</strong>：必须是 loopback 权威（或部署推出的 LAN IP 字面量），
+    或精确命中一条 <code>trustedHosts</code> 条目（<code>host:port</code> 精确、无端口条目任意
+    端口，两侧都过 WHATWG 规范化比较）。为什么是 Host？因为这是 DNS-rebinding 攻击者唯一
+    伪造不了的请求头：纯 HTTP 下浏览器对 image 与导航读取既不带 <code>Origin</code> 也不带
+    Fetch-Metadata，一个「无标记」的请求仍可能是被重绑的浏览器读取；marker 存在时
+    <code>Origin</code> 必须等于 Host 权威、显式的 <code>sec-fetch-site: cross-site</code> 直接
+    拒绝。非规范条目（比如 <code>harness.internal/path</code> 这种带路径的东西）在插件加载时就
+    大声失败。另有一组<strong>钉死在 loopback</strong> 的特权方法（<code>host.pickDirectory</code>、
+    配置面读写、agentPreset 读写那一族）——声明的 <code>trustedHosts</code> 权威够得着其他方法，
+    却够不着它们；在真正的认证层存在之前，这些能力不出本机。fence 是可达性策略，
+    <strong>不是认证</strong>：这也是 <code>dsh web --host 0.0.0.0</code> 至今刻意不支持的原因。
+  </p>
+
+  <h2 id="sec-recap">20.6 本章回顾</h2>
+  <ul>
+    <li>Typert 分三层：generator 构建期从类型树生成工件（Host tsdown 触发，按包 opt-in），loader 扫 Loader 条目导入 <code>./typert</code>，registry 提供 <code>ctx.typert</code>（<code>&lt;package&gt;#&lt;face&gt;</code> 反射、<code>&lt;package&gt;#&lt;name&gt;</code> schema、lookups/contexts）。</li>
+    <li>gateway 两面：<code>ctx.typertGateway</code>（strict 描述符校验，SRC 仅开发回退且撤回已观察的 strict 定义会失败）与 <code>ctx.remote</code>（$mount 生成方法、$on 转发事件）。</li>
+    <li><code>/api</code> FetchHandler 上 interceptor 先认领 Remote 端点，未认领的落 apiproxy（<code>ctx.apiProxy</code>）的遗留方法族；两网关共享 remotes 的 <code>createApiRemoteAgentResolver</code>（活 Agent 复用、冷恢复去重、subagent 所有权 fence）。</li>
+    <li>通道：unary/respond 走 HTTP POST（必须 application/json）；<code>/api/events.mux</code> 与 <code>/api/events.host</code> 两条只下行 WebSocket，断任一即整代重建；readiness = 双 socket + <code>host.describe</code> 成功。</li>
+    <li>fence 盯 Host 头防 DNS-rebinding；<code>trustedHosts</code> 声明权威，特权方法钉死 loopback；fence 是可达性策略，不是认证。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>以为 Typert 在浏览器运行期分析类型——分析在构建期（Host tsdown），浏览器只消费生成的 codec 与描述符。</li>
+      <li>以为没被认领的端点是 404——它落进 apiproxy 的遗留面；apiproxy 是回退层，不是废墟。</li>
+      <li>给端点撤 strict 定义指望退回 SRC——已被观察过 strict 定义的端点会直接失败，校验只许变严。</li>
+      <li>以为浏览器会在两条 WebSocket 上回发数据——它们只下行；上行永远走 HTTP POST。</li>
+      <li>把 fence 当认证——它只挡可达性；这也是 <code>--host 0.0.0.0</code> 被刻意拒绝的根因。</li>
+      <li>在 <code>trustedHosts</code> 里写带路径或零填充端口的「权威」——非裸 host[:port] 条目在插件加载时就大声失败。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="20">
+    <h2>第 20 章 测验</h2>
+
+    <div class="q" data-id="20-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— generator 在构建期分析类型树并生成工件；Host tsdown 携带 workspace Typert 生成运行。"
+         data-rationale="C 正确。A 错，浏览器只消费生成物。B 错，loader 只负责发现与注册。D 错，registry 是运行期存储，不做分析。"
+         data-review="sec-typert-pipeline">
+      <div class="prompt"><span class="qnum">Q1.</span> Typert 的类型分析发生在什么时候？</div>
+      <label class="opt"><input type="radio" name="q-20-1" value="a"> A. 浏览器首次加载页面时</label>
+      <label class="opt"><input type="radio" name="q-20-1" value="b"> B. loader 激活扫描条目时</label>
+      <label class="opt"><input type="radio" name="q-20-1" value="c"> C. 构建期：generator 以 tsconfig.host.json 为种子分析并生成工件</label>
+      <label class="opt"><input type="radio" name="q-20-1" value="d"> D. ctx.typert 注册表首次查询时</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-2" data-type="fill" data-accepted='["typert","./typert","package/typert"]'
+         data-answer="./typert（即 package 的 typert 子路径；工件在 lib/typert.host.js）。"
+         data-rationale="loader 解析每个条目包的 package.json，在它导出 ./typert 时导入、校验 TYPERT 清单并注册；没有该导出的包直接跳过。"
+         data-review="sec-typert-pipeline">
+      <div class="prompt"><span class="qnum">Q2.</span> 填空：typert loader 只导入那些在 package.json 里导出了 <code>______</code> 子路径的 Loader 条目包。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 包反射按 &lt;package&gt;#&lt;face&gt; 键存，schema 按 &lt;package&gt;#&lt;name&gt; 键存。"
+         data-rationale="B 正确：schema 键省略 face，因为 host 与 client 跑在不同上下文——同上下文里注册两个同名 schema 会被当作重复拒绝。A/C/D 的键形都不对。"
+         data-review="sec-typert-pipeline">
+      <div class="prompt"><span class="qnum">Q3.</span> <code>ctx.typert</code> 注册表里包反射与 schema 各按什么键存？</div>
+      <label class="opt"><input type="radio" name="q-20-3" value="a"> A. 都按 <code>&lt;package&gt;#&lt;face&gt;</code></label>
+      <label class="opt"><input type="radio" name="q-20-3" value="b"> B. 反射按 <code>&lt;package&gt;#&lt;face&gt;</code>，schema 按 <code>&lt;package&gt;#&lt;name&gt;</code></label>
+      <label class="opt"><input type="radio" name="q-20-3" value="c"> C. 反射按 <code>&lt;face&gt;#&lt;name&gt;</code>，schema 按 <code>&lt;package&gt;#&lt;face&gt;</code></label>
+      <label class="opt"><input type="radio" name="q-20-3" value="d"> D. 都按裸包名存</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— gateway 注册的 interceptor 先认领 Remote 端点，未认领的交给 apiproxy。"
+         data-rationale="A 正确：Connection 把复合 FetchHandler 递给 HTTP 桥，认领分派到 gateway、未认领到 API Proxy。B 把顺序反了。C 错，回退是无声的职责分层，不是错误。D 错，载体会分发，只是分派逻辑由复合 handler 决定。"
+         data-review="sec-gateway">
+      <div class="prompt"><span class="qnum">Q4.</span> 一个 Remote 端点的请求到达 <code>/api</code> 后如何分流？</div>
+      <label class="opt"><input type="radio" name="q-20-4" value="a"> A. 注册的 Typert interceptor 先认领；没认领的落 apiproxy</label>
+      <label class="opt"><input type="radio" name="q-20-4" value="b"> B. apiproxy 先处理，不认识的再转 typertGateway</label>
+      <label class="opt"><input type="radio" name="q-20-4" value="c"> C. 未认领的端点返回 404</label>
+      <label class="opt"><input type="radio" name="q-20-4" value="d"> D. 由 webserver 按 URL 前缀硬编码分派</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— strict 读 ctx.typert.local 的生成描述符做精确校验；SRC 是从未有 strict 定义的端点的开发回退，只解析简单参数名并验 JSON 安全；撤回已观察的 strict 定义直接失败。"
+         data-rationale="D 正确。A 错，SRC 是回退不是主力。B 错，正是这条红线防止校验悄悄变弱。C 错，两种模式都是 gateway 的 host 面行为。"
+         data-review="sec-gateway">
+      <div class="prompt"><span class="qnum">Q5.</span> strict 模式与 SRC 模式的关系是什么？</div>
+      <label class="opt"><input type="radio" name="q-20-5" value="a"> A. SRC 是生产推荐，strict 只在开发用</label>
+      <label class="opt"><input type="radio" name="q-20-5" value="b"> B. 一个端点可以先 strict 后 SRC，自由降级</label>
+      <label class="opt"><input type="radio" name="q-20-5" value="c"> C. 两种模式都在浏览器侧执行</label>
+      <label class="opt"><input type="radio" name="q-20-5" value="d"> D. strict 用生成描述符精确校验；SRC 只覆盖从未有过 strict 定义的端点，且已观察过 strict 的端点撤回定义会失败</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A/B/C 正是 resolver 的四件事中的三件（另一件是并发恢复去重）。D 错：subagent 所有权 fence 恰恰被保留，不被绕开。"
+         data-review="sec-remotes">
+      <div class="prompt"><span class="qnum">Q6.</span> <code>createApiRemoteAgentResolver()</code> 承担哪些行为？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="a"> A. 复用活 Agent</label>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="b"> B. 恢复普通冷会话</label>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="c"> C. 对并发的恢复去重</label>
+      <label class="opt"><input type="checkbox" name="q-20-6" value="d"> D. 绕过 subagent 所有权 fence 以简化路由</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 正确。C 错：客户端不在下行 socket 上发任何应用数据，上行走 HTTP POST；断任一条 socket 会让当前 generation 失败并重建两条流。"
+         data-review="sec-channels">
+      <div class="prompt"><span class="qnum">Q7.</span> 关于通道，下列说法正确的是？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="a"> A. unary 与 respond 操作都走 HTTP POST</label>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="b"> B. readiness 需要两条下行 socket 都开着，且 host.describe 的 HTTP 调用成功</label>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="c"> C. 浏览器经 /api/events.mux 回发确认帧</label>
+      <label class="opt"><input type="checkbox" name="q-20-7" value="d"> D. 普通 GET 打到 events.mux/events.host 返回 426，线上无 SSE 回退</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 纯 HTTP 下浏览器对 image/导航读取不带 Origin 和 Fetch-Metadata，无标记请求仍可能是重绑读取；Host 是 rebinding 唯一伪造不了的请求头。"
+         data-rationale="B 正确。A 错，Host 头客户端可控但重绑攻击者无法让浏览器替他带上正确值。C 错，fence 也比较 Origin（存在时）。D 错，性能与这无关。"
+         data-review="sec-channels">
+      <div class="prompt"><span class="qnum">Q8.</span> fence 为什么以 Host 头为核心比较？</div>
+      <label class="opt"><input type="radio" name="q-20-8" value="a"> A. 因为 Host 头无法被客户端伪造</label>
+      <label class="opt"><input type="radio" name="q-20-8" value="b"> B. 因为无标记的浏览器读取（image/导航）不带 Origin 与 Fetch-Metadata，而 Host 是 DNS-rebinding 唯一伪造不了的请求头</label>
+      <label class="opt"><input type="radio" name="q-20-8" value="c"> C. 因为 Origin 头浏览器从不发送</label>
+      <label class="opt"><input type="radio" name="q-20-8" value="d"> D. 因为 Host 比较最便宜</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— API_REMOTE_FORWARDED_EVENTS 是转发白名单：Host 逐字转发（无投影、无脱敏、不改名），它同时就是 ctx.remote.$on 的合法键集。"
+         data-rationale="C 正确：键面、类型投影、Host 转发循环都从这一个数组派生。A 错，Host 面还断言 TypertForwardableEvent（拒绝绑定 AgentScope 与非单向事件）。B 错，逐字转发正是设计。D 错，事件转发与 ready 状态无关。"
+         data-review="sec-remotes">
+      <div class="prompt"><span class="qnum">Q9.</span> <code>ctx.remote.$on()</code> 的合法键由什么决定？</div>
+      <label class="opt"><input type="radio" name="q-20-9" value="a"> A. 浏览器运行时自省 Host 事件</label>
+      <label class="opt"><input type="radio" name="q-20-9" value="b"> B. 任意 cordis 事件名，反正都是逐字转发</label>
+      <label class="opt"><input type="radio" name="q-20-9" value="c"> C. remotes 的 API_REMOTE_FORWARDED_EVENTS 白名单，且 Host 转发前经 TypertForwardableEvent 断言</label>
+      <label class="opt"><input type="radio" name="q-20-9" value="d"> D. connection 的 readiness 握手协商</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 特权方法集（host.pickDirectory、配置面、agentPreset 读写等）钉死 loopback：trustedHosts 权威够得着其他方法，够不着它们。"
+         data-rationale="B 正确：在真正认证层存在之前这些能力不出本机。A/C 错，fence 是可达性策略不是认证，也覆盖读操作。D 错，webserver 对 /api 没有特判，fence 在 connection 层。"
+         data-review="sec-channels">
+      <div class="prompt"><span class="qnum">Q10.</span> 声明了 <code>trustedHosts</code> 的局域网部署里，哪类方法仍然够不着？</div>
+      <label class="opt"><input type="radio" name="q-20-10" value="a"> A. 所有 GET 类方法</label>
+      <label class="opt"><input type="radio" name="q-20-10" value="b"> B. 钉死 loopback 的特权方法集（目录选择、配置面、agentPreset 读写等）</label>
+      <label class="opt"><input type="radio" name="q-20-10" value="c"> C. 全部方法——fence 是认证层</label>
+      <label class="opt"><input type="radio" name="q-20-10" value="d"> D. 没有；trustedHosts 等于管理员授权</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="20-11" data-type="short"
+         data-key-points='["客户端经 ctx.remote 的生成方法构造精确命名 args，走 ctx.connection.rpc.call 发 POST /api","fence 先校验 Host：loopback 或 trustedHosts，可选 Origin/sec-fetch-site 检查","复合 FetchHandler 分派：interceptor 认领的端点进 typertGateway，其余落 apiproxy","typertGateway 用 ctx.typert.local 描述符解析调用，经 lookups（remotes 的 resolver）解析 agent/session 身份","业务 Service 方法执行后结果沿原路校验回传；下行变化经 mux/host WebSocket 推送"]'
+         data-answer="浏览器插件调用 ctx.remote 上的生成方法：位置参数校验后拼出描述符的精确命名 args，经 ctx.connection.rpc 发 POST /api。请求先过 browser-trust fence（Host 是 loopback 或命中 trustedHosts），再交给复合 FetchHandler：被 Typert interceptor 认领的端点进 typertGateway，按 ctx.typert.local 的描述符校验参数，经 lookups（由 api-remotes 的 resolver 供给）把 sessionId 解析成活 Agent 或恢复的冷会话，随后调用业务 Service 方法并校验返回值；未被认领的端点落 apiproxy 的遗留方法族，但身份策略同一份。之后的会话变化经 events.mux/events.host 两条只下行 WebSocket 推回浏览器。"
+         data-rationale="五跳都在：构造 args → fence → 认领分派 → 查找身份 → 调用与回传，外加下行推送。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> 从浏览器发起一个 Remote 方法调用到拿到结果，完整走一遍每一跳。</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="21-acp-sdk-python.html"><strong>第 21 章 · ACP、SDK 与 Python</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

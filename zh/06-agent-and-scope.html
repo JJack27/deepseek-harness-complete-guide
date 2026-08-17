@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 6 章 · Agent 抽象与 Scope 机制 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 6 章 · Agent 与 Scope</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="6">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 6 章 · 第二部分 · 核心脊柱</div>
+    <h1>Agent 抽象与 Scope 机制</h1>
+    <p class="lede">
+      上一章结束时会话已经能落盘了，但「谁在驱动会话」还没出场。本章认识
+      <code>Agent</code>——dsh 对「一个正在工作的 agent」的公共接口，以及让
+      「每个 agent 有自己的一套工具和提示词」成为可能的 <strong>scope 机制</strong>：
+      一个活 agent 就是它自己 scope 的 key，最具体的注册胜出（shadowing）。
+      这是 per-session 人格（persona）、agent preset、子代理组合的共同地基。
+      具体的驱动循环（turn/step）留给下一章。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学完本章你能够</div>
+    <ul>
+      <li>说出 <code>Agent</code> 接口的成员与 <code>ctx.agents</code> 注册表（get/list/roots/isOwnedBy）各自回答什么问题</li>
+      <li>按「观察还是拦截」给 <code>agent/*</code> 事件分类，并指出哪些是 waterfall（必须调 <code>next()</code>）</li>
+      <li>解释 create/resume 走 <code>AgentFactory</code> 接缝的意义：接口与驱动分离，loop 可整体替换</li>
+      <li>描述 setup window 的时序：在发布前组装 agent 的 scoped 世界，失败整体回滚</li>
+      <li>用 shadowing 规则（最具体的 scope 胜出）推导一个同名注册在多 agent 下谁生效</li>
+      <li>区分「lineage 是数据」与「runtime 所有权」：parentSession 记在 header，父不自动看到子</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-agent-interface">6.1 Agent：接口与注册表</h2>
+
+  <p>
+    第 4 章的 <code>Session</code> 是「发生过什么」；<code>Agent</code> 是「正在做的那个主体」。
+    它是一个纯接口（<code>packages/core/agent/src/runtime-types.ts</code>），
+    <strong>具体实现是 <code>agent-loop</code> 包的私有物</strong>——插件永远不 import
+    <code>agent-loop</code>，只依赖这个接口。成员按用途分组：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>成员</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>id</code> / <code>session</code></td><td>agent 与会话<strong>共享同一个 id</strong>（<code>SessionId</code>）；<code>session</code> 是它驱动的活会话，日志是耐久真相</td></tr>
+      <tr><td><code>options</code></td><td>provider 路由与模型等 per-agent 选项（merge-extensible 的 <code>AgentOptions</code>）</td></tr>
+      <tr><td><code>inbox</code></td><td>持久待办投影：next-turn 与 next-step 两条有序队列</td></tr>
+      <tr><td><code>status</code></td><td><code>idle</code> ⇄ <code>running</code>（每次转迁发 <code>agent/status</code>；dispose 不是第三个状态）</td></tr>
+      <tr><td><code>ctx</code></td><td><strong>agent-scoped 上下文</strong>：通过它注册的贡献是 agent 局部的、随 dispose 展开 afterwards 拒绝注册（6.5 节主角）</td></tr>
+      <tr><td><code>send</code> / <code>followup</code> / <code>steer</code> / <code>inject</code></td><td>投递输入的四种姿势：<code>send</code> 是统一原语（目标 + 是否唤醒），后三个是固定预设（追加一轮 / 就近一步的转向 / 不唤醒的上下文注入）</td></tr>
+      <tr><td><code>cancel</code> / <code>whenIdle</code> / <code>runMaintenance</code></td><td>取消（首个原因获胜，可 <code>keepInbox</code> 保队列）/ 等静止 / 从真空闲跑一段非 turn 维护任务</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    注册表 <code>ctx.agents</code>（<code>AgentRegistry</code>）管「谁活着」：
+    <code>get(id)</code> 查活 agent、<code>list()</code> 按注册序列出全部、
+    <code>roots()</code> 只列无运行时父的顶层 agent、<code>isOwnedBy(id, owner)</code>
+    判断「这个子是不是经某个确切父的 scoped 上下文创建的」——注意这是<strong>运行时关系</strong>，
+    与耐久谱系无关（6.7 节展开）。
+  </p>
+
+  <p>
+    创建 agent 的消费者拿到的是 <code>AgentHandle</code>（<code>{ agent, dispose() }</code>）。
+    <code>dispose</code> 是一种<strong>能力</strong>：在消费者里只有持有者能拆掉这个 agent；
+    另一个结构性 owner 是注册了工厂的 provider（它的 scoped agent 依赖它的服务 API，
+    provider 卸载会停掉并排空它造的所有活 handle）。拆卸顺序固定：
+    停 loop → 等 exit → 注销 agent → 从 session store 移除会话 → 最后展开它的 scoped 世界。
+    经配置创建的 agent（loop 自己的启动项）由 loop fiber 拥有，从不需要 handle。
+  </p>
+
+  <h2 id="sec-agent-events">6.2 agent/* 事件：观察与拦截进行中的工作</h2>
+
+  <p>
+    所有 <code>agent/*</code> 事件都携带活 <code>Agent</code>（payload 里），
+    并经 scope 过滤的分发（上一节 <code>Scoped&lt;Agent&gt;</code> this 载体；6.6 节讲它意味着什么）。
+    按用途分三组记：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>分组</th><th>事件</th><th>模式</th><th>一句话</th></tr>
+    </thead>
+    <tbody>
+      <tr><td rowspan="4">生命周期（观察）</td><td><code>agent/created</code> / <code>agent/disposed</code></td><td>emit</td><td>发布 / 离开注册表；created 的同步抛出可否决发布</td></tr>
+      <tr><td><code>agent/status</code></td><td>emit</td><td>idle ⇄ running 转迁镜像</td></tr>
+      <tr><td><code>agent/inbox/inserted</code> / <code>claimed</code> / <code>discarded</code></td><td>emit</td><td>活收件箱的进出；被认领后又被拒的消息止步于此</td></tr>
+      <tr><td><code>agent/session-start</code></td><td>emit</td><td>会话生命周期开始（每会话一次，第一个 turn 前）——<code>agent.inject()</code> 播种上下文的标准时机</td></tr>
+      <tr><td rowspan="3">拦截（扩展点）</td><td><code>agent/pre-step</code></td><td><strong>waterfall</strong></td><td>拒绝拟议的 step，或改写进入它的消息（调 <code>next()</code> 保留）</td></tr>
+      <tr><td><code>agent/request</code></td><td><strong>waterfall</strong></td><td>替换冻结的调用配置；不能改消息（模型可见内容走日志通道）</td></tr>
+      <tr><td><code>agent/request-error</code></td><td><strong>waterfall</strong></td><td>认领失败请求的恢复（返回 retry 而不调 next），或委托</td></tr>
+      <tr><td>停止边界</td><td><code>agent/turn-stopping</code></td><td>serial（无 next）</td><td>turn 即将闭合；反对的方式是数据——<code>steer()</code> 注入新转向，机器重读收件箱</td></tr>
+      <tr><td>错误通知</td><td><code>agent/error</code></td><td>emit</td><td>step/turn 出错的现场报告（哪怕错误在 turn 里没有耐久位置）</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    和第 4 章的对照值得再念一遍：<strong>会话事件是耐久事实，agent 事件是活扩展点</strong>。
+    事实必须熬过重启所以落日志；进行中的工作（inbox 变化、请求改写、turn 停止）
+    只对当下有意义，所以走 Cordis 事件总线。挑选机制时的第一问永远是：
+    这个事实需要在 reload 后还存在吗？
+  </p>
+
+  <p>
+    三个 waterfall（<code>agent/pre-step</code>、<code>agent/request</code>、
+    <code>agent/request-error</code>）的监听器<strong>必须调 <code>next()</code></strong> 委托下层——
+    不调就是短路整条链，这是第 2 章学过的 Cordis waterfall 语义在 dsh 里最重要的三个落点。
+    <code>agent/turn-stopping</code> 刻意是 serial 且无 <code>next()</code>：它不是否决点，
+    而是「最后看一眼」点，反对靠数据（steer）不靠返回值。
+  </p>
+
+  <h2 id="sec-factory-seam">6.3 create/resume：工厂接缝</h2>
+
+  <p>
+    <code>AgentRegistry</code> 自己不构造 agent。它持有最多一个
+    <code>AgentFactory</code>（<code>createAgent</code> + <code>resume</code> 两个方法），
+    由<strong>驱动插件</strong>在构造时经 <code>ctx.agents.setFactory()</code> 注册——
+    出厂实现来自 <code>agent-loop</code>。没有注册就调 create/resume 会得到一句直白的错误：
+    「no agent factory registered (load an agent-loop plugin)」。
+  </p>
+
+  <pre><code><span class="code-comment">// 消费者视角：只认识 ctx.agents，不认识 agent-loop</span>
+<span class="code-key">const</span> handle = <span class="code-key">await</span> ctx.agents.<span class="code-fn">create</span>({
+  sessionId,              <span class="code-comment">// 共享身份：agent 和 session 同一个 id</span>
+  meta: { cwd, parentSession, delegationDepth, agentPreset, ... },
+  seed,                   <span class="code-comment">// 可选：fork 的平衡前缀</span>
+  agentOptions: { provider, model, maxTokens },
+  setup,                  <span class="code-comment">// 6.4 节主角</span>
+})
+<span class="code-comment">// resume 是持久化版：先走 ctx.sessionPersistence.prepare(id)</span>
+<span class="code-key">const</span> resumed = <span class="code-key">await</span> ctx.agents.<span class="code-fn">resume</span>({ resumeSessionId, agentOptions, setup })</code></pre>
+
+  <p>
+    这个接缝的意义是<strong>接口与驱动分离</strong>：ACP 桥、测试工具、任何消费者都编程于
+    <code>ctx.agents</code>，谁也不知道驱动是谁。想把整个 loop 换成另一种实现
+    （比如不做工具循环的特殊驱动），注册自己的 factory 即可，插件生态不动。
+    工厂内部的事务顺序（下一章细讲）：铸造 scoped 上下文 → await setup →
+    依次插入并公告 session 与 agent → 发 <code>agent/session-start</code> → 启动 loop。
+    每一步都被回滚覆盖：已经公告过的创建会配上配对的 disposed 通知。
+  </p>
+
+  <p>
+    注册表还提供<strong>发起者（initiator）作用域</strong>：进程内异步链上的因果归属。
+    <code>withInitiator(agent, fn)</code> 把 agent 带进 <code>fn</code> 的整个返回生命周期，
+    <code>currentInitiator()</code> 读它（可选形式，给日志/追踪/指标用）、
+    <code>requireInitiator()</code> 强制要求、<code>withoutInitiator(fn)</code> 显式清除
+    （给懒共享定时器、队列泵这种「别继承第一个碰巧初始化它的 agent」的场景）。
+    注意契约：initiator 的存在<strong>既不是活性证明也不是授权</strong>——
+    只是同进程的因果标注；主体与 owner 永远显式传递。
+  </p>
+
+  <h2 id="sec-setup-window">6.4 setup window：发布前组装 scoped 世界</h2>
+
+  <p>
+    <code>CreateAgentOptions.setup</code> / <code>ResumeAgentOptions.setup</code>
+    是一个回调，签名是 <code>(agentCtx: Context) =&gt; commit | Promise&lt;commit | void&gt; | void</code>。
+    它是最重要的组装窗口，时序契约一句话：<strong>工厂铸造出 agentCtx 之后、
+    插入或公告 session 与 agent 之前 await 它</strong>。后果是观察者永远看不到
+    半配置的世界：通过 <code>agentCtx</code> 注册的一切（scoped 工具、prompt section /
+    变量、<code>restrict()</code>、监听器、await 的子插件）在
+    <code>session/created</code>、<code>agent/created</code>、<code>agent/session-start</code>
+    和第一次 prompt 组装之前<strong>全部就位</strong>。
+  </p>
+
+  <ul>
+    <li><strong>setup 只组装，从不驱动</strong>：回调拿到完整 scoped 上下文（可信同进程代码），
+      这是契约而非运行时限制——创建 resolve 之后才能驱动 agent。</li>
+    <li>setup 可以返回一个同步的 <code>AgentSetupCommit</code>，其 <code>commit()</code>
+      在所有 setup await 落定后、发布前一刻被调用——让可变的配置在确切的发布边界重新校验。</li>
+    <li>setup 抛错、commit 抛错、owner dispose，都会<strong>整体回滚</strong>：
+      两个 id（session 与 agent）都不发布。</li>
+    <li>resume 的 setup 同构：先加载持久化，再铸造 agentCtx、await setup，
+      期间重建的 session 与 agent 都未发布。</li>
+  </ul>
+
+  <p>
+    preset 系统就长在这个窗口上：<code>ctx.agentPresets.mount(agentCtx, id)</code>
+    的唯一受支持调用点就是工厂的 <code>setup(agentCtx)</code> 钩子——只有在那里 join
+    才能保证「组合失败 → 整个创建回滚」而不是留下半组装的会话（第 3 章组装、
+    第 14 章子代理都会回到这里）。
+  </p>
+
+  <h2 id="sec-scope-mechanism">6.5 Scope 机制：agent 就是自己 scope 的 key</h2>
+
+  <p>
+    「通过 <code>agentCtx</code> 注册的东西是 agent 局部的」这句话的机制在
+    <code>packages/core/scope</code>。先记三个身份事实：
+  </p>
+  <ul>
+    <li>它是一个<strong>库，不是 Cordis 服务</strong>——没有 ctx key，模块图里坐在
+      session 与 system-prompt <strong>之下</strong>，好让它们用得起而不成环。</li>
+    <li><code>ScopeKey</code> 是<strong>不透明的对象身份</strong>（<code>type ScopeKey = object</code>，
+      按同一性比较）。原语从不检查对象内容。</li>
+    <li>出货的 loop 里，<strong>活 <code>Agent</code> 对象就是自己的 scope key</strong>：
+      <code>agent-loop/src/agent.ts</code> 里 <code>this.scope = createScope(loopCtx, this)</code>，
+      然后 <code>this.ctx = this.scope.ctx.extend({ agent: this })</code>——
+      你读到的 <code>agent.ctx</code> 就是这个带 scope 标签、又带 <code>ctx.agent</code>
+      DX 访问器的上下文。</li>
+  </ul>
+
+  <p>
+    <code>createScope(ctx, key, options?)</code> 铸造一个 scope：
+    它在 <code>ctx</code> 下挂一个共享空插件（拥有全部注册的生命周期），
+    把 key 写进派生上下文的标签位（<code>scopeOf(ctx)</code> 可读回），
+    返回 <code>{ ctx, rawDispose, dispose }</code>——<code>rawDispose</code> 保留
+    Cordis 确切 disposer 身份（给有序组合 effect 嵌套用），<code>dispose()</code>
+    是共享的静止拆卸边界。
+  </p>
+
+  <p>
+    一对方向相反的能力由同一条<strong>父链</strong>（<code>bindScopeParent</code>，防环）驱动：
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Scope chain: views inherit down, events flow up">
+      <rect x="290" y="14" width="180" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="380" y="34" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">全局层（无 scope）</text>
+      <text x="380" y="50" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">deployment 的注册与监听</text>
+
+      <rect x="270" y="100" width="220" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="380" y="120" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">preset standing mount</text>
+      <text x="380" y="136" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">进程内挂一次，链上共享</text>
+
+      <rect x="180" y="186" width="180" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="270" y="206" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">agent A（自己的 key）</text>
+      <text x="270" y="222" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">scoped 层：宽松 write</text>
+
+      <rect x="420" y="186" width="180" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="510" y="206" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">agent B（同一个 preset）</text>
+      <text x="510" y="222" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">无自己的 write 注册</text>
+
+      <line x1="380" y1="58" x2="380" y2="96" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="330" y1="144" x2="278" y2="182" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="430" y1="144" x2="482" y2="182" style="stroke:var(--muted)" stroke-width="2"/>
+      <text x="352" y="82" style="fill:var(--fg-dim)" font-size="10">父子链（bindScopeParent）</text>
+
+      <line x1="600" y1="120" x2="600" y2="170" style="stroke:var(--accent)" stroke-width="2.5"/>
+      <polygon points="600,176 595,166 605,166" style="fill:var(--accent)"/>
+      <text x="612" y="148" style="fill:var(--accent)" font-size="10.5">注册视图向下继承</text>
+      <text x="612" y="162" style="fill:var(--fg-dim)" font-size="10">agent A 看：A → preset → global</text>
+
+      <line x1="700" y1="170" x2="700" y2="124" style="stroke:var(--accent-2)" stroke-width="2.5" stroke-dasharray="6,4"/>
+      <polygon points="700,118 695,128 705,128" style="fill:var(--accent-2)"/>
+      <text x="712" y="148" style="fill:var(--accent-2)" font-size="10.5">事件准入向上放行</text>
+      <text x="712" y="162" style="fill:var(--fg-dim)" font-size="10">preset 的监听器收到 A、B 的事件</text>
+
+      <line x1="540" y1="208" x2="410" y2="208" style="stroke:var(--fail)" stroke-width="1.5" stroke-dasharray="4,4"/>
+      <polygon points="404,208 414,203 414,213" style="fill:var(--fail)"/>
+      <text x="475" y="200" text-anchor="middle" style="fill:var(--fail)" font-size="9.5">兄弟间互不可见</text>
+
+      <text x="380" y="246" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">同一条父链驱动两个方向：视图沿链向下叠加（最近胜出），事件沿链向上放行（祖先观察后代）</text>
+    </svg>
+    <figcaption>图 6-2 · scope 父链的双向语义：agent A 与 B 的视图沿链向下继承（A → preset → global），事件沿链向上放行（preset 的监听器收到两个 agent 的事件）；兄弟之间互不可见。</figcaption>
+  </figure>
+  <ul>
+    <li><strong>注册视图沿链向下继承</strong>：子 scope 看得见祖先的层
+      （<code>ScopedLayers.chainLayers</code>——这是下一节 shadowing 的基础）。</li>
+    <li><strong>事件准入沿链向上放行</strong>：<code>scopeTarget(base, key)</code> 造出路由载体，
+      未打标签的监听器全局放行，打了标签的监听器只有「匹配 key 或其祖先」才收到——
+      祖先 scope 的监听器能收到所有后代 scope 的事件，
+      <strong>事件沿链上流，永不下流</strong>。这就是为什么一个常驻组合
+      （比如某个 preset 的 standing mount）能观察它下面组装的每个 agent。</li>
+  </ul>
+
+  <h2 id="sec-shadowing">6.6 Shadowing：最具体的 scope 胜出</h2>
+
+  <p>
+    现在看注册表这侧。scope 感知的注册表（<code>ctx.tools</code>、
+    <code>ctx.systemPrompt</code>……）用 <code>ScopedLayers&lt;L&gt;</code> 存两层：
+    一个<strong>急切构造的全局层</strong>，加每 scope 惰性创建的<strong>覆盖层</strong>。
+    读取用 <code>merge()</code>：
+  </p>
+
+  <pre><code><span class="code-comment">// ScopedLayers.merge 的效果（示意）</span>
+merged = <span class="code-key">new Map</span>(全局层的命名项)
+<span class="code-key">for</span> (layer <span class="code-key">of</span> 沿父链由远到近的 scope 层)
+  <span class="code-key">for</span> ([name, value] <span class="code-key">of</span> layer) merged.set(name, value)
+<span class="code-comment">// 同名时后写覆盖先写 → 链上最近的 scope 拥有最终发言权</span></code></pre>
+
+  <p>
+    规则就一句：<strong>最具体的 scope 胜出</strong>。同名注册在 agent 层出现，
+    就遮蔽（shadow）全局层的那一个——被遮蔽的注册<strong>没有卸载</strong>：
+    它还在全局层里，其他 agent 照常解析到它；只有这个 agent 的视图里，
+    自己层上的同名项盖住了它。注册与拆卸对称：经 <code>ctx.effect()</code> 拥有，
+    undo 之后若整个层空了，层本身被回收。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Global vs agent-scoped shadowing">
+      <rect x="10" y="20" width="560" height="120" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="30" y="44" style="fill:var(--accent)" font-size="12" font-weight="700">全局层（deployment 注册，所有 agent 共享）</text>
+      <g font-size="10.5">
+        <rect x="30" y="58" width="150" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="105" y="77" text-anchor="middle" style="fill:var(--fg)">write（严格版）</text>
+        <rect x="190" y="58" width="130" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="255" y="77" text-anchor="middle" style="fill:var(--fg)">read</text>
+        <rect x="330" y="58" width="130" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="395" y="77" text-anchor="middle" style="fill:var(--fg)">bash</text>
+        <rect x="470" y="58" width="80" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="510" y="77" text-anchor="middle" style="fill:var(--fg)">grep</text>
+      </g>
+
+      <rect x="60" y="160" width="300" height="110" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="80" y="184" style="fill:var(--accent-2)" font-size="12" font-weight="700">人格 agent 的 scoped 层（persona 插件注册）</text>
+      <g font-size="10.5">
+        <rect x="80" y="198" width="150" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2.5"/>
+        <text x="155" y="217" text-anchor="middle" style="fill:var(--fg)">write（宽松版）</text>
+        <rect x="240" y="198" width="100" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2.5"/>
+        <text x="290" y="217" text-anchor="middle" style="fill:var(--fg)">persona 文案</text>
+      </g>
+      <text x="210" y="254" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">agent.ctx 的注册落在这层</text>
+
+      <line x1="155" y1="88" x2="155" y2="196" style="stroke:var(--fail)" stroke-width="2"/>
+      <text x="163" y="140" style="fill:var(--fail)" font-size="10">同名遮蔽</text>
+
+      <rect x="400" y="160" width="170" height="110" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="485" y="184" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">另一个 agent（无 scoped 层）</text>
+      <text x="485" y="212" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">视图 = 全局层原样</text>
+      <text x="485" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">write → 严格版</text>
+      <text x="485" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">（被遮蔽 ≠ 被卸载）</text>
+
+      <text x="600" y="80" style="fill:var(--fg-dim)" font-size="10.5">merge 顺序：</text>
+      <text x="600" y="98" style="fill:var(--fg-dim)" font-size="10.5">全局 → preset 层</text>
+      <text x="600" y="116" style="fill:var(--fg-dim)" font-size="10.5">→ agent 层</text>
+      <text x="600" y="134" style="fill:var(--fg-dim)" font-size="10.5">（若有 preset 层）</text>
+      <text x="600" y="160" style="fill:var(--fg)" font-size="10.5" font-weight="700">视图解析：</text>
+      <text x="600" y="178" style="fill:var(--fg-dim)" font-size="10.5">agent → preset</text>
+      <text x="600" y="196" style="fill:var(--fg-dim)" font-size="10.5">→ global</text>
+      <text x="600" y="214" style="fill:var(--fg-dim)" font-size="10.5">最近者优先</text>
+      <text x="380" y="290" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">persona 插件之所以「只能在 agent scope 里挂载」：全局挂载会与 deployment:persona 注册同名相撞，大声失败</text>
+    </svg>
+    <figcaption>图 6-1 · shadowing：人格 agent 在自己的 scoped 层注册同名 write（宽松版）与 persona 文案，遮蔽全局注册；全局注册仍在，其他 agent 不受影响。</figcaption>
+  </figure>
+
+  <p>
+    这是 <strong>per-session 人格的底层机制</strong>。<code>dsh-persona</code> 插件
+    注册一段 <code>deployment:persona</code> prompt section——与 system-prompt
+    自己无条件注册的那一段<strong>同名</strong>。全局挂载会撞名失败（部署人格已有 owner），
+    它被设计成<strong>只能在 agent scope 里挂载</strong>：preset 组合时，
+    该 agent 的视图里 persona 插件的文案遮蔽部署文案。可选 <code>complete: true</code>
+    甚至在组装完成后把该 agent 的系统提示词<strong>恢复成只剩这一段</strong>。
+    遮蔽改变的是视图，不是世界——同一个进程里别的 agent 一无所知。
+  </p>
+
+  <p>
+    scope 链还能更长：preset 的 standing mount 在进程里挂<strong>一次</strong>
+    （在 roster 服务自己的 fiber 下），每个点名它的会话把自己的 agent scope key
+    <strong>父子链接</strong>到 mount 的 key 上。于是该 agent 的视图解析顺序是
+    <code>agent → preset → global</code>：mount 层上的工具与 prompt section
+    对所有加入的 agent 生效且实例只有一份（插件按 Session/Agent 键控自己的状态），
+    而 sibling preset 的监听器对它保持「聋」。
+  </p>
+
+  <div class="demo" data-demo="scopeShadow">
+    <div class="demo-title">试一试 —— scoped 注册的 shadowing</div>
+    <p>全局注册了严格版 write 工具；人格 agent 在自己的 agent.ctx 里注册了同名宽松版：</p>
+    <label><input type="radio" name="d6" value="base"> 默认 agent</label>
+    <label><input type="radio" name="d6" value="persona"> 人格 agent（preset 装了 persona 插件）</label>
+    <div class="demo-output empty">选择会话使用的 agent。</div>
+  </div>
+
+  <h2 id="sec-lineage-vs-visibility">6.7 lineage 是数据，不是可见性</h2>
+
+  <p>
+    最后一组容易混淆的概念：会话的<strong>谱系（lineage）</strong>与运行时的<strong>可见性 / 所有权</strong>。
+    第 4 章见过 <code>SessionHeader</code> 的谱系字段：<code>parentSession</code>（从谁 fork/resume）、
+    <code>seedLength</code>（继承前缀多长）、<code>origin: 'subagent'</code>、
+    <code>delegationDepth</code>（递归预算，持久化就是为了熬过重启）。要点是：
+  </p>
+
+  <div class="box key">
+    <p style="margin:0;">
+      谱系是<strong>数据</strong>，记在 header 里，供 UI 展示、递归预算、fork 导航用。
+      它不创造任何运行时可见性——<strong>父不自动看到子</strong>：父 agent 不会因为
+      header 里写着 parentSession 就收到子的事件或读到子的日志。
+    </p>
+  </div>
+
+  <p>
+    运行时的关系另有其人，两者刻意独立：
+  </p>
+  <ul>
+    <li><strong>runtime 所有权</strong>：注册表 entry 上的 <code>owner</code> 字段——
+      「这个子 agent 是经哪个确切父 agent 的 scoped 上下文创建的」
+      （<code>isOwnedBy(id, owner)</code> 查询）。resume 出来的 fork 没有 runtime 父，
+      仍然是 root——耐久谱系不影响这个运行时关系，反之亦然。</li>
+    <li><strong>事件可见性</strong>：scope 链的向上放行（6.5 节）。谁想观察子，
+      就在合适的祖先 scope 上挂监听器（preset 的 standing mount 观察它下面所有 agent
+      就是这么来的）；或显式传引用。没有「因为我是父亲所以自动收到」的隐式通道。</li>
+    <li><strong>initiator 归属</strong>：进程内异步链上的因果标注
+      （<code>currentInitiator()</code>），第 14 章子代理会看到它怎么用于归因。</li>
+  </ul>
+
+  <p>
+    把三者分开的价值在边界上显形：重启之后 runtime owner 和 initiator 都没了，
+    只剩 header 里的谱系数据；跨进程 / 跨 wire 时（第 20 章 Typert RPC），
+    连 <code>Agent</code> 对象都不再是同一个，只有 id 与谱系可传。
+    「数据归日志，关系归运行时」，这条线贯穿 dsh 的所有边界设计。
+  </p>
+
+  <h2 id="sec-recap">6.8 本章回顾</h2>
+  <ul>
+    <li><code>Agent</code> 是公共接口（id/session/inbox/status/ctx + send 族 + cancel/whenIdle/runMaintenance），实现是 agent-loop 的私有物；<code>ctx.agents</code> 管活注册表，<code>AgentHandle.dispose</code> 是能力，拆卸顺序：停 loop → 注销 → 移会话 → 展开 scoped 世界。</li>
+    <li><code>agent/*</code> 事件分三组：生命周期观察（emit）、拦截扩展点（pre-step / request / request-error 三个 waterfall，必须调 next()）、turn-stopping（serial，反对靠 steer 数据）+ agent/error 通知。会话事件是耐久事实，agent 事件是活扩展点。</li>
+    <li>create/resume 走 <code>AgentFactory</code> 接缝：loop 经 setFactory 注册，消费者只依赖 ctx.agents——接口与驱动分离，loop 可整体替换。</li>
+    <li>setup window 在发布前组装 scoped 世界：agentCtx 铸造后、双公告前 await；一切注册就位于第一个事件与首次 prompt 组装之前；失败整体回滚；可选 commit 在发布边界重校验。</li>
+    <li>scope 是库不是服务：ScopeKey 是不透明对象身份，活 Agent 对象就是自己的 key；agent.ctx = 带标签的 scoped 上下文。</li>
+    <li>shadowing：ScopedLayers 的全局层 + scope 覆盖层，merge 时沿父链由远到近、最近胜出；被遮蔽的注册不卸载。persona 插件靠它实现 per-session 人格（只能 scoped 挂载，全局挂载撞名失败）；preset standing mount 让视图解析变成 agent → preset → global。</li>
+    <li>谱系是数据不是可见性：parentSession/delegationDepth 记在 header 供预算与导航；runtime owner（isOwnedBy）、scope 链的事件放行、initiator 归属是三个独立的运行时关系，父不自动看到子。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>插件直接 import <code>agent-loop</code> 拿驱动。扩展件只依赖 <code>agent</code>（接口层）；需要发起者时用 <code>ctx.agents.currentInitiator()</code>。</li>
+      <li>在 waterfall 监听器里不调 <code>next()</code> 就返回。pre-step / request / request-error 的链会当场短路，下层全部失效。</li>
+      <li>以为 persona 插件能全局挂载然后按会话开关。同名注册相撞会大声失败——它被设计成只能在 agent scope（preset 组合）里挂载。</li>
+      <li>把 header 里的 parentSession 当运行时父子关系用。谱系是数据：重启后仍在、但既不给事件可见性也不给拆卸权；runtime 所有权用 isOwnedBy 查。</li>
+      <li>在 setup 里驱动 agent。setup 只组装、从不驱动；创建 resolve 之前任何 send/followup 都是误用。</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="6">
+    <h2>第 6 章测验</h2>
+
+    <div class="q" data-id="6-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— agent 与会话共享同一个 SessionId；Agent 接口在 core/agent，实现是 agent-loop 的私有物。"
+         data-rationale="B 正确：单一共享身份是注册表、Typert 查询、wire 协议的基础。A 错：接口与实现分离正是为了让 loop 可替换。C 错：status 只有 idle/running 两个可观察值。D 错：可以配置创建（loop 启动项），此时 owner 是 loop fiber，不需要 handle。"
+         data-review="sec-agent-interface">
+      <div class="prompt"><span class="qnum">Q1.</span> 关于 <code>Agent</code> 接口与身份，下列哪句对？</div>
+      <label class="opt"><input type="radio" name="q-6-1" value="a"> A. Agent 的实现在 core/agent 里，插件应直接实例化它</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="b"> B. agent 与它驱动的 session 共享同一个 id；接口在 core/agent，具体实现是 agent-loop 的私有物</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="c"> C. status 有 idle、running、disposed 三个可观察值</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="d"> D. 所有 agent 都必须经 AgentHandle 创建</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-2" data-type="mcq" data-multiselect="true" data-correct='["b","d","e"]'
+         data-answer="B、D、E —— pre-step、request、request-error 是 waterfall，监听器必须调 next() 委托。"
+         data-rationale="B、D、E 正确。A 错：turn-stopping 是 serial 且刻意没有 next()，反对靠 steer 数据。C 错：agent/status 是 emit 观察。F 错：agent/created 是 emit，同步抛出可否决发布，但不是 waterfall。"
+         data-review="sec-agent-events">
+      <div class="prompt"><span class="qnum">Q2.</span> 下列哪些 agent/* 事件是 waterfall（监听器必须调 <code>next()</code>）？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="a"> A. <code>agent/turn-stopping</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="b"> B. <code>agent/pre-step</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="c"> C. <code>agent/status</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="d"> D. <code>agent/request</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="e"> E. <code>agent/request-error</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="f"> F. <code>agent/created</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— AgentFactory 由驱动插件（agent-loop）经 setFactory 注册；消费者只依赖 ctx.agents，loop 可整体替换。"
+         data-rationale="C 正确：接口与驱动分离。A 错：registry 刻意不构造 agent，没工厂时报「load an agent-loop plugin」。B 错：ACP 桥正是依赖 ctx.agents 而非 agent-loop 的例子。D 错：sibling preset 的事件对它保持聋——事件沿链上流，不横流。"
+         data-review="sec-factory-seam">
+      <div class="prompt"><span class="qnum">Q3.</span> AgentFactory 接缝的存在意义是？</div>
+      <label class="opt"><input type="radio" name="q-6-3" value="a"> A. 让 AgentRegistry 能同时跑多个不同 loop</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="b"> B. 让 ACP 桥直接 import agent-loop 的内部类</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="c"> C. 接口与驱动分离：消费者编程于 ctx.agents，注册工厂的驱动（默认 agent-loop）可整体替换</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="d"> D. 让每个 preset 能注册自己的工厂</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 工厂在铸造 agentCtx 之后、插入或公告 session 与 agent 之前 await setup；观察者永远看不到半配置的世界。"
+         data-rationale="A 正确：这是 setup window 的核心时序。B 错：公告发生在 setup 之后。C 错：第一个 turn 远在 setup 之后（session-start 都晚于它）。D 错：setup 是组装窗口，恰在发布前，不是运行期回调。"
+         data-review="sec-setup-window">
+      <div class="prompt"><span class="qnum">Q4.</span> setup 回调在什么时机被 await？</div>
+      <label class="opt"><input type="radio" name="q-6-4" value="a"> A. agentCtx 铸造之后、session/agent 插入与公告之前</label>
+      <label class="opt"><input type="radio" name="q-6-4" value="b"> B. agent/created 公告之后、loop 启动之前</label>
+      <label class="opt"><input type="radio" name="q-6-4" value="c"> C. 第一个 turn 开始时</label>
+      <label class="opt"><input type="radio" name="q-6-4" value="d"> D. 每次 agent 收到新输入时</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-5" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D —— setup 只组装不驱动、可返回发布边界重校验的 commit、抛错则两个 id 都不发布。"
+         data-rationale="A、C、D 正确。B 错：预设插件的正确姿势恰恰是在 setup 里挂 scoped 注册，而不是等运行期。E 错：resume 同样支持 setup，先加载持久化再组装。"
+         data-review="sec-setup-window">
+      <div class="prompt"><span class="qnum">Q5.</span> 关于 setup window 的契约，哪些正确？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="a"> A. setup 只组装、从不驱动；创建 resolve 后才能驱动 agent</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="b"> B. 预设插件应在运行期动态挂载，避开 setup</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="c"> C. setup 可返回 AgentSetupCommit，其 commit() 在发布前一刻重校验</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="d"> D. setup 抛错或 commit 抛错会整体回滚：session 与 agent 都不发布</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="e"> E. resume 不支持 setup，只有 create 支持</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-6" data-type="fill" data-accepted='["createScope","createscope","the createScope"]'
+         data-answer="createScope（scope 包导出的库函数；loop 用 createScope(loopCtx, this) 铸造 agent 的 scoped 上下文）。"
+         data-rationale="dsh-scope 是库不是服务：createScope(ctx, key) 返回 { ctx, rawDispose, dispose }；活 Agent 对象作为自己的 ScopeKey。"
+         data-review="sec-scope-mechanism">
+      <div class="prompt"><span class="qnum">Q6.</span> 填空：agent-loop 用 scope 包的 <code>______</code> 函数铸造 agent 的 scoped 上下文，key 就是 agent 对象自己。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 同名注册由链上最近的 scope 胜出；被遮蔽的全局注册不卸载，其他 agent 仍解析到它。"
+         data-rationale="B 正确：merge 沿父链由远到近覆盖。A 错：遮蔽不等于卸载，全局注册仍在。C 错：加载顺序无关，视图解析规则是最近者胜。D 错：preset 的 standing mount 只挂一次、被链共享，不是每会话复制。"
+         data-review="sec-shadowing">
+      <div class="prompt"><span class="qnum">Q7.</span> 人格 agent 在自己的 scoped 层注册了同名 write 工具后，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-6-7" value="a"> A. 全局的 write 注册被卸载，所有 agent 改用宽松版</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="b"> B. 该 agent 的视图解析到宽松版；全局注册仍在，其他 agent 继续用严格版</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="c"> C. 两个同名注册共存，按加载顺序随机生效</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="d"> D. preset mount 为每个会话复制一份全局注册再改名</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— dsh-persona 注册与部署人格同名的 deployment:persona section，全局挂载会撞名失败；scoped 挂载则在该 agent 视图里遮蔽部署文案。"
+         data-rationale="D 正确：这正是它只能 scoped 挂载的原因。A 错：没有全局开关。B 错：卸载全局注册不是它的机制。C 错：persona 落在 prompt 注册表面非事件。"
+         data-review="sec-shadowing">
+      <div class="prompt"><span class="qnum">Q8.</span> dsh-persona 插件实现 per-session 人格的机制是？</div>
+      <label class="opt"><input type="radio" name="q-6-8" value="a"> A. 在全局层注册 deployment:persona，按会话开关</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="b"> B. 卸载全局人格注册，换上自己的</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="c"> C. 往会话日志追加 persona 事件</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="d"> D. 在 agent scope 里注册同名 deployment:persona section，遮蔽部署文案而不卸载它</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 事件准入沿 scope 父链向上放行：祖先 scope 的监听器收到所有后代的事件，永不向下。"
+         data-rationale="C 正确：一对方向由同一条父链驱动——视图沿链向下继承，事件沿链向上放行。A 说反了。B 错：未打标签的监听器是全局放行的。D 错：sibling preset 之间没有链，互不可见。"
+         data-review="sec-scope-mechanism">
+      <div class="prompt"><span class="qnum">Q9.</span> scope 链上的事件流向是怎样的？</div>
+      <label class="opt"><input type="radio" name="q-6-9" value="a"> A. 父 scope 的监听器收到子 scope 的事件，同时也向下广播</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="b"> B. 所有事件都对所有监听器可见</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="c"> C. 事件沿链向上放行：祖先（含 preset mount）的监听器收到后代 agent 的事件，永不下流</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="d"> D. 兄弟 preset 互相能看到对方 agent 的事件</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— parentSession 是 header 里的数据（预算/导航用）；父要观察子得在祖先 scope 挂监听器或显式传引用，没有隐式通道。"
+         data-rationale="B 正确：lineage 是数据不是可见性。A 错：父不自动看到子。C 错：runtime 所有权（isOwnedBy）与耐久谱系独立，resume 的 fork 仍是 root。D 错：重启后 runtime 关系消失，只剩 header 数据。"
+         data-review="sec-lineage-vs-visibility">
+      <div class="prompt"><span class="qnum">Q10.</span> 子代理会话 header 里的 parentSession 字段给了父 agent 什么？</div>
+      <label class="opt"><input type="radio" name="q-6-10" value="a"> A. 自动订阅子会话的全部事件</label>
+      <label class="opt"><input type="radio" name="q-6-10" value="b"> B. 什么运行时能力都不给——它只是谱系数据；观察要在祖先 scope 挂监听器或显式传引用</label>
+      <label class="opt"><input type="radio" name="q-6-10" value="c"> C. isOwnedBy 的查询结果</label>
+      <label class="opt"><input type="radio" name="q-6-10" value="d"> D. 重启后依然有效的拆卸权</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-11" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A、C —— runtime 所有权查 isOwnedBy、与耐久谱系独立；三个运行时关系（所有权/事件可见性/initiator）在重启后都不复存在，只剩 header 谱系。"
+         data-rationale="A、C 正确。B 错：resume 出的会话没有 runtime 父，仍算 root——两关系独立。D 错：initiator 是进程内因果标注，不是活性证明也不是授权。"
+         data-review="sec-lineage-vs-visibility">
+      <div class="prompt"><span class="qnum">Q11.</span> 关于运行时关系与耐久谱系，哪些说法正确？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="a"> A. isOwnedBy 查询的是运行时创建关系，与 header 里的 parentSession 互相独立</label>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="b"> B. resume 一个带 parentSession 的会话，它自动变成运行时子 agent</label>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="c"> C. 进程重启后 runtime owner 与 initiator 都消失，只剩 header 谱系数据</label>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="d"> D. currentInitiator() 的返回值可以用作授权判断</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-12" data-type="short"
+         data-key-points='["scope 感知注册表分全局层与 scope 覆盖层两层（ScopedLayers）","merge 沿父链由远到近覆盖同名项，最近的 scope 胜出","被遮蔽的注册不卸载，其他 agent 照常解析到全局版","persona 插件注册同名 deployment:persona section 实现 per-session 人格，全局挂载撞名失败","preset standing mount 挂一次、经父链共享，视图解析 agent → preset → global"]'
+         data-answer="要点：ScopedLayers 全局层 + scope 层；merge 由远到近、最近胜出；遮蔽不卸载；persona 靠同名 section 遮蔽部署人格（只能 scoped 挂载）；preset mount 经父链让视图变成 agent → preset → global。"
+         data-rationale="说出「两层 + 最近胜出 + 不卸载 + persona 实例 + preset 链」五个要点中的四个即可。"
+         data-review="sec-shadowing">
+      <div class="prompt"><span class="qnum">Q12.</span> 用你自己的话解释 shadowing 机制：注册表怎么分层、同名谁胜出、被遮蔽的注册去哪了、persona 和 preset 分别怎么用它？</div>
+      <textarea class="short" placeholder="写下你的理解…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正说到了才勾选——少勾损害的是书对你的校准，多勾只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做本测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="07-agent-loop.html"><strong>第 7 章 · Agent Loop：Turn/Step 生命周期</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

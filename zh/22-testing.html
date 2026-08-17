@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 22 章 · 测试体系：五条 vitest 通道与回放 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 22 章 · 测试体系</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="22">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 22 章 · 第五部分 · 工程与贡献</div>
+    <h1>测试体系：五条 vitest 通道与回放</h1>
+    <p class="lede">
+      前面二十一章你读了 dsh 的运行时；本章读它的「证明义务」。这个仓库把测试分成五条
+      vitest 通道——unit、e2e、snapshot、web、web-stress/perf——每条通道只回答一类证据问题，
+      谁需要密钥、谁在 CI 里跑、谁产出提交进仓库的金标准，都有明确分工。读懂这套体系，
+      你才知道自己的改动「要补什么测试」，以及为什么包测试永远不能替代组装后的应用转录。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出五条 vitest 通道各自的入口命令、include 模式与证据面。</li>
+      <li>解释 <code>test:coverage</code>（而非 <code>test</code>）为何是 CI 覆盖率门禁，以及 per-file 100% 的含义。</li>
+      <li>区分 <code>DSH_SNAPSHOT</code> 的 replay / record / refresh 三种模式各自需要什么、写不写金标准。</li>
+      <li>描述 <code>llm-replay</code> 如何把持久化会话日志变成无密钥回放脚本，包括按 <code>(turn, step)</code> 分组与按首调顺序绑定子会话。</li>
+      <li>复述 docs/testing.md 的核心政策：同一 PR 内用真实可运行 example 补 keyless 快照、fixture 在 macOS/Linux 可回放、修 fixture 而不是修 normalizer。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-lanes">22.1 五条通道：一张矩阵</h2>
+
+  <p>
+    仓库根目录下每个通道一份独立 vitest 配置：<code>vitest.config.ts</code>（unit）、
+    <code>vitest.e2e.config.ts</code>（真实 API）、<code>vitest.snapshot.config.ts</code>（金标准回放）、
+    <code>vitest.web.config.ts</code>（浏览器）以及 <code>vitest.web-stress.config.ts</code> 与
+    <code>vitest.web.perf.config.ts</code>（压力与性能）。它们不是按「快慢」分层，而是按
+    <strong>证据面</strong>分层：unit 证明包内行为，e2e 证明真实 provider 行为，snapshot 证明
+    组装后的完整转录，web 证明浏览器里的真实渲染，stress/perf 证明 Web 界面在负载下的表现。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 388" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="五条测试通道矩阵">
+      <rect x="8" y="8" width="764" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">通道</text>
+      <text x="168" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">入口命令</text>
+      <text x="428" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">密钥</text>
+      <text x="528" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">证据面</text>
+
+      <rect x="8" y="50" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="75" style="fill:var(--accent)" font-size="14" font-weight="700">unit</text>
+      <text x="24" y="95" style="fill:var(--fg-dim)" font-size="11">vitest.config.ts</text>
+      <text x="168" y="75" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test</text>
+      <text x="168" y="95" style="fill:var(--fg-dim)" font-size="11">**/*.spec.ts</text>
+      <text x="428" y="85" style="fill:var(--pass)" font-size="12" font-weight="700">免密</text>
+      <text x="528" y="75" style="fill:var(--fg)" font-size="12">包级行为：注册表、事件顺序、</text>
+      <text x="528" y="95" style="fill:var(--fg)" font-size="12">HMR 安全、契约回归</text>
+
+      <rect x="8" y="118" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="143" style="fill:var(--accent)" font-size="14" font-weight="700">e2e</text>
+      <text x="24" y="163" style="fill:var(--fg-dim)" font-size="11">vitest.e2e.config.ts</text>
+      <text x="168" y="143" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test:e2e</text>
+      <text x="168" y="163" style="fill:var(--fg-dim)" font-size="11">**/*.e2e.ts</text>
+      <text x="428" y="143" style="fill:var(--warn)" font-size="12" font-weight="700">需要密钥</text>
+      <text x="428" y="163" style="fill:var(--fg-dim)" font-size="11">无则自跳过</text>
+      <text x="528" y="143" style="fill:var(--fg)" font-size="12">真实 provider：DeepSeek 与</text>
+      <text x="528" y="163" style="fill:var(--fg)" font-size="12">各搜索/抓取供应商</text>
+
+      <rect x="8" y="186" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="24" y="211" style="fill:var(--accent)" font-size="14" font-weight="700">snapshot</text>
+      <text x="24" y="231" style="fill:var(--fg-dim)" font-size="11">vitest.snapshot.config.ts</text>
+      <text x="168" y="211" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test:snapshot</text>
+      <text x="168" y="231" style="fill:var(--fg-dim)" font-size="11">**/*.snapshot.ts</text>
+      <text x="428" y="211" style="fill:var(--pass)" font-size="12" font-weight="700">replay 免密</text>
+      <text x="428" y="231" style="fill:var(--warn)" font-size="11">record 需密钥</text>
+      <text x="528" y="211" style="fill:var(--fg)" font-size="12">组装后的转录：ACP/headless</text>
+      <text x="528" y="231" style="fill:var(--fg)" font-size="12">请求、协议输出、重持久化日志</text>
+
+      <rect x="8" y="254" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="279" style="fill:var(--accent)" font-size="14" font-weight="700">web</text>
+      <text x="24" y="299" style="fill:var(--fg-dim)" font-size="11">vitest.web.config.ts</text>
+      <text x="168" y="279" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test:web</text>
+      <text x="168" y="299" style="fill:var(--fg-dim)" font-size="11">apps/web/tests</text>
+      <text x="428" y="279" style="fill:var(--pass)" font-size="12" font-weight="700">replay 免密</text>
+      <text x="428" y="299" style="fill:var(--fg-dim)" font-size="11">CI 钉死 replay</text>
+      <text x="528" y="279" style="fill:var(--fg)" font-size="12">Chromium 渲染输出对比</text>
+      <text x="528" y="299" style="fill:var(--fg)" font-size="12">apps/web/tests/snapshots/</text>
+
+      <rect x="8" y="322" width="764" height="58" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="347" style="fill:var(--accent)" font-size="14" font-weight="700">stress / perf</text>
+      <text x="24" y="367" style="fill:var(--fg-dim)" font-size="11">web-stress / web.perf</text>
+      <text x="168" y="347" style="fill:var(--fg)" font-size="12" font-family="monospace">test:web:stress</text>
+      <text x="168" y="367" style="fill:var(--fg)" font-size="12" font-family="monospace">test:web:perf</text>
+      <text x="428" y="357" style="fill:var(--pass)" font-size="12" font-weight="700">replay 免密</text>
+      <text x="528" y="347" style="fill:var(--fg)" font-size="12">Web 负载压力与性能基线</text>
+      <text x="528" y="367" style="fill:var(--fg-dim)" font-size="12">（先 build 再跑）</text>
+    </svg>
+    <figcaption>五条 vitest 通道 × 密钥要求 × 证据面。snapshot 是唯一把金标准 fixture 提交进仓库、并以 replay 为免密默认模式的通道。</figcaption>
+  </figure>
+
+  <p>
+    注意矩阵里一个容易忽略的细节：e2e 的「无则自跳过」不是降级运行，而是整段 suite 直接
+    skip——无密钥的 CI 与无密钥的贡献者永远看到绿色，但这不是成本信号。真正的 provider
+    证据只来自带密钥的那次运行。反过来，snapshot 的 replay 是<strong>完整</strong>证据：它
+    会真实组装 ACP/headless example、真实跑完进程与协议，只是把模型响应换成录好的脚本。
+  </p>
+
+  <h2 id="sec-unit-coverage">22.2 unit 通道与覆盖率门禁</h2>
+
+  <p>
+    <code>vitest.config.ts</code> 的 include 列表划定了 unit 通道的疆域：
+  </p>
+
+  <pre><code><span class="code-key">const</span> testIncludes = [
+  <span class="code-str">'packages/*/*/tests/**/*.spec.{ts,tsx}'</span>,
+  <span class="code-str">'apps/*/tests/**/*.spec.ts'</span>,
+  <span class="code-str">'examples/*/tests/**/*.spec.ts'</span>,
+  <span class="code-str">'scripts/**/*.spec.ts'</span>,
+]</code></pre>
+
+  <p>
+    测试与被测代码住在一起（tests 留在它们考察的代码区域旁）。配置里有两个 vitest project：
+    <code>thread-safe</code> 与 <code>process-bound</code>——后者收纳那些依赖进程全局状态或
+    时敏进程 I/O、无法在聚合门禁竞争下被 worker 线程可靠隔离的 suite（如
+    <code>packages/session/session-persistence-jsonl/tests/jsonl.spec.ts</code>、
+    <code>packages/boot/app-boot/tests/app-boot.spec.ts</code>），两边都用 forks 池跑 Node 稳定性。
+    所有 suite 都加载 <code>scripts/test-invariants.ts</code> 这个 setup 文件。
+  </p>
+
+  <p>
+    docs/testing.md 给 unit 通道定了三条写作纪律。其一，<strong>每个注册表都要有一条
+    HMR-safety 测试</strong>：dispose 掉贡献它的 fiber，断言清理干净——这是第 3 章「注册即效应」
+    在测试侧的映照。其二，优先写边界情形、错误路径、事件顺序、并发竞争。其三，契约回归要
+    有永久测试，范例是
+    <code>packages/core/agent-loop/tests/contract-regressions.spec.ts</code>。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">覆盖率：门禁是 test:coverage，不是 test</div>
+    <p>
+      CI 的覆盖率门禁是 <span class="kbd">pnpm run test:coverage</span>（<code>vitest run
+      --coverage</code>）：对 <code>packages/*/*/src</code> 按<strong>文件</strong>执行
+      statements / branches / functions / lines 全 100%。按文件而不是按总量，是为了让一个覆盖
+      良好的大文件补贴不了一个裸奔的小文件。配置里的每一处豁免（types-only 文件、bin/worker
+      薄入口、GUI 债务清单、Windows-only 源码等）都是显式列出并带理由注释的；比如没有真实
+      <code>pwsh</code> 的主机上，pwsh-local 的 executor suite 自跳过，配置随之豁免该文件，
+      而 CI 的 runner 带 pwsh，仍然执行完整门槛。
+    </p>
+    <p>
+      还有一条解读纪律：一条未覆盖的行，往往是门禁在正确地<strong>标记死代码该删</strong>，
+      而不是缺一条测试该补。行覆盖是必要条件，永不充分——它证明行跑过，不证明功能按发布形态
+      工作。后面三条通道补的就是这个「充分」的一半。
+    </p>
+  </div>
+
+  <h2 id="sec-e2e">22.3 e2e：真实 API 与 with-key 政策</h2>
+
+  <p>
+    <code>vitest.e2e.config.ts</code> 只收 <code>**/*.e2e.ts</code>，且范围刻意收窄：
+    <code>packages/*/*/tests</code>、<code>apps/cli/tests</code>（只有 cli，不是 apps/*——
+    apps/web 的 e2e 归 web 通道）、<code>examples/*/tests</code>。它花真金白银的 token，所以
+    配置处处体现这一点：120 秒 testTimeout、retry 2（共享内部密钥会撞并发配额，瞬时抖动重试）、
+    <code>DSH_E2E_MAX_WORKERS</code>（默认 4）限制并行文件数，且不做覆盖率——覆盖率归 unit
+    通道所有。
+  </p>
+
+  <p>
+    docs/testing.md 的 with-key 政策标题就叫「inference is cheap here」：不要省真实 API 测试。
+    无密钥测试只证明管道通；只有带密钥的运行才证明 agent 对真实模型工作。要覆盖写文件的
+    prompt、多轮对话、工具使用、中途取消。价值最高的是<strong>smoke 测试</strong>：启动真实
+    example、发一条 prompt、然后检查世界。它们专杀「unit 全绿、产品坏了」这一类故障——
+    mock 抓不到它，事后剖析记录在 <code>docs/postmortem/0001-acp-default-export-drops-inject.md</code>
+    （一个 default export 悄悄丢掉了 inject）。
+  </p>
+
+  <p>
+    e2e 通道还有两条写作铁律。<strong>验证世界，而不是自证</strong>：断言要在 agent 外部重新跑
+    命令、重新读文件；对 agent 自身输出做关键字探测会让一个作弊的 agent 通过。没被碰过的文件
+    必须断言字节相同。e2e 测试拥有自己的资源：在测试里创建 harness，<code>afterEach</code> 里
+    dispose（失败、重试、超时也要）；共享 fixture 放在普通的 <code>tests/harness.ts</code>，
+    绝不放进另一个 <code>*.e2e.ts</code>——import 一个 spec 会重新注册它的 describe，把真实
+    API 调用翻倍。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">真实实现优于 mock</div>
+    <p>
+      只 mock 昂贵或非确定的边界——LLM adapter、网络、时钟；边界下游的一切保持真实。手搓的替身
+      只能证明桥在搬字节，不能证明发布的工具如断言那样工作。桥接工具调用测试用脚本化 mock 模型
+      配真实工具与执行器：<code>makeBridgeHarness({ withBash: true })</code> 插上
+      <code>dsh-bash-local</code> 与 <code>dsh-tool-bash</code>，然后真的跑一遍 <code>echo</code>。
+    </p>
+  </div>
+
+  <h2 id="sec-snapshot-modes">22.4 snapshot：record / refresh / replay</h2>
+
+  <p>
+    snapshot 通道的配置文件 <code>vitest.snapshot.config.ts</code> 收
+    <code>scripts/**/*.snapshot.ts</code>、<code>apps/cli/tests/**/*.snapshot.ts</code>、
+    <code>examples/*/tests/**/*.snapshot.ts</code>（DSH_EXAMPLE_MODE=lib 时再加
+    <code>apps/web/tests</code>）。它用 <code>DSH_SNAPSHOT</code> 环境变量切换三种模式：
+  </p>
+
+  <table>
+    <thead><tr><th>模式</th><th>命令</th><th>密钥</th><th>行为</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>replay</code>（默认）</td>
+        <td><code>pnpm run test:snapshot</code></td>
+        <td>免密</td>
+        <td>从已提交的金标准 fixture 回放模型响应，跑完整组装路径，比对组装后的请求、规范化协议/转录输出与重持久化的日志。<strong>从不写</strong>已提交的期望输出。</td>
+      </tr>
+      <tr>
+        <td><code>record</code></td>
+        <td><code>pnpm run test:snapshot:record</code></td>
+        <td>需要 <code>DEEPSEEK_API_KEY</code></td>
+        <td>真实调用 API，重跑场景，把模型响应与期望输出写回 fixture 与 expected 文件（配置注释原话：只有 record 从环境或根 <code>.env</code> 读密钥；replay/refresh 永不加载 .env）。模型转录变化时用它重录。</td>
+      </tr>
+      <tr>
+        <td><code>refresh</code></td>
+        <td><code>pnpm run test:snapshot:refresh</code></td>
+        <td>免密</td>
+        <td>回放已提交的脚本但<strong>更新当前期望输出</strong>——回放输入仍然有效、只是输出侧需要刷新时用。每一条 JSONL 与 expected 的 diff 都要人工审。</td>
+      </tr>
+    </tbody>
+  </table>
+
+<div class="demo" data-demo="snapshotModes">
+  <div class="demo-title">试一试 —— 快照的 record / replay 两种模式</div>
+  <label><input type="radio" name="d22" value="record"> DSH_SNAPSHOT=record</label>
+  <label><input type="radio" name="d22" value="replay" checked> DSH_SNAPSHOT=replay</label>
+  <div class="demo-output empty">切换模式。</div>
+</div>
+
+  <p>
+    并行策略也按模式区分：replay 不写金标准且每个场景自持可变运行时状态，所以文件级并行，用
+    <code>DSH_SNAPSHOT_MAX_CONCURRENCY</code>（默认 5）限制文件内并发，值 1 可在受限机器上恢复
+    完全串行；record 与 refresh 保持串行——record 每个场景都在花真实 API 配额，refresh 的写回
+    会从磁盘上已有的 fixture 收割易变值，并发写手会毁掉金标准。
+  </p>
+
+  <p>
+    金标准的分布有明确归属：ACP 自动化场景在 <code>examples/&lt;name&gt;/tests/snapshots/</code>
+    （<code>examples/acp-agent</code> 是主场）；<code>examples/headless-agent</code> 拥有内部
+    canonical-event JSONL 快照与回放 fixture；<code>apps/cli</code> 单独拥有产品级
+    <code>dsh --profile headless</code> 验收；完成的交互式终端旅程用
+    <code>apps/cli/tests/snapshots/</code> 下的 JSONL 驱动场景；浏览器渲染的 Web GUI 旅程在
+    <code>apps/web/tests/snapshots/</code>。还有一个著名的精细设计：只有一个 ACP 场景
+    （<code>text-turn</code>）钉住完整 system-prompt/tool-schema 内容，其余 fixture 把它
+    token 化，这样一次编辑只搅动一行。
+  </p>
+
+  <h2 id="sec-llm-replay">22.5 llm-replay：会话日志就是 fixture</h2>
+
+  <p>
+    <code>packages/test-support/llm-replay</code>（包名
+    <code>@deepseek-ai/dsh-llm-replay</code>）是 replay 模式的发动机。它的核心洞见是：
+    <strong>fixture 就是持久化的会话日志本身</strong>——<code>&lt;scenario&gt;/session.jsonl</code>。
+    第 4 章你学过 <code>assistant/chunk</code> 事件携带每一个 <code>StreamChunk</code>；把它们按
+    <code>(turn, step)</code> 分组，就能重建 agent-loop 每一次 <code>stream()</code> 调用的 chunk
+    序列。录制因此就是「把真实 agent 跑一遍，收割 .jsonl」——这个插件自己不录制。
+  </p>
+
+  <pre><code><span class="code-comment">// ACP / headless snapshot 套件经 Loader 挂载它，顶替真实 LLM adapter</span>
+- id: llm-replay
+  name: <span class="code-str">'@deepseek-ai/dsh-llm-replay'</span>
+  config:
+    providers:
+      - id: deepseek-official
+        name: DeepSeek
+        models:
+          - id: deepseek-v4-flash
+            contextWindow: <span class="code-key">128000</span>
+  <span class="code-comment"># file / overrideFile / childFiles 默认取 $DSH_SNAPSHOT_FILE 等</span>
+  <span class="code-comment"># 环境变量，由 snapshot harness 按场景注入</span></code></pre>
+
+  <p>
+    日志推导覆盖不了两种失败形态：任何 chunk 之前就纯抛错（比如 HTTP 401，日志里只有
+    <code>turn/end {error}</code>）与取消/挂起（是时序问题，不是 chunk 内容）。需要它们的场景
+    提供可选 sidecar <code>&lt;scenario&gt;/replay.override.json</code>：要么整体替换派生脚本
+    （裸 <code>ReplayEntry[]</code>），要么按 0 基调用索引打补丁（<code>{ patches: [{ at,
+    entry }] }</code>，<code>at</code> 等于派生长度时在注入的一次瞬态 throw 后追加重试尝试）。
+    sidecar 文档、每个 patch、每条 entry、每个 chunk 判别标签在文件加载时全部校验——misconfiguration
+    fails loud 在这里同样是铁律。
+  </p>
+
+  <p>
+    嵌套 agent 是第二个精巧点。父 agent 委派进程内 subagent 的场景会录出多份日志：
+    <code>session.jsonl</code>（父）加 <code>session.1.jsonl</code>、<code>session.2.jsonl</code>……
+    每个 agent 是同一 context 上自己的 <code>Session</code>。live session id 每次运行都是新随机值，
+    永远不等于录制的，所以 replay 按<strong>首调顺序</strong>绑定：脚本按 header 的
+    <code>createdAt</code> 排序（父先——它必须先流式输出才能委派），第一个发起任意调用的 live
+    session 认领第一份脚本，下一个新 session 认领下一份，各自推进自己的游标。live session 多于
+    录制脚本则 fail loud。
+  </p>
+
+  <p>
+    编程入口是 <code>installLlmReplay(ctx, config)</code>，返回 <code>ReplayHandle</code>：
+    <code>dispose()</code> 保 HMR 安全，<code>assertConsumed()</code> 在 teardown 时断言每份录制
+    脚本都绑到了 live session、每个绑定游标都耗尽——把「场景悄悄少驱动了几次模型调用」变成一条
+    清晰诊断。Web 浏览器 e2e 通道不走 Loader，直接安装它以保留这个 teardown 消费句柄。
+  </p>
+
+  <h2 id="sec-test-support">22.6 测试基建六件套</h2>
+
+  <p>
+    除了 llm-replay，<code>packages/test-support/</code> 下还有五个支撑包。它们是 test-tier
+    基建，不是产品 API：
+  </p>
+
+  <table>
+    <thead><tr><th>包</th><th>角色</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>llm-replay</code></td>
+        <td>从录制会话日志重建模型流的无密钥回放插件（22.5 节）。</td>
+      </tr>
+      <tr>
+        <td><code>llm-mock-server</code></td>
+        <td>可脚本化的 OpenAI 兼容 HTTP/SSE 服务器， exercising <strong>真实</strong> LLM adapter、agent loop 与恢复策略而无需 provider 密钥。<code>--sequence</code> 是 FIFO 行为表：<code>connection_reset</code>、<code>partial_disconnect</code>、<code>stall</code>、<code>rate_limit</code>、<code>success</code>、<code>tool_call_success</code>……用 <span class="kbd">pnpm run mock:llm</span> 起服务，把发布的 DeepSeek adapter 指过去（<code>DEEPSEEK_BASE_URL</code>）。</td>
+      </tr>
+      <tr>
+        <td><code>acp-snapshot</code></td>
+        <td>ACP 快照套件工具箱，四层可分别 import：<code>launchAcpTestAgent</code>（进程启动器）、<code>runScenario</code>（场景 harness）、规范化纯函数组（stdout/会话日志/cwd token 化/system-prompt 与 tool-schema 清洗）、<code>defineAcpSnapshotSuite</code>（从一个场景表注册整棵 describe/it 树的工厂）。</td>
+      </tr>
+      <tr>
+        <td><code>agent-loop-testkit</code></td>
+        <td><code>mountAgentLoopTestDependencies(ctx)</code> 按依赖顺序装上 LLM、session、system-prompt、tool、agent 服务；adapter、可选插件、<code>AgentLoop</code> 本体、Context teardown 仍归调用者，让场景特定的顺序保持可见。</td>
+      </tr>
+      <tr>
+        <td><code>client-runtime</code></td>
+        <td>jsdom 槽位测试运行时：真实 Cordis <code>Context</code>、生产 <code>SlotRegistry</code> 与 web-react 渲染器，配上实现相同对外面的 typed double。生产面一变，测试台在编译期就断——而不是悄悄漂移。</td>
+      </tr>
+      <tr>
+        <td><code>loader-smoke</code></td>
+        <td>经 Cordis Loader 启动 app 与 <code>cordis.yml</code> 的共享子进程 harness：<code>resolveExampleLaunch</code> 在本地 src 模式（tsx）与 CI lib 模式（纯 Node + package exports）间选择；<code>runLoaderSmoke</code> 拥有隔离 cwd、DSH homes、deadline 与清理；<code>runFixtureTurn</code> 驱动一个任务并返回最终回答与 usage。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    这套基建的存在理由写在 acp-snapshot 的 README 第一段：所有比对/守卫机制集中在一个包里、
+    处在 per-file 覆盖率门禁之下，而不是每个 example 抍一份。一个消费方的
+    <code>*.snapshot.ts</code> 通常就是「一张场景表 + 一次工厂调用」。
+  </p>
+
+  <h2 id="sec-policy">22.7 核心政策：快照为什么不可替代</h2>
+
+  <p>
+    docs/testing.md 的「When a snapshot test is required」一节是整个体系的宪法：
+    <strong>每个非平凡的模型可见、协议可见或人类可见的行为变化，必须在同一个 PR 里通过某个
+    真实可运行 example 的快照套件加/更新一个 keyless 场景。</strong>包测试、e2e 断言、
+    mock/仅测试组合、PR 说明——都不能替代组装后的应用转录；需要时先扩展 harness。AGENTS.md
+    把同一条列为仓库级约定，并补上两条：fixture 必须在 macOS/Linux 可回放（修 fixture，
+    而不是修 normalizer）；新的 capability seam、生命周期变体或转录面，在计划阶段就点名每一层
+    覆盖，并先验证 harness 能表达它再动手实现。
+  </p>
+
+  <p>
+    为什么包测试不够？回到 postmortem 0001 那类故障：一个 default export 丢掉 inject，
+    单元层的组合可以全绿，产品在真实 Loader 组合下才断。所以政策还要求「测真实入口路径」：
+    产品可见插件必须有非 unit 的真实组合测试，手搭的 <code>ctx.plugin(...)</code> suite 不算数——
+    要 boot 测试专用的 <code>cordis.yml</code>，穿过 Loader 与 app/进程。「真实入口路径」还指
+    发布产物：一个包的 bin 在纯 <code>node</code> 下跑构建好的 <code>lib/bin.js</code>，暴露
+    tsx 会掩盖的故障（settle 竞争、模块解析、被吞的加载失败）；构建产物 smoke 要保持绿色
+    （<code>packages/examples/*/tests/built-bin.e2e.ts</code> 等），并断言真正缺配置时非零退出。
+  </p>
+
+  <p>
+    解析面同样有纪律：<strong>测试解析只走 source plane</strong>——每份 vitest 配置都把
+    vite-tsconfig-paths 指向 <code>tsconfig.base.json</code>，裸 workspace 导入解析到
+    <code>src</code>，绝不经 package exports 落到构建的 <code>lib/</code>（那里陈旧的产物会
+    装出第二份模块单例）。构建产物只在显式声明的场合被消费：lib 模式子进程与 built smoke。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">测试子进程的启动模式（test subprocess launch modes）</div>
+    <p>
+      CI 与带构建的测试通道把每个 example 或 Cordis 配置子进程从构建好的 <code>lib/</code> 经
+      共享的双模式 launcher 跑——不要为这些子进程手写 <code>--import tsx</code>。不加载 Cordis
+      的协议/操作系统 fixture 用可擦除的 <code>.ts</code> 直接跑 Node，不带 tsx 也不用根 paths
+      映射。只有被测对象就是源码路径解析时才可选 <code>src</code>，且要在测试里写明这条契约。
+      AGENTS.md 的一句话总结：配置子进程在纯 Node 下跑构建的 <code>lib/</code>；源码回归用声明
+      的 launcher。
+    </p>
+  </div>
+
+  <h2 id="sec-recap">22.8 本章回顾</h2>
+  <ul>
+    <li>五条通道按证据面分工：unit（包级行为）、e2e（真实 provider）、snapshot（组装后转录）、web（Chromium 渲染）、stress/perf（负载）。</li>
+    <li><code>test:coverage</code> 才是 CI 覆盖率门禁：<code>packages/*/*/src</code> per-file 100%；未覆盖行常是死代码该删。</li>
+    <li>e2e 无密钥自跳过不是成本信号；smoke 测试（起真实 example、发一条 prompt、查世界）专杀「unit 全绿产品坏了」。</li>
+    <li><code>DSH_SNAPSHOT</code>：replay 免密回放且不写金标准（CI 默认）；record 需密钥重录 fixture；refresh 免密刷新期望输出；diff 必须逐条人工审。</li>
+    <li>llm-replay 的 fixture 就是 <code>session.jsonl</code>：<code>assistant/chunk</code> 按 <code>(turn, step)</code> 分组重建流；override sidecar 补纯抛错/取消；子会话按首调顺序绑定；<code>assertConsumed()</code> 兜底。</li>
+    <li>宪法条款：非平凡的模型/用户可见变化必须同一 PR 内通过真实可运行 example 补 keyless 快照；fixture 在 macOS/Linux 可回放，修 fixture 不修 normalizer。</li>
+    <li>测试解析只走 source plane；配置子进程用构建的 <code>lib/</code> 加共享双模式 launcher，别手写 <code>--import tsx</code>。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为 <code>pnpm run test</code> 绿了就满足覆盖率——门禁是 <code>test:coverage</code>，per-file 100%。</li>
+      <li>把 e2e 的 self-skip 当成「e2e 免密也可跑」——跳过的 suite 不产生任何 provider 证据。</li>
+      <li>改了模型可见行为后用包测试或 PR 说明交差——宪法要求同一 PR 内的 keyless 快照场景。</li>
+      <li>快照 diff 不合预期就去改 normalizer——先修 fixture；normalizer 是共享纯函数，改它影响所有场景。</li>
+      <li>给 example 子进程手写 <code>--import tsx</code>——用共享双模式 launcher，CI 从构建的 <code>lib/</code> 跑。</li>
+      <li>在 <code>*.e2e.ts</code> 之间互相 import 共享 fixture——import 一个 spec 会重复注册 describe 并翻倍真实 API 调用；共享代码放 <code>tests/harness.ts</code>。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="22">
+    <h2>第 22 章测验</h2>
+
+    <div class="q" data-id="22-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— test:coverage（vitest run --coverage）才是 CI 覆盖率门禁，对 packages/*/*/src 按文件 100%。"
+         data-rationale="C 正确。pnpm run test 只是 unit 运行；门禁是 test:coverage，且按 per-file 而非总量。A 混淆了运行与门禁。B 无此命令（这是通道选择环境变量）。D 说反了：按文件正是为了让大文件不能补贴小文件。"
+         data-review="sec-unit-coverage">
+      <div class="prompt"><span class="qnum">Q1.</span> 哪条命令是 CI 覆盖率门禁，它的度量方式是什么？</div>
+      <label class="opt"><input type="radio" name="q-22-1" value="a"> A. <code>pnpm run test</code>，按总量覆盖率</label>
+      <label class="opt"><input type="radio" name="q-22-1" value="b"> B. <code>DSH_SNAPSHOT=coverage</code>，按场景数</label>
+      <label class="opt"><input type="radio" name="q-22-1" value="c"> C. <code>pnpm run test:coverage</code>，对 <code>packages/*/*/src</code> 按文件 100%（statements/branches/functions/lines）</label>
+      <label class="opt"><input type="radio" name="q-22-1" value="d"> D. <code>pnpm run hygiene</code>，按包平均覆盖率</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-2" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A/C/D 都能在无密钥状态下产出完整证据：unit 本来就免密；snapshot 的 replay 用录好的响应回放完整组装路径；web 通道 CI 钉死 DSH_SNAPSHOT=replay 只读比对。B 错：e2e 无密钥时整段 suite 自跳过，不产生任何 provider 证据。"
+         data-review="sec-lanes">
+      <div class="prompt"><span class="qnum">Q2.</span> 下列哪些通道在<strong>没有</strong> DEEPSEEK_API_KEY 的机器上仍能产出完整证据？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="a"> A. unit（<code>pnpm run test</code>）</label>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="b"> B. e2e（<code>pnpm run test:e2e</code>）</label>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="c"> C. snapshot 的 replay 模式（<code>pnpm run test:snapshot</code>）</label>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="d"> D. web 通道的 CI replay（Chromium 对比 <code>apps/web/tests/snapshots/</code>）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— record 真实调用 API 并把模型响应与期望输出写回 fixture 与 expected 文件。"
+         data-rationale="B 正确：模型转录变化时用 test:snapshot:record 重录，它需要密钥（从环境或根 .env 读，replay/refresh 永不加载 .env）。A 锏述 record：它就是写金标准的模式。C 描述的是 refresh——回放已提交脚本、只更新期望输出，免密。D 无此区分：unit 覆盖率归 test:coverage，与 record 无关。"
+         data-review="sec-snapshot-modes">
+      <div class="prompt"><span class="qnum">Q3.</span> <code>DSH_SNAPSHOT=record</code> 做什么，需要什么？</div>
+      <label class="opt"><input type="radio" name="q-22-3" value="a"> A. 免密回放已提交 fixture，只比对不写入</label>
+      <label class="opt"><input type="radio" name="q-22-3" value="b"> B. 需要 DEEPSEEK_API_KEY，真实调用 API，把模型响应与期望输出写回金标准 fixture</label>
+      <label class="opt"><input type="radio" name="q-22-3" value="c"> C. 免密重放已提交脚本，但更新当前期望输出</label>
+      <label class="opt"><input type="radio" name="q-22-3" value="d"> D. 需要 mock:llm 服务器，且只为覆盖率统计服务</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— refresh 回放已提交的录制脚本，不调 API，只把当前期望输出写回，每个 diff 都要人工审。"
+         data-rationale="C 正确：回放输入仍有效、输出侧需要刷新时用 refresh，免密且串行。A 是 record。B 无此模式组合。D 说反了：record 花配额所以串行，replay 才并行（受 DSH_SNAPSHOT_MAX_CONCURRENCY 限制）。"
+         data-review="sec-snapshot-modes">
+      <div class="prompt"><span class="qnum">Q4.</span> refresh 与 record 的区别是什么？</div>
+      <label class="opt"><input type="radio" name="q-22-4" value="a"> A. refresh 调真实 API 重录模型响应；record 不调</label>
+      <label class="opt"><input type="radio" name="q-22-4" value="b"> B. 两者都要密钥，只是并行度不同</label>
+      <label class="opt"><input type="radio" name="q-22-4" value="c"> C. refresh 免密回放已提交脚本并更新当前期望输出；record 需密钥重录 fixture 本身</label>
+      <label class="opt"><input type="radio" name="q-22-4" value="d"> D. refresh 并行、record 串行，除此之外完全一样</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-5" data-type="fill" data-accepted='["session.jsonl"]'
+         data-answer="session.jsonl。"
+         data-rationale="llm-replay 的 fixture 就是持久化的会话日志（scenario 目录下的 session.jsonl），assistant/chunk 事件按 (turn, step) 分组即可重建每次 stream() 的 chunk 序列；嵌套场景的子会话是 session.1.jsonl 等同级文件。"
+         data-review="sec-llm-replay">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：llm-replay 的主 fixture 就是持久化的会话日志本身，文件名是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A 正确：按 (turn, step) 分组 assistant/chunk 重建流。B 正确：日志推导不出纯抛错与取消/挂起，用 replay.override.json 整体替换或按调用索引打补丁。D 正确：assertConsumed 断言每份脚本都绑定且游标耗尽。C 错：live session id 每次全新随机，绑定靠首调顺序，不是 id 相等。"
+         data-review="sec-llm-replay">
+      <div class="prompt"><span class="qnum">Q6.</span> 关于 llm-replay 的机制，下列说法正确的是？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="a"> A. 把 <code>assistant/chunk</code> 事件按 <code>(turn, step)</code> 分组，重建每次 <code>stream()</code> 的 chunk 序列</label>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="b"> B. 日志推导不出的失败形态（纯抛错、取消/挂起）用 <code>replay.override.json</code> sidecar 补</label>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="c"> C. 子会话靠 live session id 与录制 id 相等来绑定脚本</label>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="d"> D. <code>assertConsumed()</code> 把「场景悄悄少驱动了几次模型调用」变成清晰诊断</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-7" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 无密钥测试只证明管道；只有带密钥运行证明 agent 对真实模型工作，自跳过不是成本信号。"
+         data-rationale="D 正确，这是 docs/testing.md 的原意：不要省真实 API 测试，self-skip 让无密钥 CI 与贡献者不被卡住。A 反了。B 错：smoke 是 e2e 里价值最高的形态。C 是手段不是理由。"
+         data-review="sec-e2e">
+      <div class="prompt"><span class="qnum">Q7.</span> with-key 政策（inference is cheap here）的核心主张是什么？</div>
+      <label class="opt"><input type="radio" name="q-22-7" value="a"> A. 真实 API 测试太贵，能用 mock 就用 mock</label>
+      <label class="opt"><input type="radio" name="q-22-7" value="b"> B. smoke 测试不重要，重点是单元覆盖</label>
+      <label class="opt"><input type="radio" name="q-22-7" value="c"> C. self-skip 是为了把 e2e 从 CI 里彻底移除</label>
+      <label class="opt"><input type="radio" name="q-22-7" value="d"> D. 无密钥测试只证明管道；只有带密钥运行证明 agent 对真实模型工作，自跳过只是让无密钥贡献者不被阻塞</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 在 agent 外部重新执行命令、重读文件；关键字探测会让作弊的 agent 通过。"
+         data-rationale="B 正确：验证世界而不是自证。A/C/D 都是对 agent 自身输出的探测，作弊 agent 可以在输出里印关键字通过。另外未触碰的文件要断言字节相同。"
+         data-review="sec-e2e">
+      <div class="prompt"><span class="qnum">Q8.</span> 「验证世界，而不是自证」在 e2e 断言里意味着什么？</div>
+      <label class="opt"><input type="radio" name="q-22-8" value="a"> A. 检查 agent 的最终回答里是否包含成功关键字</label>
+      <label class="opt"><input type="radio" name="q-22-8" value="b"> B. 在 agent 外部重新跑命令、重读文件，断言世界状态；没被碰的文件必须字节相同</label>
+      <label class="opt"><input type="radio" name="q-22-8" value="c"> C. 让 agent 自己报告它做了什么，然后断言报告格式</label>
+      <label class="opt"><input type="radio" name="q-22-8" value="d"> D. 对 agent 的 stderr 做关键字探测</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 在同一 PR 里通过真实可运行 example 的快照套件加/更新 keyless 场景。"
+         data-rationale="A 正确，这是宪法条款：包测试、e2e 断言、mock 组合、PR 说明都不能替代组装后的转录。B/C/D 分别用包测试、e2e、说明交差，全被政策点名不可替代。"
+         data-review="sec-policy">
+      <div class="prompt"><span class="qnum">Q9.</span> 你改了一个模型可见的行为（比如 system prompt 的新 section），测试义务是什么？</div>
+      <label class="opt"><input type="radio" name="q-22-9" value="a"> A. 同一 PR 内，通过某个真实可运行 example 的快照套件加/更新一个 keyless 场景</label>
+      <label class="opt"><input type="radio" name="q-22-9" value="b"> B. 只要在相关包里加单元测试即可</label>
+      <label class="opt"><input type="radio" name="q-22-9" value="c"> C. 跑一次带密钥的 e2e 并在 PR 里贴结果</label>
+      <label class="opt"><input type="radio" name="q-22-9" value="d"> D. 在 PR 描述里说明行为变化即可，快照可以下个 PR 再补</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-10" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 从构建好的 lib/ 经共享双模式 launcher 在纯 Node 下跑；不要手写 --import tsx。"
+         data-rationale="C 正确，这是 test subprocess launch modes：真实入口路径指发布产物，lib 模式暴露 tsx 掩盖的故障。A/B 违反不要手写 --import tsx 的规则；D 说反了，只有被测对象是源码路径解析时才可选 src 且要写明契约。"
+         data-review="sec-policy">
+      <div class="prompt"><span class="qnum">Q10.</span> CI 上，加载 Cordis 的 example / 配置子进程应该怎么跑？</div>
+      <label class="opt"><input type="radio" name="q-22-10" value="a"> A. 手写 <code>node --import tsx</code> 从 src 跑</label>
+      <label class="opt"><input type="radio" name="q-22-10" value="b"> B. 每个 suite 自己决定 tsx 还是 lib，各自实现</label>
+      <label class="opt"><input type="radio" name="q-22-10" value="c"> C. 从构建好的 <code>lib/</code> 经共享双模式 launcher 在纯 Node 下跑</label>
+      <label class="opt"><input type="radio" name="q-22-10" value="d"> D. 一律选 src 模式，因为源码总能跑</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 只 mock 昂贵或非确定边界（LLM adapter、网络、时钟），下游全部真实。"
+         data-rationale="B 正确：手搓替身只证明桥在搬字节。范例是 makeBridgeHarness({ withBash: true })——脚本化 mock 模型 + 真实工具与执行器，真跑 echo。A/C/D 都把真实工具/执行器/adapter 换成了替身。"
+         data-review="sec-e2e">
+      <div class="prompt"><span class="qnum">Q11.</span> 「真实实现优于 mock」的边界画在哪里？</div>
+      <label class="opt"><input type="radio" name="q-22-11" value="a"> A. 把工具与执行器也 mock 掉，只测桥的调度逻辑</label>
+      <label class="opt"><input type="radio" name="q-22-11" value="b"> B. 只 mock 昂贵或非确定的边界（LLM adapter、网络、时钟），边界下游一切保持真实</label>
+      <label class="opt"><input type="radio" name="q-22-11" value="c"> C. mock 到 HTTP 层，工具执行保持真实但 adapter 换成手写桩</label>
+      <label class="opt"><input type="radio" name="q-22-11" value="d"> D. 按测试速度决定 mock 多少，越快越好</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-12" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 优先怀疑死代码：删掉它，或给出带理由的显式豁免；行覆盖本身不证明功能工作。"
+         data-rationale="D 正确，这是 per-file 100% 门禁的解读纪律：未覆盖行常常是死代码该删；豁免必须显式列出并带理由。A 随手 bypass 违反每条 v8 ignore 注释都要带理由的规则。B/C 把行覆盖当成充分证据，testing.md 明说它是必要不充分。"
+         data-review="sec-unit-coverage">
+      <div class="prompt"><span class="qnum">Q12.</span> per-file 100% 门禁下你发现一行未覆盖，第一反应应该是什么？</div>
+      <label class="opt"><input type="radio" name="q-22-12" value="a"> A. 在 v8 coverage 注释里随手 ignore 该行</label>
+      <label class="opt"><input type="radio" name="q-22-12" value="b"> B. 写一条测试盖住它，覆盖率就绿了</label>
+      <label class="opt"><input type="radio" name="q-22-12" value="c"> C. 行覆盖已证明功能可用，忽略即可</label>
+      <label class="opt"><input type="radio" name="q-22-12" value="d"> D. 优先怀疑它是死代码该删；豁免需显式列出并写理由，行覆盖从不证明功能正确</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-13" data-type="short"
+         data-key-points='["fixture 就是持久化的会话日志 session.jsonl（assistant/chunk 按 turn/step 分组重建流）","replay 免密且从不写金标准，是 CI 与本地默认；record 需密钥重录，refresh 免密刷新期望输出","回放仍跑完整组装路径：真实进程、Loader、协议与持久化，只换模型响应","宪法条款：非平凡模型/用户可见变化必须同一 PR 补 keyless 快照；fixture 要在 macOS/Linux 可回放"]'
+         data-answer="要点：fixture 即会话日志；replay/record/refresh 三模式与各自的密钥要求；replay 仍跑完整组装路径所以能证明组装后的转录；以及同一 PR 内补 keyless 快照的政策与 fixture 可移植性。"
+         data-rationale="抓住这四点（日志即 fixture、三模式分工、完整组装路径、同 PR 快照义务），你就理解了 snapshot 通道为什么能作为发布证据。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> 用自己的话解释：为什么 snapshot 的 replay 模式能作为「免密的完整证据」，而单元测试不能？</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="23-gates-and-conventions.html"><strong>第 23 章 · 质量门禁与仓库约定</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 17 章 · 能力面速览 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 17 章 · 能力速览</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="17">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 17 章 · 第三部分 · Capability Seams 专题</div>
+    <h1>能力面速览</h1>
+    <p class="lede">
+      shell、fs、subagent、compaction——前几章深挖的能力只是仓库的一半。本章是一页式地图：
+      把其余十四个能力家族按「解决什么问题、包怎么分、去哪扩展」各用一小节过一遍。
+      你不需要记住每个细节，只需要在遇到需求时知道<strong>该走进哪扇门</strong>；
+      每扇门里的三角色结构，都是第 11 章你已经掌握的那套方法论。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>拿到一个能力需求（检索、编排、定时、凭据……）能说出对应的能力家族与它的 <code>ctx.*</code> 服务键</li>
+      <li>对每个家族能指出扩展点：注册 provider、监听事件、还是挂 Consumer 工具</li>
+      <li>能说出几个刻意收紧的边界：lsp 只有四个操作、schedule 不含外部通知通道、credentials 配置不带值</li>
+      <li>能把本地图与 <code>docs/capability-seams.md</code> 全图对照，自行补齐本章未展开的细节</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-map">17.1 能力地图</h2>
+
+  <p>
+    十四个家族按关注点分成五组。知识与外部信息组回答「模型怎么知道更多」；
+    编排与续跑组回答「工作怎么跨 step、跨轮次延续」；配置与凭据组回答「部署差异放哪」；
+    数据与执行组回答「二进制与模型写的程序怎么跑」；自省与桥接组回答「agent 怎么改自己、
+    怎么接外来生态」。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="能力面分组地图">
+      <text x="340" y="26" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">十四个能力家族 · 五个关注点分组</text>
+
+      <rect x="20" y="46" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="120" y="70" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">知识与外部信息</text>
+      <text x="34" y="96" style="fill:var(--fg)" font-size="11">skill</text><text x="98" y="96" style="fill:var(--fg-dim)" font-size="10">ctx.skills</text>
+      <text x="34" y="120" style="fill:var(--fg)" font-size="11">web</text><text x="98" y="120" style="fill:var(--fg-dim)" font-size="10">ctx.web</text>
+      <text x="34" y="144" style="fill:var(--fg)" font-size="11">lsp</text><text x="98" y="144" style="fill:var(--fg-dim)" font-size="10">ctx.lsp</text>
+      <text x="34" y="168" style="fill:var(--fg)" font-size="11">mcp-client</text><text x="98" y="168" style="fill:var(--fg-dim)" font-size="10">→ ctx.tools</text>
+
+      <rect x="240" y="46" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="340" y="70" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">编排与续跑</text>
+      <text x="254" y="96" style="fill:var(--fg)" font-size="11">workflow · ralph</text><text x="378" y="96" style="fill:var(--fg-dim)" font-size="10">ctx.workflowEngine</text>
+      <text x="254" y="120" style="fill:var(--fg)" font-size="11">jobs</text><text x="378" y="120" style="fill:var(--fg-dim)" font-size="10">ctx.jobs</text>
+      <text x="254" y="144" style="fill:var(--fg)" font-size="11">goal</text><text x="378" y="144" style="fill:var(--fg-dim)" font-size="10">ctx.goals</text>
+      <text x="254" y="168" style="fill:var(--fg)" font-size="11">schedule</text><text x="378" y="168" style="fill:var(--fg-dim)" font-size="10">会话日志内</text>
+
+      <rect x="460" y="46" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="560" y="70" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">配置与凭据</text>
+      <text x="474" y="102" style="fill:var(--fg)" font-size="11">settings</text><text x="552" y="102" style="fill:var(--fg-dim)" font-size="10">ctx.settings</text>
+      <text x="474" y="134" style="fill:var(--fg)" font-size="11">credentials</text><text x="552" y="134" style="fill:var(--fg-dim)" font-size="10">ctx.credentials</text>
+
+      <rect x="130" y="226" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="230" y="250" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">数据与执行</text>
+      <text x="144" y="282" style="fill:var(--fg)" font-size="11">attachment</text><text x="238" y="282" style="fill:var(--fg-dim)" font-size="10">ctx.attachments</text>
+      <text x="144" y="314" style="fill:var(--fg)" font-size="11">code-runtime</text><text x="238" y="314" style="fill:var(--fg-dim)" font-size="10">ctx.codeRuntime</text>
+
+      <rect x="350" y="226" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="450" y="250" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">自省与桥接</text>
+      <text x="364" y="282" style="fill:var(--fg)" font-size="11">extensions</text><text x="452" y="282" style="fill:var(--fg-dim)" font-size="10">ctx.dynamicCordisRunner</text>
+      <text x="364" y="314" style="fill:var(--fg)" font-size="11">hooks</text><text x="452" y="314" style="fill:var(--fg-dim)" font-size="10">桥到 typed 拦截点</text>
+
+      <text x="340" y="394" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">每个家族都是第 11 章的三角色结构：查 docs/capability-seams.md 可定位 owner / implementations / consumers</text>
+    </svg>
+    <figcaption>能力面分组地图：五组、十四个家族。每组小节给出包、ctx 键与扩展点。</figcaption>
+  </figure>
+
+  <h2 id="sec-skill">17.2 skill：可复用指令的目录与加载</h2>
+
+  <p>
+    skill 家族发现可复用的 agent 指令（SKILL.md 一类）并以 provider 中立的目录暴露给模型。
+    <code>dsh-skill</code> 是纯注册表：provider 用 <code>registerProvider(create)</code> 注册来源
+    （本地文件、内嵌数据、HTTP 都行），消费方用 <code>snapshot()</code>/<code>list()</code>/<code>get()</code>
+    读取；<code>skills/change</code> 是不带目录内容的失效通知。注册表按 host+per-scope 分层
+    （第 11 章工具注册表确立的形状），invocation 策略把 modelInvocable 与 userInvocable 分开。
+    <code>dsh-tool-skill</code> 在每次合格的 <code>agent/pre-step</code> 做目录快照，
+    以持久 user 角色 <code>&lt;available_skills&gt;</code> 消息发布有序的 name/description 目录，
+    摘要 digest 变化才追加完整替换；<code>skill</code> 工具按名加载，
+    <code>renderSkillContent()</code> 保证目录注入与工具加载渲染出同一个 <code>&lt;skill_content&gt;</code> 形状。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-skill</code></td><td><code>ctx.skills</code> · Definition</td><td><code>registerProvider()</code> / <code>register()</code>（runtime 内嵌技能）；<code>skills/change</code></td></tr>
+      <tr><td><code>dsh-skill-filesystem</code></td><td>注册于 <code>ctx.skills</code></td><td>本地文件系统发现</td></tr>
+      <tr><td><code>dsh-skill-badge</code></td><td>注册于 <code>ctx.skills</code></td><td>随船的可选 dsh badge 技能</td></tr>
+      <tr><td><code>dsh-tool-skill</code></td><td>注册于 <code>ctx.tools</code></td><td><code>skill</code> 工具 + pre-step 目录发布</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-web">17.3 web：search 与 fetch 共用一条 seam</h2>
+
+  <p>
+    <code>dsh-web</code> 的 <code>WebRuntime</code>（<code>ctx.web</code>）跨两个操作（search、fetch）
+    于一条 seam：registerSearchProvider 与 registerFetchProvider 各自注册后端，
+    执行时按「显式配置的 provider id，否则恰好一个可用者自动选中，否则抛错」解析——
+    <strong>选择从不依赖注册或 HMR 顺序</strong>。错误走结构化的 <code>WebError</code> 词汇
+    （如配置的 id 未注册是 <code>WEB_PROVIDER_CONFIGURED_MISSING</code>，未配置且多个可用是
+    <code>WEB_PROVIDER_AMBIGUOUS</code>）。providers 注册的是<strong>能力不是工具</strong>：
+    <code>dsh-tool-web</code> 是模型可见名（<code>web_search</code>/<code>web_fetch</code>）、
+    schema 与展示的唯一 owner。想接新的搜索或抓取后端，注册一个 provider 就够了。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-web</code></td><td><code>ctx.web</code> · Definition</td><td><code>registerSearchProvider()</code> / <code>registerFetchProvider()</code></td></tr>
+      <tr><td><code>dsh-web-search-exa</code> / <code>-perplexity</code> / <code>-deepseek</code></td><td>注册于 <code>ctx.web</code></td><td>三个搜索 provider</td></tr>
+      <tr><td><code>dsh-web-fetch-http</code></td><td>注册于 <code>ctx.web</code></td><td>匿名公共 HTTP(S) 抓取</td></tr>
+      <tr><td><code>dsh-tool-web</code></td><td>注册于 <code>ctx.tools</code></td><td><code>web_search</code> / <code>web_fetch</code> 工具</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-lsp">17.4 lsp：四个语义操作，没有逃生口</h2>
+
+  <p>
+    LSP 家族把语言服务器能力收进一条刻意收窄的 seam：<code>ctx.lsp</code> 只暴露四个语义操作——
+    <code>goToDefinition</code>、<code>findReferences</code>、<code>goToImplementation</code>、<code>hover</code>——
+    <strong>没有通用 JSON-RPC 逃生口</strong>。这样换 provider 不改变模型提问的方式，
+    也没有协议载荷或未审查的变更能到达模型契约。<code>dsh-lsp-stdio</code> 是通用多服务器后端，
+    建在 <code>ctx.fs</code> 与 <code>ctx.subprocess</code> 之上（第 12 章的共享执行世界），
+    文档按查询临时打开；<code>dsh-tool-lsp</code> 是模型可见的 <code>lsp</code> 工具，
+    使用一基 UTF-16 光标坐标。providers 注册能力而非工具——模型面的名字与 schema 归
+    <code>tool-lsp</code> 独有。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-lsp</code></td><td><code>ctx.lsp</code> · Definition</td><td>按 branded id 注册 provider 与扩展名映射</td></tr>
+      <tr><td><code>dsh-lsp-stdio</code></td><td>注册于 <code>ctx.lsp</code></td><td>stdio JSON-RPC 多服务器后端（消费 <code>ctx.fs</code>/<code>ctx.subprocess</code>）</td></tr>
+      <tr><td><code>dsh-tool-lsp</code></td><td>注册于 <code>ctx.tools</code></td><td><code>lsp</code> 工具（四操作）</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-mcp">17.5 mcp-client：外部工具生态的桥</h2>
+
+  <p>
+    <code>dsh-mcp-client</code> 连接外部 MCP（Model Context Protocol）服务器，
+    把它们的工具注册到 <code>ctx.tools</code>，模型以原生工具的形式使用：
+    公开名是 <code>mcp__&lt;serverName&gt;__&lt;rawName&gt;</code>，与 Claude Code、Codex 同形。
+    cordis.yml 里每个 MCP 服务器一个插件实例，传输为 <code>stdio</code> 或
+    <code>streamable-http</code>；工具名是 <code>(serverName, rawName)</code> 的纯函数——
+    连接顺序、re-sync、其他服务器都不改名。断线由监督者按指数退避重启并重新发现，
+    预算耗尽则注销工具直到重载。注意它只桥接 tools：MCP 的 Resources 与 Prompts 尚无消费者。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-mcp-client</code></td><td>消费 <code>ctx.tools</code></td><td>cordis.yml 每服务器一实例（transport / serverName / command / url / reconnect…）</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-workflow">17.6 workflow 与 ralph：模型写的编排</h2>
+
+  <p>
+    workflow 家族运行<strong>模型编写的编排脚本</strong>。<code>dsh-workflow</code> 定义执行与生命周期
+    （<code>ctx.workflowEngine</code>），<code>dsh-workflow-worker-thread</code> 在 worker 线程里跑脚本
+    ——线程把执行与 host 事件循环隔离，但<strong>不是安全边界</strong>。<code>dsh-tool-workflow</code>
+    暴露 <code>workflow</code> 工具（<code>meta</code>/<code>script</code>/<code>args</code>），
+    把运行投影进调用方会话的 <code>workflow/*</code> log-only 事件。
+    <code>dsh-tool-ralph</code> 是同一引擎上的固定策略 Consumer：<code>ralph({ objective, maxRounds? })</code>
+    把一个不可变目标交给一串<strong>全新子代理</strong>——每轮一个 fresh child（provider 必须支持
+    结构化输出且 <code>inheritsParentContext: false</code>），共享工作区是长期记忆，
+    轮与轮之间传递结构化 handoff。没有为它改 agent-loop（呼应第 7、14 章：编排是插件不是循环分支）。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-workflow</code></td><td><code>ctx.workflowEngine</code> · Definition</td><td>注册引擎后端；<code>workflow/*</code> 事件</td></tr>
+      <tr><td><code>dsh-workflow-worker-thread</code></td><td>注册于 <code>ctx.workflowEngine</code></td><td>worker 线程执行</td></tr>
+      <tr><td><code>dsh-tool-workflow</code></td><td>注册于 <code>ctx.tools</code></td><td><code>workflow</code> 工具（通用脚本）</td></tr>
+      <tr><td><code>dsh-tool-ralph</code></td><td>消费 engine + <code>ctx.subagents</code></td><td><code>ralph</code> 工具（固定 fresh-agent 循环）</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-jobs">17.7 jobs：后台作业的一个协议</h2>
+
+  <p>
+    长时间运行的工具（构建、watch、采集）需要观察、取消、等待与完成通知——jobs 家族给它们
+    <strong>一个 owner 隔离的协议</strong>。<code>dsh-jobs</code> 定义 <code>ctx.jobs</code> 注册表契约
+    （start/get/list/read/kill/wait/onJobDone/onJobsChanged），
+    <code>dsh-jobs-local</code> 是进程内实现。访问按 <code>SessionId</code> 圈定（owner fence），
+    controller 的注册也是 owner 相对：没加载 controller 的组合不能借着别人的控制开工。
+    <code>dsh-tool-jobs</code> 暴露三个与种类无关的工具——<code>job_output</code>、<code>job_list</code>、
+    <code>job_kill</code>——加上完成通知。通知走两条车道：owner 忙碌时<strong>注入</strong>
+    next-step 收件箱（第 15 章的 <code>agent.inject()</code>，多个作业同时结算只花一个 step）；
+    owner 空闲时用 follow-up turn 唤醒，且唤醒有 <code>maxConsecutiveWakes</code> 预算防自激。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-jobs</code></td><td><code>ctx.jobs</code> · Definition</td><td>扩展 <code>JobKindMap</code> 的 producer 插件；<code>attachController()</code></td></tr>
+      <tr><td><code>dsh-jobs-local</code></td><td>注册于 <code>ctx.jobs</code></td><td>进程内注册表</td></tr>
+      <tr><td><code>dsh-tool-jobs</code></td><td>注册于 <code>ctx.tools</code></td><td><code>job_output</code> / <code>job_list</code> / <code>job_kill</code> + 完成通知</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-goal-schedule">17.8 goal 与 schedule：同会话的两种时间观</h2>
+
+  <p>
+    两个家族都把状态存进<strong>原有会话日志</strong>，但时间方向相反。goal 面向「跨多轮持续推进的
+    目标」：<code>ctx.goals</code> 维护至多一个当前目标，每次变更追加携带完整变更后快照的
+    <code>goal/change</code> 事件；<strong>activation（续跑授权）从不持久化</strong>——进程本地，
+    resume/fork 保留目标与阶段但不动手，之后必须显式 resume 才重新武装。
+    <code>dsh-goal-round-driver</code> 把激活目标变成顺序的 goal round：空闲时预留轮次、
+    以 <code>GoalMessageSource</code> 的 <code>user/message</code> 排入 <code>&lt;goal_round&gt;</code>
+    提示；人类消息优先，不消耗 goal 轮次预算。schedule 面向「未来的提醒」：单包
+    <code>dsh-schedule</code> 提供会话作用域的 <code>schedule_create</code>/<code>schedule_list</code>/
+    <code>schedule_delete</code> 三工具，durable 状态在会话日志里；进程本地的 owner 只在该会话有
+    live root agent 时等待，到期工作经普通 follow-up 队列进入对话——<strong>不隐含任何外部通知通道</strong>。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-goal</code></td><td><code>ctx.goals</code> · Definition</td><td>服务动词 + <code>goal/changed</code> 事件；continuation consumer 以 <code>GoalMessageSource</code> 准入轮次</td></tr>
+      <tr><td><code>dsh-goal-round-driver</code></td><td>continuation Consumer</td><td>空闲 agent 的轮次预留与排队</td></tr>
+      <tr><td><code>dsh-tool-goal</code> / <code>dsh-command-goal</code></td><td>模型工具 / 人类命令</td><td>目标变更的两个入口</td></tr>
+      <tr><td><code>dsh-schedule</code></td><td>会话日志内（无服务键）</td><td>三个会话作用域工具；到期经 follow-up 队列</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-settings-credentials">17.9 settings 与 credentials：配置与凭据</h2>
+
+  <p>
+    settings 家族解析用户可编辑的配置：<code>ctx.settings</code> 上插件注册命名空间 schema，
+    读值按「schema 默认 → 注册方组合的 base → 用户文档小节」分层解析；没有挂 provider 时
+    消费方照常只解析 entry config，所以每个组合有没有 settings 都能工作。
+    <code>dsh-settings-file</code> 把文档存在本地文件并观察外部编辑。
+    credentials 家族的教义是三句话：<strong>配置携带引用、绝不携带值</strong>（<code>CredentialRef</code>
+    是 branded 的，<code>resolve(ref)</code> 在每个操作开头解析、从不跨操作缓存——换密钥下一个
+    请求就生效）；<strong>describe 不返回值</strong>（配置 UI 安全）；<strong>空值即缺席</strong>。
+    <code>dsh-credentials-local</code> 把进程环境叠在 <code>$DSH_HOME/.credentials.yaml</code> 之上，
+    .env 层兜底；只读来源遮蔽引用时 <code>set</code>/<code>unset</code> 刻意拒绝。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-settings</code></td><td><code>ctx.settings</code> · Definition</td><td><code>register(ns, schema, …)</code>；<code>settings/updated</code> / <code>settings/document-updated</code></td></tr>
+      <tr><td><code>dsh-settings-file</code></td><td>注册于 <code>ctx.settings</code></td><td>本地文件 provider（外部编辑热发布）</td></tr>
+      <tr><td><code>dsh-credentials</code></td><td><code>ctx.credentials</code> · Definition</td><td><code>resolve</code> / <code>describe</code> / <code>set</code> / <code>unset</code>；<code>credentials/updated</code></td></tr>
+      <tr><td><code>dsh-credentials-local</code></td><td>注册于 <code>ctx.credentials</code></td><td>env + <code>.credentials.yaml</code> + .env 分层 provider</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-attachment-code-runtime">17.10 attachment 与 code-runtime：字节与程序</h2>
+
+  <p>
+    attachment 家族处理<strong>持久二进制</strong>：<code>ctx.attachments</code> 校验并原子提交不可变的
+    图片字节，返回可序列化的 <code>ImageAttachmentRef</code>——消费者从不把浏览器路径、
+    object URL 或 base64 塞进会话事件；未发送的草稿图片留在浏览器侧，字节只有在用户提交提示
+    或 provider adapter 提交结构化输出时才进入持久存储。
+    <code>dsh-attachment-local</code> 把内容寻址的私有存储放在 <code>DSH_HOME</code> 之下。
+    code-runtime 家族是 Code Mode 的地基：<code>ctx.codeRuntime</code> 定义「执行一个模型写的程序、
+    对 host 提供的 async 绑定求值、捕获打印与返回值」的运行时，<code>dsh-code-runtime-worker-thread</code>
+    是 worker 线程后端；Consumer 是工具注册表自己的 Code Mode（<code>tools: { mode: code }</code>）
+    ——<code>run_code</code> 工具与按加载运行时语言生成的 SDK。第 15 章你已见过它的一个侧面：
+    子调用结果的持久日志副本经 <code>tools/code-dispatch-log</code> 接受 spill 上限。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-attachment</code></td><td><code>ctx.attachments</code> · Definition</td><td><code>validateImage</code> / <code>saveImage</code> / <code>readImage</code></td></tr>
+      <tr><td><code>dsh-attachment-local</code></td><td>注册于 <code>ctx.attachments</code></td><td><code>DSH_HOME</code> 下内容寻址存储</td></tr>
+      <tr><td><code>dsh-code-runtime</code></td><td><code>ctx.codeRuntime</code> · Definition</td><td>注册运行时后端（语言、隔离、预算）</td></tr>
+      <tr><td><code>dsh-code-runtime-worker-thread</code></td><td>注册于 <code>ctx.codeRuntime</code></td><td>worker 线程执行</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-extensions-hooks">17.11 extensions 与 hooks：自省与桥接</h2>
+
+  <p>
+    extensions 家族让<strong>agent 检查并修改自己的运行时</strong>：<code>dsh-tool-cordis</code>
+    在 <code>ctx.tools</code> 上注册模型可见的运行时检查与动态包工具——检视已加载插件与服务 API、
+    定义并运行模型写的动态包、再撤回它们；<code>dsh-cordis-host-runner</code> 提供
+    <code>ctx.dynamicCordisRunner</code>（定义注册表 + <code>node:vm</code> 沙箱 + 请求-运行往返），
+    <code>dsh-cordis-client-runner</code> 是浏览器半边，<code>dsh-ui-cordis</code> 提供操作面板与只读
+    define 卡。这是「demo:cordis 让 agent 修改自己的运行时」背后的机制。hooks 家族面向外来生态：
+    它把 Claude Code / Codex 风格的外部 shell hook（<code>hooks.json</code>）忠实映射到 dsh 的
+    typed 拦截点上——<code>dsh-hook-protocol</code> 是共享的 wire 协议库，
+    <code>dsh-hooks-claude-code</code> 与 <code>dsh-hooks-codex</code> 各自拥有方言的事件映射。
+    记住立场：dsh 的原生扩展面就是那些类型化拦截点，「原生 hook」不过是挂在上面的普通 Cordis 插件。
+  </p>
+  <table>
+    <thead><tr><th>包</th><th>ctx 键 / 角色</th><th>扩展点</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-tool-cordis</code></td><td>注册于 <code>ctx.tools</code></td><td>运行时检查 + 动态包定义/运行/撤回工具</td></tr>
+      <tr><td><code>dsh-cordis-host-runner</code></td><td><code>ctx.dynamicCordisRunner</code>（host）</td><td>定义注册表 + <code>node:vm</code> 沙箱</td></tr>
+      <tr><td><code>dsh-cordis-client-runner</code> / <code>dsh-ui-cordis</code></td><td>浏览器半边</td><td>浏览器插件求值 + 面板 UI</td></tr>
+      <tr><td><code>dsh-hook-protocol</code></td><td>库</td><td>共享 shell-hook wire 协议</td></tr>
+      <tr><td><code>dsh-hooks-claude-code</code> / <code>dsh-hooks-codex</code></td><td>桥插件</td><td>方言事件映射到 typed 拦截点</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-recap">17.12 本章回顾</h2>
+  <ul>
+    <li>知识与外部信息：skill（<code>ctx.skills</code> 目录 + <code>skill</code> 工具）、web（<code>ctx.web</code> search/fetch 一条 seam、多 provider、显式选择策略）、lsp（四操作、无 JSON-RPC 逃生口）、mcp-client（<code>mcp__server__tool</code> 注册到 <code>ctx.tools</code>）。</li>
+    <li>编排与续跑：workflow（<code>ctx.workflowEngine</code> + worker 线程 + <code>workflow</code> 工具）、ralph（固定 fresh-agent 循环，工作区即长期记忆）、jobs（<code>ctx.jobs</code> owner 圈定 + <code>job_*</code> 工具 + 注入/唤醒双车道通知）、goal（<code>ctx.goals</code> 事件溯源、activation 进程本地）、schedule（会话日志内提醒，无外部通知通道）。</li>
+    <li>配置与凭据：settings（命名空间分层解析 + 文件 provider）、credentials（引用不携值、按操作 resolve、空值即缺席）。</li>
+    <li>数据与执行：attachment（不可变图片字节 + <code>ImageAttachmentRef</code>）、code-runtime（<code>ctx.codeRuntime</code> + Code Mode 的 <code>run_code</code> 与生成 SDK）。</li>
+    <li>自省与桥接：extensions（<code>ctx.dynamicCordisRunner</code>、模型检查/挂载自己的插件）、hooks（外部 shell-hook 协议桥接到 typed 拦截点）。</li>
+    <li>共同句式：providers 注册<strong>能力不是工具</strong>；模型面的名字、schema、提示与展示归 Consumer 工具包独有；状态要么进会话日志、要么留在侧车，从不进模型历史。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>给 web/lsp 的 provider 起工具名——providers 注册能力；模型可见名归 <code>tool-web</code>/<code>tool-lsp</code>。</li>
+      <li>指望 web 自动在多个可用 provider 里挑一个——未配置 id 且多个可用时抛 <code>WEB_PROVIDER_AMBIGUOUS</code>，选择必须显式。</li>
+      <li>把 worker 线程当安全边界——workflow 与 code-runtime 的线程只隔离事件循环，不是沙箱。</li>
+      <li>以为 schedule 会推送通知——它是会话内提醒，只在有 live root agent 时投递。</li>
+      <li>把凭据值写进配置——配置只带 <code>CredentialRef</code>；值由 provider 解析，空值视为未配置。</li>
+      <li>给 ralph 加「Ralph 模式」或改 agent-loop——它是普通插件上的固定策略 workflow。</li>
+      <li>绕过 <code>ctx.attachments</code> 直接把 base64/URL 塞进会话事件——持久引用只能是 <code>ImageAttachmentRef</code>。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="17">
+    <h2>第 17 章测验</h2>
+
+    <div class="q" data-id="17-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 未配置 id 且有多个可用 provider 时抛 WEB_PROVIDER_AMBIGUOUS；选择策略要求显式 id 或恰好一个可用者。"
+         data-rationale="C 正确，这是 ctx.web 的执行时选择表。A、B 都是无中生有的自动选择——选择从不依赖注册顺序。D 错：fetch 与 search 是独立的能力种类，search 的歧义不影响 fetch 的解析。"
+         data-review="sec-web">
+      <div class="prompt"><span class="qnum">Q1.</span> 没有配置 provider id，而注册了两个可用的 search provider 时，<code>ctx.web.search()</code> 会怎样？</div>
+      <label class="opt"><input type="radio" name="q-17-1" value="a"> A. 自动用先注册的那个</label>
+      <label class="opt"><input type="radio" name="q-17-1" value="b"> B. 自动轮询两个 provider</label>
+      <label class="opt"><input type="radio" name="q-17-1" value="c"> C. 抛出 <code>WebError</code>（<code>WEB_PROVIDER_AMBIGUOUS</code>）</label>
+      <label class="opt"><input type="radio" name="q-17-1" value="d"> D. 静默降级为 fetch</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— dsh-mcp-client：连接外部 MCP 服务器并把其工具以 mcp__&lt;serverName&gt;__&lt;rawName&gt; 注册到 ctx.tools。"
+         data-rationale="B 正确。A 是接入 dsh 内部技能目录的家族，不桥接外部服务器。C 的 tool-web 是 web seam 的 Consumer。D 的 hooks 是把外部 shell-hook 协议桥到 typed 拦截点，不注册工具。"
+         data-review="sec-mcp">
+      <div class="prompt"><span class="qnum">Q2.</span> 想让模型直接使用一个外部 MCP 服务器（如 GitHub）提供的工具，用哪个包？</div>
+      <label class="opt"><input type="radio" name="q-17-2" value="a"> A. dsh-skill-filesystem</label>
+      <label class="opt"><input type="radio" name="q-17-2" value="b"> B. dsh-mcp-client</label>
+      <label class="opt"><input type="radio" name="q-17-2" value="c"> C. dsh-tool-web</label>
+      <label class="opt"><input type="radio" name="q-17-2" value="d"> D. dsh-hooks-codex</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-3" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 恰好四个语义操作：goToDefinition、findReferences、goToImplementation、hover；没有通用 JSON-RPC 逃生口。"
+         data-rationale="A 正确：收窄的操作集保证换 provider 不改变模型提问方式，协议载荷到不了模型契约。B 错：没有逃生口。C 错：providers 注册能力，工具面归 tool-lsp。D 错：后端建在共享执行世界（ctx.fs/ctx.subprocess）上，文档按查询临时打开，但操作数量与 provider 无关。"
+         data-review="sec-lsp">
+      <div class="prompt"><span class="qnum">Q3.</span> <code>ctx.lsp</code> 这条 seam 暴露多少个语义操作？</div>
+      <label class="opt"><input type="radio" name="q-17-3" value="a"> A. 四个：goToDefinition、findReferences、goToImplementation、hover</label>
+      <label class="opt"><input type="radio" name="q-17-3" value="b"> B. 任意 LSP 方法，含通用 JSON-RPC 透传</label>
+      <label class="opt"><input type="radio" name="q-17-3" value="c"> C. 每个后端自己决定操作集</label>
+      <label class="opt"><input type="radio" name="q-17-3" value="d"> D. 两个：definition 与 references</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-4" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A、B、C 正确：SessionId 是 owner fence（可预测 id 之外唯一的边界）、三个种类无关工具、忙碌 owner 的通知进 next-step 收件箱（多个作业结算只花一个 step）。D 错：通知不使用操作系统或外部推送；空闲 owner 是用 follow-up turn 唤醒模型，且有预算上限。"
+         data-review="sec-jobs">
+      <div class="prompt"><span class="qnum">Q4.</span> 关于 jobs 家族，下列哪些说法正确？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="a"> A. 访问按 <code>SessionId</code> 圈定（owner fence）</label>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="b"> B. 模型侧工具是 <code>job_output</code> / <code>job_list</code> / <code>job_kill</code></label>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="c"> C. 忙碌 owner 的完成通知注入 next-step 收件箱</label>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="d"> D. 完成通知通过操作系统推送给用户</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— activation 是进程本地的，从不持久化；resume/fork 保留目标与阶段，但必须显式 resume 才重新武装续跑。"
+         data-rationale="D 正确，这是刻意的安全边界：durable 日志记录目标与生命周期，是否自动开工是运行时授权。A 错：goal/change 携带完整变更后快照，是持久的。B 错：至多一个当前目标。C 错：goal-round-driver 只是 continuation Consumer，续跑授权在 ctx.goals。"
+         data-review="sec-goal-schedule">
+      <div class="prompt"><span class="qnum">Q5.</span> goal 家族里，activation（续跑授权）的持久化语义是什么？</div>
+      <label class="opt"><input type="radio" name="q-17-5" value="a"> A. 随每次 goal/change 事件持久化</label>
+      <label class="opt"><input type="radio" name="q-17-5" value="b"> B. 存在 goal-round-driver 的配置里</label>
+      <label class="opt"><input type="radio" name="q-17-5" value="c"> C. 可同时激活多个目标，各自持久化</label>
+      <label class="opt"><input type="radio" name="q-17-5" value="d"> D. 进程本地、从不持久化；resume/fork 保留目标但不自动续跑</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— ralph 是 ctx.workflowEngine 与 ctx.subagents 之上的固定策略 Consumer：每轮一个全新子代理、共享工作区为长期记忆、结构化 handoff 轮间传递。"
+         data-rationale="B 正确：没有 Ralph 模式，也没有 fresh-agent loop 进入 agent-loop。A 错：child 是全新的（provider 必须 inheritsParentContext 为 false），父对话不种子。C 错：每轮全新 child，不延续前一个 child 的会话；长期记忆是共享工作区。D 错：workspace-as-authority 恰恰是设计的一部分。"
+         data-review="sec-workflow">
+      <div class="prompt"><span class="qnum">Q6.</span> <code>ralph</code> 工具的编排策略是什么？</div>
+      <label class="opt"><input type="radio" name="q-17-6" value="a"> A. agent-loop 内建的 Ralph 模式，复用父会话上下文</label>
+      <label class="opt"><input type="radio" name="q-17-6" value="b"> B. 固定策略 workflow：每轮一个全新子代理，共享工作区作为长期记忆，结构化 handoff 在轮间传递</label>
+      <label class="opt"><input type="radio" name="q-17-6" value="c"> C. 单个子代理多轮对话，逐轮累积其会话</label>
+      <label class="opt"><input type="radio" name="q-17-6" value="d"> D. 无编排：把目标直接发给当前 agent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 是三条教义：配置带 CredentialRef 不带值（文档可安全同步渲染）、按操作 resolve（换密钥下一请求生效，无重启）、describe 只答配置状态不返回值。C 恰好相反：空存储值到处视为缺席，空白永远冒充不了已配置的密钥。"
+         data-review="sec-settings-credentials">
+      <div class="prompt"><span class="qnum">Q7.</span> credentials 家族的教义包括哪些？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="a"> A. 配置携带引用，绝不携带值</label>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="b"> B. 消费者在每个操作开头 resolve，不跨操作缓存</label>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="c"> C. 空的存储值视为已配置但待填充</label>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="d"> D. <code>describe()</code> 能回答是否已配置、来源、可否写入，而不返回值</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-8" data-type="fill"
+         data-accepted='["ctx.dynamicCordisRunner","dynamicCordisRunner","ctx.dynamicCordisRunner (dsh-cordis-host-runner)"]'
+         data-answer="ctx.dynamicCordisRunner（由 dsh-cordis-host-runner 提供：定义注册表 + node:vm 沙箱 + 请求-运行往返）。"
+         data-rationale="extensions 家族的 host 侧 runner 提供 ctx.dynamicCordisRunner；tool-cordis 是它之上的模型可见工具，浏览器半边由 cordis-client-runner 提供同名的客户端服务。"
+         data-review="sec-extensions-hooks">
+      <div class="prompt"><span class="qnum">Q8.</span> 填空：dsh-cordis-host-runner 提供 ______ 服务，支撑模型定义并运行动态 Cordis 包。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-9" data-type="short"
+         data-key-points='["长时构建/watch → jobs（ctx.jobs + job_output/job_list/job_kill，owner 圈定）","按目标多轮推进 → goal（ctx.goals 事件溯源 + goal-round-driver 续跑；activation 进程本地）","语义导航（定义/引用/实现/hover）→ lsp（ctx.lsp，四操作）","外部 MCP 工具 → mcp-client（mcp__server__tool 注册到 ctx.tools）","共同句式：providers 注册能力不是工具；模型面归 Consumer 工具包"]'
+         data-answer="按需求对号：长时间构建/watch 走 jobs——producer 插件扩展 JobKindMap，经 ctx.jobs.start 开工，模型用 job_output/job_list/job_kill 观察与停止，完成通知按 owner 忙闲走注入或唤醒；跨轮目标走 goal——目标与生命周期以 goal/change 事件存在会话日志，goal-round-driver 在空闲时以 GoalMessageSource 的 user/message 准入轮次，activation 进程本地防自动开工；语义导航走 lsp——四个固定操作，换 provider 不改模型契约；外部 MCP 工具走 mcp-client——每服务器一个插件实例，工具以 mcp__server__tool 名注册。四者共同句式：providers 注册能力不是工具，模型面的名字与 schema 归 Consumer 工具包独有。"
+         data-rationale="能把需求映射到家族与扩展点，这张地图的目的就达到了；细节回查各包 README 与 docs/capability-seams.md。"
+         data-review="sec-map">
+      <div class="prompt"><span class="qnum">Q9.</span> 场景映射：模型要跑长时间构建并事后收集输出、要按一个目标连续推进多轮、要查符号的定义与引用、还要用外部 MCP 服务器的工具。各走哪个能力家族、去哪扩展？</div>
+      <textarea class="short" placeholder="你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正覆盖了某个要点才勾选它——少选伤害校准，多选只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="18-cli-and-boot.html"><strong>第 18 章 · dsh CLI 与 boot 深入</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 5 章 · 持久化：JSONL/SQLite 后端与版本化 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 5 章 · 持久化</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="5">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 5 章 · 第二部分 · 核心脊柱</div>
+    <h1>持久化：JSONL/SQLite 后端与版本化</h1>
+    <p class="lede">
+      上一章的 <code>SessionEvent</code> 日志是活真相，活在进程内存里。本章讲它怎么变得
+      durable（耐崩溃）：一个抽象的持久化接缝（<code>ctx.sessionPersistence</code>）、
+      两个可互换的后端（JSONL 与 SQLite）、两层版本化与「拒绝式」加载策略、
+      崩溃恢复，以及从同一条日志派生出来的投影、标题与遥测。读完本章，
+      你能回答「dsh 把我的会话存到哪了、以什么格式存、版本变了怎么办」。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学完本章你能够</div>
+    <ul>
+      <li>描述持久化接缝的职责边界：write-behind 批量写、revision 令牌、prepare/load/inspect/readFrom 各自解决什么</li>
+      <li>说出两个后端的物理形态：JSONL 每会话一个 transcript 文件、SQLite 的三张表与一行一事件</li>
+      <li>区分两层版本化：<code>SessionHeader.version</code>（当前 0）盖事件词汇，SQLite <code>SCHEMA_VERSION</code>（当前 15）盖表结构，且都是拒绝而非迁移</li>
+      <li>解释崩溃恢复为什么「收口孤儿 turn」而不是截断日志</li>
+      <li>列出从日志派生的状态（投影缓存冷读梯、标题、遥测）与非会话数据（<code>ctx.storage</code> hub）的去向</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-persistence-seam">5.1 内存日志是活真相，持久化是接缝</h2>
+
+  <p>
+    先把上一章的分工再钉一次：<code>SessionStore</code>（<code>ctx.sessions</code>）
+    <strong>故意不实现任何持久化</strong>。落盘是插件的事——持久化插件订阅
+    <code>session/event</code>（同步通知，插件把事件拷进自己的缓冲，不阻塞生产者），
+    并在 <code>session/flush</code> 检查点排空。抽象服务是
+    <code>ctx.sessionPersistence</code>（包 <code>packages/session/session-persistence</code>），
+    它是一个标准 capability seam：Service Definition 声明接口，两个 Service Provider
+    实现它，若干 Consumer 使用它——同样的 <code>SessionEvent</code> 词汇，
+    <strong>没有第二种持久化事件类型</strong>要同步。
+  </p>
+
+  <p>
+    接口面（都在 <code>session-persistence/src/index.ts</code>）按使用场景记：
+  </p>
+  <ul>
+    <li><code>locate(meta)</code>：同步解析一个会话的工件位置，不读不建不冲刷。JSONL 返回 transcript 绝对路径；SQLite 返回 <code>undefined</code>（所有会话共享一个库）。</li>
+    <li><code>create(meta)</code> / <code>append(id, events)</code>：登记头元数据 / 持久一批连续事件。<code>append</code> 只在耐久完成后 resolve。</li>
+    <li><code>prepare(id)</code>：resume 用的——取出一个未发布的 <code>SessionPreparation</code>（上一章 4.8 节那个），提交修复、预留独占。</li>
+    <li><code>load(id)</code> / <code>inspect(id)</code>：加载平衡过的逻辑视图（提交冷恢复）/ 只读检查不写恢复。</li>
+    <li><code>readFrom(id, fromSeq)</code>：从某个 seq 读存储后缀——给「从水位续读」的读模型用。</li>
+    <li><code>list()</code> / <code>listSnapshots()</code>：轻量列举，只读头元数据、不解析全日志。</li>
+  </ul>
+
+  <h3>协调器与 write-behind 批量写</h3>
+
+  <p>
+    两个后端不各自发明缓冲逻辑：<code>session-persistence/src/coordinator.ts</code>
+    提供共享的缓冲、序列化、修复、销毁编排（第三方后端也可以直接实现接缝）。
+    批量写策略在 <code>write-behind.ts</code>：
+  </p>
+  <ul>
+    <li>第一个待写事件<strong>启动一个固定的批量窗口</strong>（默认 <code>200ms</code>，
+      <code>writeBatchMaxDelayMs</code> 可配）；窗口内后续事件加入同一批，
+      <strong>不重置截止时间</strong>。</li>
+    <li>窗口到期触发一次耐久批量写；写入期间到达的事件获得自己的新窗口，形成后续批次。</li>
+    <li><code>session/flush</code> 取消等待、排空到静止（quiescence）——所以循环在认领下一个普通 turn 前拿它当顺序与错误观察检查点。</li>
+    <li>后台写失败时事件<strong>保留</strong>并暂停自动重试；新事件重启窗口，显式 flush 立即重试并把失败通过 <code>agent/error</code> 与日志上报——绝不会作为会话事件写进已关闭的 turn。</li>
+  </ul>
+
+  <p>
+    <strong>revision</strong>（<code>revision.ts</code>，<code>SessionPersistenceRevision</code>）
+    是后端自有表示的不透明令牌：它同时标识「哪个存储源」和「该源的第几版」，
+    随 append 或修复性 load 在事务中改变。派生状态的消费者在加载完整日志前先比较
+    这个廉价令牌——相等就不必重读。调用方只做相等比较，不解释它的内部结构。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Persistence architecture">
+      <rect x="10" y="30" width="170" height="80" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="58" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">内存 store（活真相）</text>
+      <text x="95" y="78" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">ctx.sessions · SessionEvent[]</text>
+      <text x="95" y="94" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">append 即提交</text>
+
+      <line x1="180" y1="70" x2="248" y2="70" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="248,70 240,66 240,74" style="fill:var(--muted)"/>
+      <text x="214" y="58" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">session/event</text>
+
+      <rect x="250" y="24" width="200" height="94" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="350" y="50" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">ctx.sessionPersistence</text>
+      <text x="350" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">协调器：write-behind 批量</text>
+      <text x="350" y="86" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">修复 / 准备 / revision</text>
+      <text x="350" y="102" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">session/flush 排空</text>
+
+      <line x1="450" y1="56" x2="518" y2="40" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="518,40 509,39 512,47" style="fill:var(--muted)"/>
+      <line x1="450" y1="88" x2="518" y2="104" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="518,104 512,97 509,106" style="fill:var(--muted)"/>
+
+      <rect x="520" y="14" width="230" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="635" y="36" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">JSONL 后端</text>
+      <text x="635" y="54" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">每会话一个 session.jsonl.zstd</text>
+
+      <rect x="520" y="82" width="230" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="635" y="104" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">SQLite 后端</text>
+      <text x="635" y="122" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">node:sqlite · 一行一事件</text>
+
+      <line x1="95" y1="110" x2="95" y2="170" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <line x1="350" y1="118" x2="350" y2="170" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <line x1="635" y1="138" x2="635" y2="170" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="95,170 91,162 99,162" style="fill:var(--muted)"/>
+      <polygon points="350,170 346,162 354,162" style="fill:var(--muted)"/>
+      <polygon points="635,170 631,162 639,162" style="fill:var(--muted)"/>
+
+      <rect x="30" y="172" width="220" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="140" y="194" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">session-projection(+cache)</text>
+      <text x="140" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">投影读模型 + 冷读梯</text>
+      <text x="140" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">列表永不加载完整日志</text>
+      <text x="140" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">readFrom(seq) 续读水位</text>
+      <text x="140" y="272" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">revision 相等即免读</text>
+
+      <rect x="270" y="172" width="220" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="380" y="194" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">session-title 家族</text>
+      <text x="380" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">首提示词回退 / LLM 摘要</text>
+      <text x="380" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">每个修订 = session/title 事件</text>
+      <text x="380" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">foldSessionTitle 取最新</text>
+
+      <rect x="510" y="172" width="220" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="620" y="194" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">session-telemetry(+otel)</text>
+      <text x="620" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">live 或 on-demand 捕获</text>
+      <text x="620" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">redact waterfall 后交给 SDK</text>
+      <text x="620" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">去重键 (session.id, seq)</text>
+
+      <text x="380" y="306" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">下面三个框都是从日志「派生」的状态：日志在先，缓存在后，永远可以重推</text>
+    </svg>
+    <figcaption>图 5-1 · 持久化架构：内存 store 通过 session/event 喂给协调器，write-behind 批量落到双后端之一；投影 / 标题 / 遥测是同一条日志的派生消费者。</figcaption>
+  </figure>
+
+  <h2 id="sec-jsonl-backend">5.2 JSONL 后端：每会话一个 transcript 文件</h2>
+
+  <p>
+    <code>packages/session/session-persistence-jsonl</code> 把每个会话存成一个
+    append-only 的逻辑 JSONL 日志。磁盘布局：
+  </p>
+
+  <pre><code>&lt;root&gt;/
+  --&lt;normalized-cwd&gt;--/        <span class="code-comment"># 可读的项目目录（无 cwd 时 _no-cwd/）</span>
+    &lt;encoded-session-id&gt;/      <span class="code-comment"># 会话自有目录</span>
+      session.jsonl.zstd       <span class="code-comment"># 默认：校验和的 zstd 帧序列</span>
+      session.jsonl            <span class="code-comment"># 仅当 compression: 'none'</span></code></pre>
+
+  <p>
+    逻辑内容三件事值得记：
+  </p>
+  <ul>
+    <li><strong>第一行是 <code>SessionHeader</code></strong>（打上 <code>{ type: 'session', ... }</code> 标签），之后每行一条存储记录，<code>seq</code> 跨整个解码后的日志保持连续（<code>events[i].seq === i</code>）。<code>assistant/chunk</code> 一条不丢。</li>
+    <li><strong>packed chunk row</strong>：默认开启（<code>packChunks: true</code>）时，
+      连续 ≥3 条同 block 的 <code>assistant/chunk</code> 增量打包成一行
+      （<code>text-chunks</code> / <code>reasoning-chunks</code> / <code>tool-call-chunks</code>，
+      无斜杠的裸标签，不会与事件类型混淆），用 <code>seq0/time0 + 逐成员 dt</code> 精确重建每条成员的
+      <code>seq/time</code>——实测能把逻辑日志缩小约 60%。<strong>读取对布局无感</strong>：
+      打包、未打包、混合的文件加载结果完全相同。这正是上一章「持久层可自选编码，
+      但 load 必须返回精确事件」契约的实例。</li>
+    <li><strong>物理编码</strong>：默认是「校验和 Zstandard 帧的串接」——头行一帧，
+      之后每个耐久批量一帧。<code>compression: 'none'</code> 保留原始换行文本。
+      一个 root 只属于一种编码，混用后缀会被拒绝而不是被忽略。</li>
+  </ul>
+
+  <p>
+    配置上有一个刻意的「无默认」：<code>root</code> 必填。给 <code>process.cwd()</code> 当默认值
+    会让文件随进程 cwd 漂移（bash 调用、子进程都会改 cwd），把会话散落各处。
+    这是「显式优于隐式」规约的教科书案例。
+  </p>
+
+  <h2 id="sec-sqlite-backend">5.3 SQLite 后端：一行一事件</h2>
+
+  <p>
+    <code>packages/session/session-persistence-sqlite</code> 用 Node 内置的
+    <code>node:sqlite</code>（<code>DatabaseSync</code>），DDL 在
+    <code>src/schema.ts</code>，三张表：
+  </p>
+
+  <pre><code><span class="code-key">CREATE TABLE</span> persistence_state (   <span class="code-comment"># store 身份：单例行 + 随机 store_id</span>
+  singleton <span class="code-key">INTEGER PRIMARY KEY</span> <span class="code-key">CHECK</span> (singleton = 1),
+  store_id  <span class="code-key">TEXT NOT NULL</span>) <span class="code-key">STRICT</span>;
+
+<span class="code-key">CREATE TABLE</span> sessions (              <span class="code-comment"># 会话元数据表 = SessionHeader</span>
+  id <span class="code-key">TEXT PRIMARY KEY</span>, version <span class="code-key">INTEGER NOT NULL</span>, created_at <span class="code-key">INTEGER NOT NULL</span>,
+  cwd <span class="code-key">TEXT</span>, parent_session <span class="code-key">TEXT</span>, seed_length <span class="code-key">INTEGER</span>, origin <span class="code-key">TEXT</span>,
+  delegation_depth <span class="code-key">INTEGER</span>, agent_preset <span class="code-key">TEXT</span>,
+  incarnation <span class="code-key">TEXT NOT NULL</span>,          <span class="code-comment"># 物化时分配的稳定身份</span>
+  revision   <span class="code-key">INTEGER NOT NULL</span>) <span class="code-key">STRICT</span>;   <span class="code-comment"># 单调日志变更令牌</span>
+
+<span class="code-key">CREATE TABLE</span> events (                <span class="code-comment"># 事件表：一条 SessionEvent 一行</span>
+  session_id <span class="code-key">TEXT NOT NULL REFERENCES</span> sessions(id) <span class="code-key">ON DELETE CASCADE</span>,
+  seq <span class="code-key">INTEGER NOT NULL</span>, type <span class="code-key">TEXT NOT NULL</span>, time <span class="code-key">INTEGER NOT NULL</span>,
+  data <span class="code-key">TEXT NOT NULL</span>,               <span class="code-comment"># 事件 data 的 JSON 文本</span>
+  source_event_seqs <span class="code-key">TEXT</span>,       <span class="code-comment"># JSON 编码的 number[]，或 NULL</span>
+  surface_op <span class="code-key">TEXT</span>,                <span class="code-comment"># JSON 编码的 SurfaceOp，或 NULL</span>
+  ignorable  <span class="code-key">INTEGER</span>,              <span class="code-comment"># 带标记时为 1</span>
+  <span class="code-key">PRIMARY KEY</span> (session_id, seq)) <span class="code-key">STRICT</span>;</code></pre>
+
+  <p>
+    行字段 <code>(session_id, seq, type, time, data, source_event_seqs, surface_op)</code>
+    与事件 <strong>1:1 映射</strong>，包括可选的 surface 元数据——所以「没有第二套持久化
+    schema 要维护」。几个行为细节：
+  </p>
+  <ul>
+    <li><strong>惰性物化</strong>：<code>sessions</code> 行只在第一次 <code>append</code> 时写入。
+      建了但从没写过事件的会话在 <code>list()</code> 里不存在——废弃会话不留痕迹，
+      与 JSONL 的「第一次 append 才有文件」对称。</li>
+    <li><strong>journal 模式</strong>：默认 <code>wal</code>；回滚日志模式（<code>delete</code>/
+      <code>truncate</code>/<code>persist</code>）为 WAL 共享内存文件不可用的文件系统（网络挂载）保留。
+      <code>memory</code>/<code>off</code> 被排除——静默丢弃日志耐久性与本后端的承诺矛盾。</li>
+    <li><code>locate()</code> 返回 <code>undefined</code>（共享一个库，没有 per-session 工件）；
+      因此它也不支持原始工件读取（<code>supportsRawArtifacts === false</code>），
+      而 JSONL 的 <code>readRaw</code> 能逐字节回放它写下的文本。</li>
+    <li><strong>revision 的 SQLite 形态</strong>：sessions 行里的 <code>revision</code> 列，
+      每个变更事务单调 +1；<code>store_id</code> 让不同后端实例的 revision 永不撞车。</li>
+  </ul>
+
+  <h2 id="sec-two-layer-versioning">5.4 两层版本化：拒绝，不迁移</h2>
+
+  <p>
+    dsh 的版本策略只有一句话：<strong>读不了的日志必须被拒绝，绝不悄悄猜</strong>。
+    落到实现是两层各自把关：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th></th><th>会话格式层</th><th>SQLite 结构层</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>版本住在哪</td><td><code>SessionHeader.version</code>，创建时从 <code>SESSION_FORMAT_VERSION</code> 盖章</td><td><code>PRAGMA user_version</code>（<code>SCHEMA_VERSION</code>）+ <code>PRAGMA application_id</code></td></tr>
+      <tr><td>当前值</td><td><code>0</code>（预发布期钉死：无兼容承诺）</td><td><code>15</code>（单调递增；application id <code>0x44534850</code>）</td></tr>
+      <tr><td>盖住什么</td><td>事件词汇与信封的结构语义（header 形态、信封、核心事件语义、surface 机制）</td><td>表结构布局（三张表怎么长）</td></tr>
+      <tr><td>不匹配时</td><td>抛 <code>SessionFormatUnsupportedError</code>，文案区分方向：版本更高 =「由更新的 harness 写的——升级 harness」；更低 =「本构建没有升级路径」</td><td>拒绝打开数据库；<code>user_version</code> 为 0 但非空、或版本非当前，一律拒绝，绝不在原地迁移</td></tr>
+      <tr><td>什么不碰它</td><td>新增普通事件类型不 bump——词汇增长由 <code>ignorable</code> 标记覆盖（上一章）</td><td>会话自己的 <code>version</code> 存在 sessions 行里，与本层正交</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    注意区分「拒绝格式不支持」（<code>SessionFormatUnsupportedError</code>：日志没坏，
+    只是这个构建读不了）与「损坏」（<code>SessionPersistenceCorruptionError</code>：
+    已提交前缀里的数据真坏了）。方向感知的拒绝文案是产品级细节：用户该看到
+    「升级 harness」，永远不该看到「文件损坏」。JSONL 后端甚至<strong>从原始头行</strong>
+    就能给出方向判断——在任何结构校验之前；SQLite 则先用 <code>SCHEMA_VERSION</code>
+    pragma 把整库结构挡在门外。仓库 AGENTS.md 的预发布立场说得直白：
+    没有外部消费者时，优先正确的地基——拒绝旧格式、自由重命名、同步更新所有引用。
+  </p>
+
+  <div class="demo" data-demo="versionReject">
+    <div class="demo-title">试一试 —— 版本不匹配就被拒绝</div>
+    <p>为日志和读取器各选一个版本（机制演示，数值仅作示例）：</p>
+    <label><input type="radio" name="d5log" value="1"> 日志 v1</label>
+    <label><input type="radio" name="d5log" value="2"> 日志 v2</label>
+    <label><input type="radio" name="d5read" value="1"> 读取器 v1</label>
+    <label><input type="radio" name="d5read" value="2"> 读取器 v2</label>
+    <div class="demo-output empty">各选一个版本。</div>
+  </div>
+
+  <h2 id="sec-crash-recovery">5.5 崩溃恢复：收口孤儿 turn</h2>
+
+  <p>
+    上一章 4.8 节讲了修复<strong>语义</strong>（<code>interruptedTurnClosers</code>：
+    悬空调用补 error 结果、补边界、<code>turn/end { interrupted }</code>、已有事件不动），
+    这里补上持久化层的执行时机与边界判定：
+  </p>
+  <ul>
+    <li><strong>只对冷会话修复</strong>。对仍活着的会话 id，<code>load(id)</code> 等内存里的
+      权威快照耐久化后返回它；活会话的开着的 turn 直接拒绝，不会收到合成的
+      中断边界。</li>
+    <li><strong>撕裂尾 vs 半截 turn</strong>：写了一半的物理记录（JSONL 的断帧、
+      SQLite 的不可解析行或 seq 空洞）是「从未提交」的撕裂尾，<strong>丢弃</strong>；
+      而<strong>完整写入</strong>的半截 turn 是已提交事实，<strong>收口保留</strong>。
+      SQLite 的 <code>scanRows</code> 用「最后一个 <code>turn/end</code>」做分界：
+      界前的洞是已提交区的损坏（抛错），界后的洞是可容忍的撕裂尾（截掉）。</li>
+    <li><strong>inspect 不落盘修复</strong>：冷检视在内存里补合成闭合，物理撕裂尾原样不动；
+      <code>load</code> / <code>prepare</code> 才把修复提交回存储（此时 revision 也会变）。</li>
+    <li><strong>prepare 的缓存复用</strong>：协调器把冷的未发布会话留在有界 LRU 里
+      （默认 5 个），重复的历史读取和随后的 resume 共享一次「读取、解压、验证、冻结、构造」。</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Crash recovery timeline">
+      <text x="380" y="22" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">磁盘上的日志（崩溃后）</text>
+      <g font-size="10">
+        <rect x="20" y="36" width="96" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="68" y="53" text-anchor="middle" style="fill:var(--fg)">turn/start</text>
+        <rect x="120" y="36" width="96" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="168" y="53" text-anchor="middle" style="fill:var(--fg)">user/message</text>
+        <rect x="220" y="36" width="110" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="275" y="53" text-anchor="middle" style="fill:var(--fg)">assistant/msg</text>
+        <rect x="334" y="36" width="90" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="379" y="53" text-anchor="middle" style="fill:var(--fg)">tool/call</text>
+        <rect x="428" y="36" width="100" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="478" y="53" text-anchor="middle" style="fill:var(--fg)">tool/result</text>
+        <rect x="532" y="36" width="110" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--fail)" stroke-dasharray="4,3"/>
+        <text x="587" y="53" text-anchor="middle" style="fill:var(--fg)">assistant/msg…</text>
+        <rect x="646" y="36" width="94" height="26" rx="4" style="fill:var(--surface-2);stroke:var(--muted)" stroke-dasharray="3,3"/>
+        <text x="693" y="53" text-anchor="middle" style="fill:var(--fg-dim)">撕裂尾</text>
+      </g>
+      <text x="587" y="78" text-anchor="middle" style="fill:var(--fail)" font-size="10">turn 未闭合</text>
+      <text x="693" y="78" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">写了一半，丢弃</text>
+
+      <line x1="587" y1="84" x2="587" y2="116" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="587,116 583,108 591,108" style="fill:var(--muted)"/>
+
+      <rect x="300" y="118" width="380" height="76" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="490" y="140" text-anchor="middle" style="fill:var(--accent)" font-size="11.5" font-weight="700">load 时合成收口（durably 追加）</text>
+      <text x="490" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">tool/result（error: TOOL_OUTCOME_UNKNOWN，若有悬空调用）</text>
+      <text x="490" y="174" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">step/end（若有开着的 step）→ turn/end { kind: interrupted }</text>
+      <text x="490" y="190" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">seq 接续、time 复用最后真实事件</text>
+
+      <line x1="68" y1="62" x2="68" y2="96" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <line x1="530" y1="62" x2="530" y2="96" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="5,4"/>
+      <text x="290" y="106" text-anchor="middle" style="fill:var(--pass)" font-size="10.5">以上事件完整写入 = 已提交事实，一条不动</text>
+      <text x="380" y="216" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">收口而不是截断：大 turn 里的工具成果全部保留，恢复出的转录对 provider 合法</text>
+    </svg>
+    <figcaption>图 5-2 · 崩溃恢复时间线：完整写入的孤儿 turn 被合成边界收口（interrupted），撕裂的物理尾被丢弃；两者以「写没写完整」分界，不以「有没有 turn/end」分界。</figcaption>
+  </figure>
+
+  <h2 id="sec-derived-state">5.6 派生状态：投影、标题、遥测</h2>
+
+  <p>
+    会话日志落了盘，一大类「读模型」就可以从它派生——日志在先，缓存在后，
+    缓存永远可以扔掉重推。这一节认识三个家族（都在 <code>packages/session/</code> 下）。
+  </p>
+
+  <h3>投影与冷读梯（session-projection / session-projection-cache）</h3>
+
+  <p>
+    <code>ctx.sessionProjections</code> 是一个「框架驱动、领域计算」的注册表：
+    每个领域注册一个投影单元 <code>{ key, schema, init, apply, view, stateVersion }</code>——
+    三个纯同步函数加声明。框架订阅一次 <code>session/event</code>，让每个已提交事件
+    流过每个单元的 <code>apply</code>；<code>snapshot(session)</code> 给出所有单元在同一个
+    <code>asOfSeq</code> 上的一致快照。两条性能纪律是契约的一部分：
+    不关心该事件的 <code>apply</code> 必须<strong>返回同一个 state 引用</strong>（引用相等即免下游工作）；
+    状态事件必须携带<strong>整值</strong>而非增量（last-wins、自描述）。
+  </p>
+
+  <p>
+    挂上 <code>session-projection-cache</code> 后，每个会话的投影检查点持久化到
+    storage-domain（见 5.7），冷读走<strong>梯子</strong>而<strong>绝不加载完整日志</strong>：
+  </p>
+
+  <pre><code>缓存行（(key → ver, seq, val)，零 I/O）
+  → restoreFloor（锚定在最低可用水位下方一个事件）
+  → 持久层 readFrom(id, floor)（只读后缀）
+  → restore 折叠 → 回写刷新行（fail-soft）</code></pre>
+
+  <p>
+    会话<strong>列表</strong>因此永远不解析完整日志：<code>cachedSnapshot(meta)</code> 直接从
+    存储记录读整值；<code>ver</code> 对不上就丢弃重推（不迁移）；记录绑定日志生命周期身份
+    （<code>createdAt</code>/<code>cwd</code>），换了底层存储的残留缓存会被识别并丢弃。
+    写入有两个强制点（<code>turn/end</code>、会话 dispose）加两个节流配置
+    （<code>writeEveryEvents</code>、<code>writeIntervalMs</code>，两个都必填——
+    刷写节奏是部署决策，没有普适默认值）。
+  </p>
+
+  <h3>标题（session-title 家族）</h3>
+
+  <p>
+    会话列表要给人看的一行标题。策略是「先给个能用的，再异步换更好的」：
+    第一条人类提示词的前几个词（限字节数、控制序列清除、不切断 code point）
+    立即成为回退标题；可选的 provider（如 <code>session-title-llm</code>、
+    <code>session-title-first-prompt-llm</code>、<code>session-title-all-prompts-llm</code>
+    按摘要范围区分）稍后用模型生成更好的。<strong>每个被接受的修订都是一条 log-only 的
+    <code>session/title</code> 会话事件</strong>，<code>foldSessionTitle()</code> 取最新——
+    标题也是事件溯源的，fork 继承父的标题事件。用户手动改名（<code>rename</code>）
+    写 <code>user</code> 来源的标题事件并<strong>钉住</strong>会话：之后的人类消息不再触发自动改名，
+    显式 <code>refresh</code> 才解钉。自动标题绝不延迟主响应：provider 只在循环自己发出的请求
+    且路由与已记录的 <code>request/header</code> 精确匹配时才跑，完成后追加独立的
+    log-only 事件（不开 turn）。
+  </p>
+
+  <h3>遥测（session-telemetry / session-telemetry-otel）</h3>
+
+  <p>
+    <code>SessionTelemetryCoordinator</code> 把会话记录交给实现
+    <code>SessionTelemetrySink</code>（<code>emit</code>/<code>flush</code>/<code>shutdown</code>）
+    的后端——<code>session-telemetry-otel</code> 是 OTel 实现。捕获两种模式：
+    <code>live</code>（挂 <code>session/created</code> / <code>session/event</code> /
+    <code>session/flush</code> / <code>session/disposed</code> / <code>agent/error</code>）
+    或 <code>on-demand</code>（显式 <code>captureSession()</code> 回放日志前缀）。
+    出站前过一道 <strong><code>sessionTelemetry/record</code> redact waterfall</strong>——
+    本包不自带任何规则，导出多干净取决于部署挂了什么规则；redact 只作用于出站副本，
+    规范日志永不改写。两个值得记的取舍：每个 <code>(turn, step)</code> 只出首条
+    <code>assistant/chunk</code>（流已开始的信号），所以线上 seq 有洞是常态不是丢失；
+    接收端按 <code>(session.id, event.seq)</code> 去重。resume 不回填上个进程没送达的记录
+    （at-most-once），feedback 门控的共享策略（<code>full</code>/<code>feedback-only</code>/<code>disabled</code>）
+    由部署披露。
+  </p>
+
+  <h2 id="sec-non-session-storage">5.7 非会话数据：storage hub 与 DSH_HOME</h2>
+
+  <p>
+    不是所有耐久数据都是会话日志。工作区偏好、用户反馈记录这类「应用数据」走另一个
+    家族（<code>packages/storage/</code>）：
+  </p>
+  <ul>
+    <li><code>storage/</code>——hub，接缝 <code>ctx.storage</code>：把具名后端与类型化数据形态接起来；</li>
+    <li><code>storage-json/</code>（后端 <code>json</code>，JSON 文件）与
+      <code>storage-sqlite/</code>（后端 <code>sqlite</code>）——两个可换后端；</li>
+    <li><code>storage-domain/</code>——<code>ctx.storageDomain</code>：类型化的领域记录存储
+      （<code>DomainSpec</code>/<code>Domain</code>、<code>domain/changed</code> 事件），
+      消费者拿领域形态而不是裸后端。</li>
+  </ul>
+
+  <p>
+    使用方包括 <code>workspace</code>（工作区数据，json 后端落在存储根的
+    <code>workspace.json</code> 旁）、<code>message-feedback</code>（反馈记录）、
+    以及 5.6 节的投影缓存（<code>session_projcache</code> 领域）。
+    与会话日志的区别一句话：<strong>它们不是事件流，是按领域的记录存储</strong>，
+    不需要 append-only、seq、投影这些机制，所以值得一条独立接缝。
+  </p>
+
+  <p>
+    这些文件的家由 <code>packages/util/home-paths</code> 决定：
+    <span class="kbd">$DSH_HOME</span> 环境变量覆盖默认值，默认是
+    <code>~/.dsh</code>（<code>DSH_HOME_DIR_NAME</code>）。投影缓存、preset 根等
+    用户级数据都在这个屋檐下按部署配置分目录。
+  </p>
+
+  <h2 id="sec-recap">5.8 本章回顾</h2>
+  <ul>
+    <li>持久化是插件接缝不是 store 职责：<code>ctx.sessionPersistence</code> 声明 locate/create/append/prepare/load/inspect/readFrom/list(listSnapshots)，两个后端实现同一契约，没有第二种持久化事件类型。</li>
+    <li>协调器做 write-behind：首个事件起固定批量窗口（默认 200ms，不重置）、后续事件并批；<code>session/flush</code> 排空到静止；失败保留重试；revision 是后端自有的不透明变更令牌。</li>
+    <li>JSONL 后端：每会话一个 transcript（默认 zstd 帧串接），头行是 SessionHeader，packed chunk row 是无损编码（读取布局无感）；<code>root</code> 刻意无默认。</li>
+    <li>SQLite 后端：三张表（store 身份、sessions 元数据、events 一行一事件，1:1 映射含 surface 列），惰性物化，默认 WAL。</li>
+    <li>两层版本化都是拒绝式：会话层 <code>SESSION_FORMAT_VERSION = 0</code> 盖事件词汇（不匹配抛 <code>SessionFormatUnsupportedError</code>，文案区分新旧方向）；SQLite 层 <code>SCHEMA_VERSION = 15</code> + application id <code>0x44534850</code> 盖表结构。不迁移。</li>
+    <li>崩溃恢复收口不截断：完整写入的孤儿 turn 补合成 tool/result（TOOL_NOT_STARTED / TOOL_OUTCOME_UNKNOWN）、step/end、turn/end { interrupted }；撕裂物理尾丢弃；只对冷会话修复。</li>
+    <li>派生状态从日志推出：投影注册表（apply 同引用、整值事件）+ 投影缓存冷读梯（缓存行 → readFrom 后缀 → 折叠回写，列表永不加载完整日志）；标题是 <code>session/title</code> 事件（回退 + 可选 LLM provider，用户改名钉住）；遥测 redact waterfall 后交给 sink，按 (session.id, seq) 去重。</li>
+    <li>非会话数据走 <code>ctx.storage</code> hub（json/sqlite 后端 + storage-domain 类型化形态），家在 <span class="kbd">$DSH_HOME</span>（默认 <code>~/.dsh</code>）。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为 <code>append()</code> 落盘后才算提交。提交在 push 进内存日志那一刻；持久化是异步批量。要耐久屏障就显式 <code>flush</code>。</li>
+      <li>把两层版本混为一谈。<code>SessionHeader.version</code> 版本化事件词汇，SQLite <code>SCHEMA_VERSION</code> 版本化表结构；互不代理。</li>
+      <li>期望旧日志自动迁移到新格式。dsh 的策略是拒绝式版本化：读不了就抛方向明确的错误，迁移路径留给未来的升级链。</li>
+      <li>以为崩溃恢复会丢掉半个 turn 的工作。收口不截断——已完整写入的事件全部保留，只有撕裂的物理尾被丢弃。</li>
+      <li>把投影缓存当权威。缓存行「可能旧（seq 说明旧多少）但不会错」，日志才是权威；<code>ver</code> 不匹配直接丢弃重推。</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="5">
+    <h2>第 5 章测验</h2>
+
+    <div class="q" data-id="5-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— session/event 是同步通知，持久化插件把事件拷进缓冲立即返回；耐久化靠 session/flush 检查点。"
+         data-rationale="B 正确：热路径不碰 I/O，write-behind 批量窗口（默认 200ms）攒批落盘。A 错：append 同步返回，不等磁盘。C 错：没有任何旁路写路径，绕过接缝等于丢日志。D 错：flush 是显式检查点，不是自动逐条。"
+         data-review="sec-persistence-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> 事件从内存日志到磁盘的路径是？</div>
+      <label class="opt"><input type="radio" name="q-5-1" value="a"> A. session.append() 等磁盘写完才返回</label>
+      <label class="opt"><input type="radio" name="q-5-1" value="b"> B. append 即提交并同步广播 session/event；持久化插件缓冲，固定窗口批量落盘，session/flush 时排空</label>
+      <label class="opt"><input type="radio" name="q-5-1" value="c"> C. 每个插件自己直接写文件，没有统一接缝</label>
+      <label class="opt"><input type="radio" name="q-5-1" value="d"> D. 由数据库触发器自动同步</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-2" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A、C —— 首个待写事件启动固定截止窗口（后续事件并入不重置）；后台写失败保留事件并暂停自动重试。"
+         data-rationale="A、C 正确。B 错：每批一个新窗口，不是每条事件一个。D 错：显式 flush 立即重试并上报 agent/error；自动重试被暂停不是删除，事件保留。"
+         data-review="sec-persistence-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于 write-behind 批量写，下列哪些说法正确？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="a"> A. 第一个待写事件启动一个固定截止的批量窗口，之后的事件并入同一批</label>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="b"> B. 每条新事件都重置批量窗口的截止时间</label>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="c"> C. 后台写失败时事件保留、自动重试暂停；新事件重启窗口</label>
+      <label class="opt"><input type="checkbox" name="q-5-2" value="d"> D. 写失败的事件会被丢弃，靠下次重新生成</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-3" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 事件表的行与 SessionEvent 逐字段 1:1（含 surface_op / source_event_seqs 列），没有第二套持久化 schema。"
+         data-rationale="D 正确：这正是接缝设计的目标。A 错：events 表是 (session_id, seq) 主键的逐事件行。B 错：data 列存 JSON 文本，不建属性列。C 错：surface 元数据有专门列（JSON 编码），完整保留。"
+         data-review="sec-sqlite-backend">
+      <div class="prompt"><span class="qnum">Q3.</span> SQLite 后端怎么存一个事件？</div>
+      <label class="opt"><input type="radio" name="q-5-3" value="a"> A. 每个 turn 一行，事件嵌在 JSON 数组里</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="b"> B. 每个事件的字段展开成动态属性列</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="c"> C. surfaceOp 与 sourceEventSeqs 存进 data 列，不单独建列</label>
+      <label class="opt"><input type="radio" name="q-5-3" value="d"> D. events 表一行一事件，(session_id, seq) 主键，行字段与事件 1:1 映射</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-4" data-type="fill" data-accepted='["15","schema_version","user_version","the user_version pragma"]'
+         data-answer="15（SCHEMA_VERSION，通过 PRAGMA user_version 检查）。"
+         data-rationale="SQLite 的表结构版本是单调递增的 SCHEMA_VERSION，当前 15，存在 PRAGMA user_version 里；配合 application_id 0x44534850 挡住无关数据库。"
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q4.</span> 填空：SQLite 后端当前的表结构版本号 SCHEMA_VERSION 是 <code>______</code>（写数字或字段名）。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-5" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 两个版本正交：header.version 盖每个会话的事件词汇格式，SCHEMA_VERSION 盖整个数据库的表结构，各自把关各自的对象。"
+         data-rationale="C 正确。A 错：sessions 行也存每个会话的 version，两层并存。B 错：方向反了，header 版本不描述表布局。D 错：不存在自动迁移，两层都是拒绝式。"
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q5.</span> <code>SessionHeader.version</code> 与 SQLite <code>SCHEMA_VERSION</code> 的关系是？</div>
+      <label class="opt"><input type="radio" name="q-5-5" value="a"> A. SQLite 后端只看 SCHEMA_VERSION，不检查会话的 version</label>
+      <label class="opt"><input type="radio" name="q-5-5" value="b"> B. SessionHeader.version 描述表结构，SCHEMA_VERSION 描述事件词汇</label>
+      <label class="opt"><input type="radio" name="q-5-5" value="c"> C. 正交的两层：前者版本化每会话的事件格式（存于 sessions 行），后者版本化整库表结构；不匹配都拒绝</label>
+      <label class="opt"><input type="radio" name="q-5-5" value="d"> D. SCHEMA_VERSION 更高时自动把旧库迁移到新结构</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-6" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 版本高于当前构建时报「由更新的 harness 写的——升级 harness」，低时报「本构建没有升级路径」；永不误报损坏。"
+         data-rationale="A 正确：SessionFormatUnsupportedError 与 CorruptionError 刻意分开，方向感知的文案让用户看到升级指引。B 错：那是把「读不了」误报成「坏了」。C 错：没有静默跳过，也没有降级读取。D 错：JSONL 在结构校验之前就从原始头行给出方向判断，未来格式也能报对方向。"
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q6.</span> 一个日志的格式版本高于当前 harness 支持的版本，用户会看到什么？</div>
+      <label class="opt"><input type="radio" name="q-5-6" value="a"> A. SessionFormatUnsupportedError，提示升级 harness 打开它</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="b"> B. SessionPersistenceCorruptionError，提示日志损坏</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="c"> C. 静默跳过读不懂的事件继续加载</label>
+      <label class="opt"><input type="radio" name="q-5-6" value="d"> D. 以旧版本语义尽力解析</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-7" data-type="mcq" data-multiselect="true" data-correct='["b","d"]'
+         data-answer="B、D —— 合成 error 的 tool/result 配 TOOL_NOT_STARTED 或 TOOL_OUTCOME_UNKNOWN；合成 turn/end 理由是 interrupted。"
+         data-rationale="B、D 正确：错误码区分「未开始可重试」与「已开始结果未知」。A 错：interrupted 由持久化修复合成，循环永不发出。C 错：已有事件一条不动，append-only 不改写。"
+         data-review="sec-crash-recovery">
+      <div class="prompt"><span class="qnum">Q7.</span> 加载崩溃日志时，修复会合成哪些内容？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="a"> A. turn/end 理由 kind: aborted</label>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="b"> B. 悬空工具调用的 error tool/result（TOOL_NOT_STARTED / TOOL_OUTCOME_UNKNOWN）</label>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="c"> C. 重写崩溃前的事件补上缺失配对</label>
+      <label class="opt"><input type="checkbox" name="q-5-7" value="d"> D. turn/end 理由 kind: interrupted</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 缓存行 → restoreFloor 锚定 → readFrom(id, floor) 只读后缀 → restore 折叠 → 回写；列表层直接读缓存行，零完整日志加载。"
+         data-rationale="C 正确：梯子的每一级都避免全量读，readFrom 只返回水位之后的后缀。A 错：那正是冷读梯要消灭的成本。B 错：ver 不匹配是丢弃重推，不迁移。D 错：锚定在最低水位下方一个事件，收缩过的日志可被证明（越界行触发一次从 0 全读）。"
+         data-review="sec-derived-state">
+      <div class="prompt"><span class="qnum">Q8.</span> 投影缓存的「冷读梯」在读取一个冷会话的投影时怎么做？</div>
+      <label class="opt"><input type="radio" name="q-5-8" value="a"> A. 从头加载完整日志再折叠</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="b"> B. 把旧 ver 的缓存行迁移到新 stateVersion</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="c"> C. 缓存行 → restoreFloor 水位 → readFrom 只读后缀 → 折叠 → fail-soft 回写</label>
+      <label class="opt"><input type="radio" name="q-5-8" value="d"> D. 锚定在最高水位之上，宁可多读不可少读</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 每个被接受的标题修订都是 log-only 的 session/title 事件，取最新一条即是当前标题；fork 连标题事件一起继承。"
+         data-rationale="B 正确：标题也走事件溯源。A 错：没有独立存储，rename 也是追加事件（user 来源，并钉住）。C 错：自动标题刻意不延迟主响应，provider 完成后追加独立 log-only 事件，不开 turn。D 错：LLM 摘要是可选 provider 的异步增强，不是唯一来源。"
+         data-review="sec-derived-state">
+      <div class="prompt"><span class="qnum">Q9.</span> 会话标题在 dsh 里是怎么存的？</div>
+      <label class="opt"><input type="radio" name="q-5-9" value="a"> A. 存在一个与会话日志分离的标题数据库</label>
+      <label class="opt"><input type="radio" name="q-5-9" value="b"> B. 每次修订追加一条 session/title 会话事件，折叠取最新</label>
+      <label class="opt"><input type="radio" name="q-5-9" value="c"> C. 由 LLM provider 在生成时写内存缓存</label>
+      <label class="opt"><input type="radio" name="q-5-9" value="d"> D. 只在会话结束时计算一次</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-10" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 这些是应用数据不是事件流，走 ctx.storage（json/sqlite 后端 + storage-domain 类型化形态）。"
+         data-rationale="D 正确：非会话数据不需要 append-only / seq / 投影机制，独立接缝更合适。A 错：会话日志只装对话事实。B 错：环境变量不是存储。C 错：settings 是另一个 capability（用户设置）。"
+         data-review="sec-non-session-storage">
+      <div class="prompt"><span class="qnum">Q10.</span> 工作区偏好、用户反馈这类非会话数据存到哪？</div>
+      <label class="opt"><input type="radio" name="q-5-10" value="a"> A. 追加为会话事件</label>
+      <label class="opt"><input type="radio" name="q-5-10" value="b"> B. 环境变量</label>
+      <label class="opt"><input type="radio" name="q-5-10" value="c"> C. settings capability</label>
+      <label class="opt"><input type="radio" name="q-5-10" value="d"> D. storage hub：ctx.storage 后端 + storage-domain 类型化领域记录</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-11" data-type="fill" data-accepted='["~/.dsh",".dsh","dsh_home","$dsh_home"]'
+         data-answer="~/.dsh（DSH_HOME 环境变量可覆盖）。"
+         data-rationale="packages/util/home-paths 定义 DSH_HOME_DIR_NAME = .dsh，默认拼在 OS 主目录下；DSH_HOME 环境变量覆盖。"
+         data-review="sec-non-session-storage">
+      <div class="prompt"><span class="qnum">Q11.</span> 填空：dsh 用户数据的默认家目录是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="5-12" data-type="short"
+         data-key-points='["两层各自把关：SessionHeader.version 盖每会话的事件词汇，SQLite SCHEMA_VERSION 盖整库表结构","当前值：SESSION_FORMAT_VERSION = 0（预发布无兼容承诺），SCHEMA_VERSION = 15（单调递增）","不匹配一律拒绝（SessionFormatUnsupportedError / 打不开库），绝不迁移或静默降级","拒绝文案区分方向：更新 = 升级 harness，更旧 = 没有升级路径；永不误报 corrupt","新增普通事件类型不 bump 版本，由 ignorable 标记覆盖词汇增长"]'
+         data-answer="要点：两层版本（header.version 盖事件词汇 / SCHEMA_VERSION 盖表结构，当前 0 与 15）；不匹配拒绝不迁移，方向感知的文案；版本 bump 只留给结构性变化，词汇增长走 ignorable。预发布期的立场是宁可拒绝也不做兼容垫片。"
+         data-rationale="说出「两层各管什么 + 拒绝不迁移 + 方向感知 + ignorable 兜词汇增长」四点即到位。"
+         data-review="sec-two-layer-versioning">
+      <div class="prompt"><span class="qnum">Q12.</span> 用你自己的话说明 dsh 的两层版本化与拒绝式加载策略：各层管什么、当前值是多少、不匹配时发生什么、为什么新增事件类型不需要 bump 版本？</div>
+      <textarea class="short" placeholder="写下你的理解…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正说到了才勾选——少勾损害的是书对你的校准，多勾只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做本测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="06-agent-and-scope.html"><strong>第 6 章 · Agent 抽象与 Scope 机制</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

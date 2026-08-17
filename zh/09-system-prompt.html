@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 9 章 · System Prompt 装配 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 9 章 · System Prompt 装配</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="9">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 9 章 · 第二部分 · 核心脊柱</div>
+    <h1>System Prompt 装配</h1>
+    <p class="lede">
+      模型每个 step 看到的 system 区块和运行时上下文，不是一段写死的字符串，
+      而是每次都现拼的：插件们把 section、动态上下文、变量、工具 schema 注册进
+      <code>ctx.systemPrompt</code>，agent loop 在认领输入后调用装配，得到这一轮的完整输入。
+      这一章讲清装配的全部零件、scoped 注册如何做出 per-agent 人格，
+      以及 context 组插件贡献的模型可见内容为什么全都走「可从日志重建」的路径。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出 <code>ctx.systemPrompt</code> 的四类注册物：section、context、variable、tools provider</li>
+      <li>复述 <code>assemble()</code> 的合并规则：scoped 遮蔽、order 排序、toolOrder 校验、waterfall、complete section</li>
+      <li>区分「system section」与「runtime context」两条不同的模型可见通道（后者落 durable 日志）</li>
+      <li>用 scoped section 遮蔽 <code>deployment:persona</code> 实现一个 per-agent 人格</li>
+      <li>说出 context 组四个插件分别贡献什么、以什么事件落日志</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-registry">9.1 注册表：四类输入</h2>
+
+  <p>
+    <code>packages/core/system-prompt/</code> 的 <code>SystemPrompt</code> 服务（<code>ctx.systemPrompt</code>）
+    是一个「有序 prompt 输入」的注册表。能注册的东西恰好四类，每类都返回效应 disposer，
+    都支持 scoped 注册（经 <code>agent.ctx</code> 注册就只对该 agent 生效）：
+  </p>
+  <table>
+    <thead>
+      <tr><th>API</th><th>是什么</th><th>进入哪条通道</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>section({name, order, text, complete?})</code></td>
+        <td>system 区块的一段；<code>text</code> 是静态字符串或每次装配时求值的函数；可引用 <code>{{variable}}</code></td>
+        <td>system prompt 本体</td>
+      </tr>
+      <tr>
+        <td><code>context({name, order, text})</code></td>
+        <td>动态运行时上下文（时间、环境、位置这类「此刻事实」）</td>
+        <td>runtime-context 快照 → durable user-role 消息</td>
+      </tr>
+      <tr>
+        <td><code>variable(name, provider)</code></td>
+        <td>一个 <code>{{name}}</code> 变量的求值器（如 <code>cwd</code>、<code>provider</code>、<code>model</code>）</td>
+        <td>section/context 文本的插值</td>
+      </tr>
+      <tr>
+        <td><code>tools(provider)</code></td>
+        <td>工具 schema 提供者（第 8 章的注册表就挂在这里）</td>
+        <td>请求的 tools 字段</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    两个内建 section 值得记住：<strong>order <code>-100</code></strong> 是 harness 身份
+    （<code class="small">You are an AI agent powered by DeepSeek Harness.</code>，可用配置
+    <code>includeHarnessIdentity: false</code> 关掉）；<strong>order <code>0</code></strong> 是部署人格槽位
+    <code>deployment:persona</code>（由 <code>persona</code> 配置填充）。约定俗成的编号带：
+    负数区在人格之前，工具自述用 100–199。另外 <code>suppressRuntimeContext()</code>
+    可以在某个 scope 关掉全部动态上下文贡献，而不需要动拥有这些事实的服务。
+  </p>
+
+  <h2 id="sec-assembly">9.2 装配：每个 step 现拼一次</h2>
+
+  <p>
+    回忆第 7 章：<code>preStep()</code> 认领输入后立刻调用
+    <code class="small">ctx.systemPrompt.assemble({scope, signal})</code>。装配按固定顺序发生：
+  </p>
+  <ol>
+    <li>
+      <strong>合并 scope 链</strong>：变量按「最具体的 scope 获胜」取值；section / context
+      里 scoped 同名条目遮蔽全局条目；工具提供者全局与链上的都参与。
+    </li>
+    <li>
+      <strong>排序</strong>：section 与 context 各自按 <code>order</code> 升序；工具 schema
+      按 <code>toolOrder</code> 配置排（必须恰含一次 <code>&lt;unlisted-tools&gt;</code> 占位；
+      未配置则字典序），配置了不存在的工具名会在装配时抛错。
+    </li>
+    <li>
+      <strong>waterfall</strong>：<code>system-prompt/assemble</code> 是一个专家 waterfall，
+      监听器可以整体改写装配结果，返回值权威 —— 唯一的例外是 <code>complete: true</code> 的 section：
+      装配结束后它会被恢复为<strong>唯一的</strong> prompt section（同时存在两个 complete section
+      会让装配失败）。
+    </li>
+    <li>
+      <strong>渲染</strong>：<code>renderPrompt(assembly)</code> 做严格插值 ——
+      <code>{{name}}</code> 引用必须已注册且有值，畸形或未知的引用直接抛错；
+      渲染为空的 section 被丢弃，其余用空行连接。工具 schema 则进入请求的 tools 字段。
+    </li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="system prompt 装配流程">
+      <rect x="20" y="24" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="46" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">sections（按 order 排序）</text>
+      <text x="110" y="63" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">-100 身份 · 0 人格 · 100-199 工具</text>
+      <rect x="20" y="100" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">contexts（动态上下文）</text>
+      <text x="110" y="139" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">时间 / 环境 / tmux 位置</text>
+      <rect x="20" y="176" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="198" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">tools providers</text>
+      <text x="110" y="215" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">ctx.tools 的 schema（第 8 章）</text>
+      <rect x="20" y="252" width="180" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="110" y="276" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">variables（{{…}} 求值器）</text>
+
+      <line x1="200" y1="52" x2="255" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="200" y1="128" x2="255" y2="150" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="200" y1="204" x2="255" y2="160" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="200" y1="272" x2="255" y2="170" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="260,150 251,146 251,156" style="fill:var(--muted)"/>
+
+      <rect x="260" y="105" width="180" height="90" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="350" y="135" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">assemble()</text>
+      <text x="350" y="155" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">scoped 遮蔽 · order 排序</text>
+      <text x="350" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">toolOrder 校验 · waterfall</text>
+      <text x="350" y="185" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">complete section 恢复</text>
+
+      <line x1="440" y1="128" x2="510" y2="70" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="510,70 501,72 507,79" style="fill:var(--muted)"/>
+      <line x1="440" y1="172" x2="510" y2="235" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="510,235 501,231 507,224" style="fill:var(--muted)"/>
+
+      <rect x="510" y="35" width="270" height="62" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="645" y="57" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">renderPrompt → 请求的 system</text>
+      <text x="645" y="74" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">严格 {{var}} 插值；空 section 丢弃</text>
+      <text x="645" y="88" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">工具 schema → 请求的 tools 字段</text>
+
+      <rect x="510" y="205" width="270" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="645" y="227" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">contexts → runtime-context 快照</text>
+      <text x="645" y="244" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">agent-loop 把快照投影为一条 user 消息</text>
+      <text x="645" y="259" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">随 enter 批次落 user/message（durable）</text>
+      <text x="645" y="272" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">「新快照取代旧快照」写在消息开头</text>
+    </svg>
+    <figcaption>
+      装配流程。四类注册物汇入 <code>assemble()</code>；sections 与工具 schema 进入请求本体，
+      contexts 走另一条通道 —— 变成 durable 的 user-role 快照消息（var(--warn) 框）。
+    </figcaption>
+  </figure>
+
+  <p>
+    <strong>为什么 contexts 不进 system prompt？</strong> 因为 system prompt 是每轮都一样（或由配置变化驱动）的
+    「身份与规则」，而 runtime context 是「此刻事实」：时间在走、tmux 窗口在动。把它做成
+    durable 的 user-role 消息，日志就能忠实记录「模型当时知道什么」，快照之间的替换关系
+    （「此快照取代早先的运行时上下文快照」）也写在消息文本里。这是第 4 章不变量的又一次应用：
+    <strong>模型可见的输入必须可从日志重建</strong> —— section 走 <code>request/header</code> 里的 system，
+    context 走 <code>user/message</code>，各得其所。
+  </p>
+
+  <div class="demo" data-demo="promptAssembly">
+    <div class="demo-title">试一试 —— 装配一个 system prompt</div>
+    <p>勾选插件注册的 section，看本轮 system 区块如何拼出：</p>
+    <label><input type="checkbox" checked> 身份与规则（system-prompt 插件）</label>
+    <label><input type="checkbox" checked> 环境信息：cwd / 平台</label>
+    <label><input type="checkbox"> 时间上下文（time-context 插件）</label>
+    <label><input type="checkbox" checked> 工具 schema：bash / fs / web</label>
+    <div class="demo-output empty">勾选或取消试试。</div>
+  </div>
+
+  <h2 id="sec-persona">9.3 scoped section 与 per-agent 人格</h2>
+
+  <p>
+    注册表是 scoped 的，这直接给出 per-agent 人格的做法：在某个 agent 的
+    <code>agent.ctx</code> 里注册一个<strong>同名</strong> section <code>deployment:persona</code>，
+    它就遮蔽部署层的人格槽位，只对这个 agent 生效。persona 类的 preset 包用的正是这套：
+    同名遮蔽而不是追加，所以一个 agent 永远只有一个人格 section，不会出现两段人格互相打架。
+    <code>packages/core/system-prompt/src/index.ts</code> 特意导出了
+    <code>PERSONA_SECTION</code> 常量，让「部署侧」和「遮蔽侧」引用同一个名字 ——
+    两侧各写一个魔法字符串是最容易错位的地方，共享常量让替换天然成立。
+  </p>
+  <pre><code><span class="code-comment">// 在某个 agent 的 agent.ctx 里（伪代码示意遮蔽机制）</span>
+agent.ctx.systemPrompt.<span class="code-fn">section</span>({
+  name: PERSONA_SECTION,        <span class="code-comment">// 'deployment:persona'：同名遮蔽部署人格</span>
+  order: PERSONA_ORDER,         <span class="code-comment">// 0：人格槽位不变</span>
+  text: <span class="code-str">'你是只读审查员，绝不修改文件。当前目录 {{cwd}}。'</span>,
+})</code></pre>
+  <p>
+    同样的机制也覆盖变量与工具：scoped 变量遮蔽全局变量，第 8 章的 scoped 工具遮蔽全局工具。
+    第 6 章的 shadowing 心智模型在 prompt 侧不需要任何新概念。
+  </p>
+
+  <h2 id="sec-context-plugins">9.4 context 组：模型可见内容的四个真实来源</h2>
+
+  <p>
+    <code>packages/context/</code> 组的四个插件是「给模型添加上下文」的官方实现。
+    逐一过一遍，重点看<strong>每个插件的内容如何落日志</strong>：
+  </p>
+  <ul>
+    <li>
+      <strong><code>dsh-agent-instructions</code>（AGENTS.md 指令链）</strong>：加载
+      <code>$DSH_HOME/AGENTS.md</code> 与从项目根到 cwd 每一级目录的指令文件
+      （AGENTS.md/CLAUDE.md 等候选，逐字节相同者去重）。基线在会话第一个合格的
+      <code>agent/pre-step</code> 处合成，折进进入批次 —— 紧跟用户直接 prompt 落成
+      durable 的 user-role 消息（<code>&lt;system-reminder&gt;</code> 框架）；
+      之后它观察成功的 read/write/edit 工具结果，发现新目录的指令文件就往 inbox 排
+      增/改/删通知，同样以带来源的 <code>user/message</code> 落日志。
+    </li>
+    <li>
+      <strong><code>dsh-time-context</code>（时间上下文，opt-in）</strong>：在
+      <code>agent/pre-step</code> 链首追加监听；到期时给返回的批次<strong>追加</strong>一条带来源的
+      UserMessage（<code class="small">source: {kind:'plugin', plugin:'time-context', form:'snapshot', …}</code>），
+      agent-loop 在 <code>step/start</code> 之后、请求推导之前落盘。浏览器时区来自当前 turn 的
+      user-rpc 消息来源；默认组合不加载它（Schedule Web overlay 才挂）。
+    </li>
+    <li>
+      <strong><code>dsh-tmux-context</code>（tmux 位置，opt-in）</strong>：每个 turn 的第一步，
+      经 <code>ctx.shell</code> 跑一条只读探测命令确认自己真的跑在 tmux pane 里（光有
+      <code>$TMUX_PANE</code> 不算 —— 环境变量会被继承），命中才在进入批次<strong>前部</strong>插入一条
+      <code class="small">source {kind:'plugin', plugin:'tmux-context'}</code> 的 UserMessage，
+      同样在 <code>step/start</code> 后落日志。
+    </li>
+    <li>
+      <strong><code>dsh-session-reference</code>（跨会话引用）</strong>：提供
+      <code>ctx.sessionReferenceResolver</code>；<code>prepare()</code> 把被 @ 提及的其他会话
+      投影成有界只读快照，返回一条带识别来源的 UserMessage。agent 空闲时经一次性
+      <code>agent/pre-step</code> 包装并入进入批次；运行中则 <code>inject()</code> 紧跟
+      <code>steer()</code>，两条消息一起等下一次认领。快照固定在捕获时刻 —— 源会话后续变化不影响目标日志重放。
+    </li>
+  </ul>
+  <p>
+    四个插件，四种入口（pre-step 折入批次、pre-step 追加、pre-step 前插、inject+steer），
+    但殊途同归：<strong>没有任何一个把文字悄悄塞进 system prompt</strong>。模型可见内容全部以
+    带来源的 durable user 消息存在，日志既记得「模型看到了什么」，也记得「是谁给的」。
+    如果你要写第五个上下文插件，照这个模式做 —— 这不是风格建议，是
+    「新的模型可见输入需要新的会话事件」这条仓库级规则的直接推论。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">与第 7 章的衔接</div>
+    <p style="margin:.4rem 0 0;">
+      装配发生在 <code>preStep()</code> 里、<code>agent/pre-step</code> waterfall<strong>之前</strong>，
+      装配结果（<code>PromptAssembly</code>）随后跟着 enter 决策进入 <code>step()</code>：
+      sections 渲染成请求的 system，contexts 由 <code>RuntimeContextProjection</code> 投影成
+      进入批次里的上下文消息。也就是说：<strong>每个 step 都重新装配一次</strong> ——
+      工具注册变化、变量取值变化，下一个 step 立刻生效。
+    </p>
+  </div>
+
+  <h2 id="sec-recap">9.5 本章回顾</h2>
+  <ul>
+    <li><code>ctx.systemPrompt</code> 收四类注册：section（system 本体）、context（动态快照）、variable（{{}} 插值）、tools provider（工具 schema）。</li>
+    <li><code>assemble()</code>：scope 链合并（scoped 遮蔽全局）→ order / toolOrder 排序与校验 → <code>system-prompt/assemble</code> waterfall → complete section 恢复；<code>renderPrompt</code> 做严格插值、丢空段。</li>
+    <li>sections 与工具 schema 进请求本体；contexts 走另一条通道 —— durable user-role 快照消息，带「取代旧快照」声明。</li>
+    <li>per-agent 人格 = 在 <code>agent.ctx</code> 注册同名 <code>deployment:persona</code> section 遮蔽部署槽位；共享常量 <code>PERSONA_SECTION</code> 保证两侧同名。</li>
+    <li>context 组四插件：agent-instructions（AGENTS.md 链）、time-context、tmux-context、session-reference —— 内容全走带来源的 durable user/message，可从日志重建。</li>
+    <li>装配在每个 step 的 pre-step 之前发生，每步现拼，注册变化下一步即生效。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为 runtime context 会拼进 system prompt —— 它是独立的 durable user 消息通道；把「此刻事实」塞进 system 会破坏日志的可重建性。</li>
+      <li>给每个 agent 各写一段人格但忘了同名遮蔽 —— 会得到两段人格叠加；正确做法是同名 <code>deployment:persona</code> 遮蔽。</li>
+      <li>在 section 里写 <code>{{var}}</code> 却不注册变量 —— 渲染时直接抛错（严格插值，不静默留空）。</li>
+      <li>配置 <code>toolOrder</code> 漏掉 <code>&lt;unlisted-tools&gt;</code> 或写了不存在的工具名 —— 装配时失败，不会静默忽略。</li>
+      <li>写上下文插件时直接改 system prompt 或绕过日志注入 —— 违反 model-visible ⟺ logged；照 context 组的模式走 pre-step / inject 落 user/message。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="9">
+    <h2>第 9 章 测验</h2>
+
+    <div class="q" data-id="9-1" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 都是合法注册物。C 错：工具 schema 不是通过 section 注册的，而是 tools provider（ctx.systemPrompt.tools），它进入请求的 tools 字段而不是 system 文本 —— 第 8 章的注册表就是这么挂上来的。"
+         data-review="sec-registry">
+      <div class="prompt"><span class="qnum">Q1.</span> 下列哪些可以注册到 <code>ctx.systemPrompt</code>？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="a"> A. 有序 section（name / order / text）</label>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="b"> B. 动态 context 与 {{variable}} 求值器</label>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="c"> C. 工具 schema，以一段 system 文本的形式</label>
+      <label class="opt"><input type="checkbox" name="q-9-1" value="d"> D. 工具 schema 提供者（tools provider）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— contexts 被投影成 durable 的 user-role 快照消息，随进入批次落 user/message 事件。"
+         data-rationale="C 正确。A、B 都把动态事实塞进每轮 system，日志将无法重建『模型当时知道什么』。D 错：contexts 是正常模型可见输入，必须有日志记录。"
+         data-review="sec-assembly">
+      <div class="prompt"><span class="qnum">Q2.</span> 注册的动态 <code>context</code>（如时间上下文）最终怎样到达模型？</div>
+      <label class="opt"><input type="radio" name="q-9-2" value="a"> A. 拼进 system prompt 的末尾</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="b"> B. 替换 deployment:persona section</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="c"> C. 投影成一条 user-role 快照消息（声明取代旧快照），随 enter 批次落 user/message 事件</label>
+      <label class="opt"><input type="radio" name="q-9-2" value="d"> D. 只存在内存里，不进日志</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 在该 agent 的 agent.ctx 注册同名 deployment:persona section，遮蔽部署层人格。"
+         data-rationale="B 正确，这是 persona 包的真实做法。A 会叠加两段人格（错误方向）。C 每轮改写请求超出 systemPrompt 职责且绕开装配事实。D 错：变量只能遮蔽变量，遮蔽不了 section。"
+         data-review="sec-persona">
+      <div class="prompt"><span class="qnum">Q3.</span> 给某个 agent 单独换人格的正确做法是？</div>
+      <label class="opt"><input type="radio" name="q-9-3" value="a"> A. 全局再注册一个人格 section，order 设 1</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="b"> B. 在该 agent 的 agent.ctx 注册同名 deployment:persona section（共享 PERSONA_SECTION 常量）</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="c"> C. 挂 system-prompt/assemble 监听器，每轮改写 system 文本</label>
+      <label class="opt"><input type="radio" name="q-9-3" value="d"> D. 注册同名变量遮蔽 persona 配置</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-4" data-type="fill" data-accepted='["deployment:persona","persona"]'
+         data-answer="deployment:persona（order 0 的人格槽位）。"
+         data-rationale="PERSONA_SECTION 常量的值；部署配置 persona 填充它，scoped 同名注册遮蔽它。填 harness:identity 错 —— 那是 -100 的身份 section。"
+         data-review="sec-persona">
+      <div class="prompt"><span class="qnum">Q4.</span> 填空：部署人格的 section 名是 <code>______</code>（order 为 0）。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 严格插值：畸形、未注册或无值的 {{var}} 引用都会让渲染抛错。"
+         data-rationale="D 正确。A、B、C 描述的静默容错都不存在 —— 配置错误要在装配时响亮失败（仓库的 fail-loud 规则）。"
+         data-review="sec-assembly">
+      <div class="prompt"><span class="qnum">Q5.</span> section 文本里写了 <code>{{cwd}}</code> 但没人注册 cwd 变量时，<code>renderPrompt</code> 会？</div>
+      <label class="opt"><input type="radio" name="q-9-5" value="a"> A. 留下原样 {{cwd}} 发给模型</label>
+      <label class="opt"><input type="radio" name="q-9-5" value="b"> B. 替换为空字符串</label>
+      <label class="opt"><input type="radio" name="q-9-5" value="c"> C. 丢弃整个 section</label>
+      <label class="opt"><input type="radio" name="q-9-5" value="d"> D. 抛错：unknown prompt variable</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-6" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B 和 C。"
+         data-rationale="B、C 正确：time-context 与 tmux-context 都是 opt-in，默认组合不加载（Schedule Web overlay / 特定部署才挂）。A、D 表述正确但不符合题意（题问默认不加载的）。"
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q6.</span> 下列哪些 context 组插件是 <strong>opt-in</strong>（默认组合不加载）？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="a"> A. agent-instructions（AGENTS.md 链）</label>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="b"> B. time-context（时间上下文）</label>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="c"> C. tmux-context（tmux 位置）</label>
+      <label class="opt"><input type="checkbox" name="q-9-6" value="d"> D. session-reference（跨会话引用解析器）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— agent-instructions 基线折进第一个进入批次、紧跟用户 prompt 落 durable user 消息；后续变化经工具结果观察排 inbox 通知。"
+         data-rationale="A 正确。B 错：它不写 system prompt。C 错：观察的是成功的 read/write/edit 工具结果，不是 shell cd。D 错：落的是 user-role 的 system-reminder 框架消息。"
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q7.</span> <code>dsh-agent-instructions</code> 的落日志方式是？</div>
+      <label class="opt"><input type="radio" name="q-9-7" value="a"> A. 基线折进第一个进入批次（紧跟直接 prompt），以 system-reminder 框架的 durable user 消息落盘；之后按工具触达发现新文件再注入增/改/删通知</label>
+      <label class="opt"><input type="radio" name="q-9-7" value="b"> B. 整条指令链每轮重写进 system prompt</label>
+      <label class="opt"><input type="radio" name="q-9-7" value="c"> C. 解析每次 bash 的 cd 输出来发现新目录</label>
+      <label class="opt"><input type="radio" name="q-9-7" value="d"> D. 以 assistant 消息的身份插入历史</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 因为探测命令还会比对 pane 的 tty 与本进程的控制终端，防继承的环境变量误报。"
+         data-rationale="C 正确，README 明确说 $TMUX_PANE 会被非 pane 进程继承（如从 tmux shell 启动的终端）。A、B、D 都没抓住这个点。"
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q8.</span> tmux-context 为什么只看 <code>$TMUX_PANE</code> 不够、还要比对 tty？</div>
+      <label class="opt"><input type="radio" name="q-9-8" value="a"> A. 为了取得窗口像素尺寸</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="b"> B. 为了兼容 screen 会话</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="c"> C. 因为终端可能从 tmux shell 继承了 $TMUX/$TMUX_PANE 而实际并不在那个 pane 里；比对 pane_tty 与自身 tty 才能确认</label>
+      <label class="opt"><input type="radio" name="q-9-8" value="d"> D. 为了探测兄弟 pane 的内容</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 装配在每个 step 的 preStep 里、agent/pre-step waterfall 之前发生。"
+         data-rationale="B 正确（第 7 章 preStep 的顺序：claim → assemble → agent/pre-step）。A 错：每个 step 都重新装配。C 错：进程启动时 agent 可能还没诞生。D 错：方向反了。"
+         data-review="sec-assembly">
+      <div class="prompt"><span class="qnum">Q9.</span> 装配发生的时机是？</div>
+      <label class="opt"><input type="radio" name="q-9-9" value="a"> A. 每个会话只装配一次，之后缓存</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="b"> B. 每个候选 step：认领输入后、agent/pre-step waterfall 之前</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="c"> C. 进程启动时装配一次，工具变化靠重启</label>
+      <label class="opt"><input type="radio" name="q-9-9" value="d"> D. 在 assistant/message 落日志之后</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="9-10" data-type="short"
+         data-key-points='["装配是每 step 现拼：合并 scope 链（scoped 遮蔽）、按 order/toolOrder 排序、经 system-prompt/assemble waterfall、complete section 恢复","sections+工具 schema 进请求本体；contexts 另走 durable user-role 快照消息通道","per-agent 人格用 agent.ctx 注册同名 deployment:persona 遮蔽部署槽位","context 组插件（agent-instructions/time-context/tmux-context/session-reference）的内容都以带来源的 user/message 落日志","新模型可见输入必须有对应会话事件（model-visible ⟺ logged），不能悄悄改 system prompt"]'
+         data-answer="每个 step，agent loop 在认领输入后调用 ctx.systemPrompt.assemble()：合并 scope 链（scoped section/variable 遮蔽全局）、按 order 与 toolOrder 排序并校验、经 system-prompt/assemble waterfall（complete section 事后恢复为唯一 section），再 renderPrompt 严格插值得到请求的 system，工具 schema 进入请求 tools。contexts 不进 system：它们被投影成 durable 的 user-role 快照消息随进入批次落 user/message。per-agent 人格是在 agent.ctx 注册同名 deployment:persona 遮蔽部署槽位。context 组四个插件的内容全部以带来源的 user/message 落日志 —— 因为新模型可见输入必须有会话事件（model-visible ⟺ logged）。"
+         data-rationale="五个要点：每步装配与 waterfall、两条通道的分工、人格遮蔽、context 组的落日志模式、不变量的约束。都在就完整了。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q10.</span> 用自己的话说明 system prompt 装配的完整流程，以及为什么 runtime context 与上下文插件的内容必须落 durable 日志。</div>
+      <textarea class="short" placeholder="写下你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你确实回答到的要点 —— 少勾伤害书的校准，多勾只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    下一章：<a href="10-llm-layer.html"><strong>第 10 章 · LLM 能力层</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

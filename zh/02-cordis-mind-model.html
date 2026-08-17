@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 2 章 · Cordis 心智模型 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 2 章 · Cordis 心智模型</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="2">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 2 章 · 第一部分 · 全景与心智模型</div>
+    <h1>Cordis 心智模型：Context、插件、服务、事件</h1>
+    <p class="lede">
+      第 1 章说 dsh 是「一棵插件树」。本章讲这棵树生长的土壤：Cordis 插件框架。
+      Context、插件、服务、事件、效应——五个概念吃透，全书后面任何一章的代码你都能直接读懂。
+      这是全书最重要的基础章，值得慢读。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能说出 Cordis 在 dsh 里的位置，以及「一切皆插件、没有特权核心」意味着什么</li>
+      <li>能把 Context（ctx）解释成「服务仓库」，并按 key（如 <code>ctx.tools</code>）找到服务</li>
+      <li>能读懂两种插件写法：函数插件和 <code>Service</code> 子类，以及 <code>inject</code> 如何表达加载顺序</li>
+      <li>能解释「注册即效应」：为什么一切贡献走 <code>ctx.effect()</code> / <code>ctx.on()</code>，卸载如何自动退场</li>
+      <li>能区分四种事件分发模式，并准确描述 waterfall 的 <code>next()</code> 语义与短路后果</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-what-is-cordis">2.1 Cordis：dsh 脚下的地板</h2>
+
+  <p>
+    dsh 没有从零发明插件系统。它站在 <strong>Cordis</strong> 上——一个开源插件框架，
+    设计思想写在论文《A Programming Paradigm for Spatiotemporal Composability》里（现在读不读都行）。
+    你可以把 Cordis 理解为「dsh 的操作系统内核替代品」：它不管进程和内存，它管<strong>插件怎么挂载、
+    怎么找到彼此、怎么通话、怎么退场</strong>。
+  </p>
+
+  <p>一个对本书很重要的事实：Cordis 的源码不在 node_modules 里，而在仓库的 <code>vendor/</code> 目录。</p>
+
+  <ul>
+    <li><code>vendor/</code> 是<strong>钉住的上游源码副本</strong>（pinned）：每份都记录着上游 commit，
+      可以审计、可以打补丁、版本钉死，不跟 npm 上的版本漂移。</li>
+    <li>所有 vendored 包被改名为 <code>@deepseek-ai/</code> 作用域：<code>cordis</code> →
+      <code>@deepseek-ai/cordis</code>。这样发布 dsh 时等于连这层框架一起发布，也不会在 npm 上冒名占用上游包名。</li>
+    <li>每个 harness 包都把 <code>@deepseek-ai/cordis</code> 声明为 <strong>peerDependency</strong>：
+      整棵树共享同一个 Cordis 实例。</li>
+    <li>想更新 vendored 代码，走 <code>vendor/README.md</code> 里写明的同步流程，重新套用（或撤销）记录在案的本地修改。</li>
+  </ul>
+
+  <p>
+    在这套地板上，dsh 立了一条贯穿全仓库的宪法：<strong>everything is a plugin</strong>。
+    模型适配器是插件，工具注册表是插件，会话日志是插件，连 agent loop 本身也是插件——
+    全都可以在配置层替换。这意味着<strong>没有特权核心可打补丁</strong>：
+    你扩展 dsh 的方式不是 fork 一份核心代码，而是把自己的插件挂到其他插件旁边。
+    「怎么挂」是第 3 章的主题；本章先讲挂上去之后，插件之间如何共存。
+  </p>
+
+  <h2 id="sec-context">2.2 Context：一张共享的服务桌子</h2>
+
+  <p>
+    每个插件被 Cordis 挂载时，都会拿到一个 <code>ctx</code>（<code>Context</code> 实例）。
+    把它想成一张大家共用的桌子：<strong>Context 是服务的仓库</strong>。一个服务在桌上占一个稳定的
+    key，别的插件通过 key 取用，而不是 import 某个具体实现类。
+  </p>
+
+  <p>你已经见过几个 key 了（第 1 章的表格里那一列）：</p>
+
+  <ul>
+    <li><code>ctx.tools</code> —— 工具注册表与执行管道（core/tools）</li>
+    <li><code>ctx.sessions</code> —— 会话事件日志（core/session）</li>
+    <li><code>ctx.systemPrompt</code> —— prompt 装配（core/system-prompt）</li>
+    <li><code>ctx.llm</code> —— 模型适配器接口（llm/llm）</li>
+    <li><code>ctx.agents</code> / <code>ctx.agentLoop</code> —— 在线 agent 注册表 / 默认循环</li>
+  </ul>
+
+  <p>
+    「按 key 找服务」带来一个关键性质：<strong>接口与实现分离</strong>。调用方（比如 bash 工具）
+    只依赖 <code>ctx.shell</code> 这个名字和它的 TypeScript 类型；至于背后是本地实现还是沙箱实现，
+    由配置决定。换实现不用改一行调用方代码——这就是第 1 章说的「一切皆可替换」落到实处的机制。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Context 服务仓库示意">
+      <rect x="230" y="130" width="220" height="70" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="3"/>
+      <text x="340" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="15" font-weight="700">ctx（Context）</text>
+      <text x="340" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">服务仓库：一个 key 一个服务</text>
+
+      <rect x="40" y="30" width="150" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="115" y="55" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.tools</text>
+      <line x1="150" y1="70" x2="270" y2="130" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="265" y="20" width="150" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="340" y="45" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.llm</text>
+      <line x1="340" y1="60" x2="340" y2="130" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="490" y="30" width="150" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="565" y="55" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.sessions</text>
+      <line x1="530" y1="70" x2="410" y2="130" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="40" y="200" width="160" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="120" y="225" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.systemPrompt</text>
+      <line x1="200" y1="210" x2="230" y2="195" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="480" y="200" width="160" height="40" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="560" y="225" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">ctx.agents</text>
+      <line x1="480" y1="210" x2="450" y2="195" style="stroke:var(--muted)" stroke-width="1.5"/>
+
+      <rect x="230" y="270" width="220" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="340" y="289" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">插件：tool-bash</text>
+      <text x="340" y="306" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">按 key 取用 ctx.tools、ctx.shell —— 不 import 实现类</text>
+      <line x1="290" y1="270" x2="300" y2="200" style="stroke:var(--pass)" stroke-width="1.5"/>
+      <line x1="390" y1="270" x2="380" y2="200" style="stroke:var(--pass)" stroke-width="1.5"/>
+    </svg>
+    <figcaption>Context 是共享的服务仓库：服务按 key 上桌，插件按 key 取用，接口与实现分离。</figcaption>
+  </figure>
+
+  <p>
+    那「一个服务」在代码里长什么样？它是 Cordis <code>Service</code> 的子类，构造时把自己的 key
+    报给 Cordis。看真实代码——工具注册表（节选自 <code>packages/core/tools/src/index.ts</code>）：
+  </p>
+
+  <pre><code><span class="code-comment">// packages/core/tools/src/index.ts（节选、简化）</span>
+<span class="code-key">export class</span> <span class="code-fn">ToolRuntime</span> <span class="code-key">extends</span> Service {
+  <span class="code-key">static</span> inject = [<span class="code-str">'systemPrompt'</span>]   <span class="code-comment">// 我需要 systemPrompt 服务才能激活</span>
+
+  <span class="code-fn">constructor</span>(ctx: Context, config: Config = {}) {
+    <span class="code-key">super</span>(ctx, <span class="code-str">'tools'</span>)              <span class="code-comment">// &lt;-- 在 ctx 桌上占的 key 就是这个</span>
+    …
+  }
+}</code></pre>
+
+  <p>
+    <code>super(ctx, 'tools')</code> 的第二个参数，就是这个世界里最重要的一个字符串：
+    它决定了别的插件从 <code>ctx.tools</code> 取到的就是这实例。
+  </p>
+
+  <p>
+    那 <code>ctx.tools</code> 的 TypeScript 类型从哪来？不是 dsh 手工维护一张中央注册表，
+    而是用<strong>声明合并</strong>（declaration merging）：工具包在自己的文件里向 Cordis 的
+    <code>Context</code> 接口「合并」进一个成员——
+  </p>
+
+  <pre><code><span class="code-comment">// packages/core/tools/src/index.ts（节选）</span>
+<span class="code-key">declare module</span> <span class="code-str">'@deepseek-ai/cordis'</span> {
+  <span class="code-key">interface</span> Context {
+    tools: ToolRuntime      <span class="code-comment">// 从此 ctx.tools 有类型</span>
+  }
+}</code></pre>
+
+  <p>
+    每个服务包都这样贡献自己的 key；合并出来的 <code>Context</code> 接口就是整张桌子的「菜单」。
+    事件类型也用同样的机制扩展（见 2.5 节）。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">Service Definition：接口与实现分离的名字</div>
+    <p>
+      本书后续会把「声明某个 key 上该有什么接口」的代码叫 <strong>Service Definition</strong>（服务定义），
+      把「真正实现这个接口的插件」叫 Service Provider（服务提供者）。dsh 的规范是一句话：
+      <strong>扩展插件依赖 Service Definition，绝不依赖具体 Provider</strong>。
+      这就是为什么 <code>dsh-agent-loop</code> 可以被整体换掉而 UI、工具插件毫发无伤。
+    </p>
+  </div>
+
+  <h2 id="sec-plugin-shapes">2.3 插件长什么样：函数，或 Service 子类</h2>
+
+  <p>Cordis 里的插件只有两种写法，dsh 两种都用。</p>
+
+  <p><strong>写法一：函数插件</strong>。一个带 <code>name</code>、<code>inject</code>、<code>apply</code> 三件套的模块。
+    真实例子——bash 工具（<code>packages/shell/tool-bash/src/index.ts</code>）：</p>
+
+  <pre><code><span class="code-comment">// packages/shell/tool-bash/src/index.ts（节选）</span>
+<span class="code-key">export const</span> name = <span class="code-str">'tool-bash'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'tools'</span>, <span class="code-str">'shell'</span>, <span class="code-str">'systemPrompt'</span>, <span class="code-str">'shellEnv'</span>]
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx: Context, config: Config = {}): <span class="code-key">void</span> {
+  <span class="code-comment">// 在 ctx.tools 上注册 bash 工具；调用 ctx.shell 执行命令</span>
+}</code></pre>
+
+  <p>
+    <code>apply(ctx)</code> 在插件挂载时被调用，<code>ctx</code> 就是它的入场券。
+    适合「往别人的服务上注册点东西」的插件——dsh 里大多数能力插件都是这种。
+  </p>
+
+  <p><strong>写法二：Service 子类插件</strong>。像上面的 <code>ToolRuntime</code> 那样继承
+    <code>Service</code>，Cordis 把它的生命周期（构造、启动、停用）挂进当前 context。
+    适合「自己就是一个服务、要在桌上占个 key」的插件。</p>
+
+  <p>两种写法共用的关键字段是 <code>inject</code>：</p>
+
+  <div class="box note">
+    <div class="box-title">inject：用服务需求表达加载顺序</div>
+    <p>
+      <code>inject</code> 声明「我要这些服务」。Cordis 会等这些服务都存在了才激活这个插件。
+      于是<strong>加载顺序不再靠手工排序</strong>，而是靠依赖关系自然涌现：
+      <code>tool-bash</code> 声明需要 <code>tools</code> 和 <code>shell</code>，
+      所以无论配置里两行谁先谁后，它都不会在服务缺席时启动。谁等谁，代码自己说了算。
+    </p>
+  </div>
+
+  <p>
+    回头看第 1 章那张 core 表格，现在能读出第二层含义：<code>core/agent-loop</code> 依赖
+    <code>ctx.agents</code> 声明的接口，但它只是一个插件——把它从配置里换掉，换上一个你自己写的循环，
+    其余插件照常工作。「一切皆插件」不是口号，是 <code>inject</code> 撑起来的事实。
+  </p>
+
+  <h2 id="sec-effects">2.4 注册即效应：一切贡献都可退场</h2>
+
+  <p>
+    插件在 <code>apply</code>（或构造）里做的事，统称「贡献」：注册一个工具、加一段 prompt、
+    订阅一个事件、装一个模型适配器。dsh 的铁律是：<strong>注册即效应（registrations are effects）</strong>——
+    一切贡献必须走 <code>ctx.effect()</code> 或 <code>ctx.on()</code>，并且拿到<strong>处置器</strong>（disposer）。
+  </p>
+
+  <ul>
+    <li><code>ctx.effect(setup)</code> 接收一个 generator 函数，你在里面 <code>yield</code> 出清理动作；
+      它返回一个 disposer，调用即撤销整套注册。</li>
+    <li><code>ctx.on(event, listener)</code> 订阅事件，返回值就是退订函数。</li>
+    <li>注册表风格的 API（比如往 <code>ctx.tools</code> 注册工具）返回的也是 disposer——
+      「注册的返回值就是注销函数」是通用约定。</li>
+  </ul>
+
+  <p>
+    真实代码（简化自 <code>ToolRuntime.presentAs</code>，<code>packages/core/tools/src/index.ts</code>）：
+  </p>
+
+  <pre><code><span class="code-key">const</span> dispose = ctx.<span class="code-fn">effect</span>(<span class="code-key">function*</span> () {
+  <span class="code-key">yield</span> this.layers.<span class="code-fn">effect</span>(ctx, layer =&gt; {
+    layer.mode = mode
+    <span class="code-key">return</span> () =&gt; { layer.mode = <span class="code-key">undefined</span> }   <span class="code-comment">// 清理：还原</span>
+  })
+  <span class="code-key">yield</span> ctx.systemPrompt.<span class="code-fn">section</span>(this.<span class="code-fn">sdkSection</span>()) <span class="code-comment">// 返回值同样是退场函数</span>
+})
+<span class="code-comment">// dispose() 一调，上面两件事按相反顺序全部撤销</span></code></pre>
+
+  <p>为什么把「注册」抬到「效应」的高度？因为<strong>可逆性</strong>：</p>
+
+  <ul>
+    <li>插件<strong>卸载</strong>时，它做过的所有注册自动、按序退场——树始终保持一致；</li>
+    <li>热更新（HMR）靠它：换一版插件 = 卸旧挂新，不用重启进程；</li>
+    <li>测试靠它：每个用例挂自己的小树，结束拆掉，互不污染。</li>
+  </ul>
+
+  <p>
+    反过来的推论同样重要：绕过 <code>ctx.effect()</code> 直接改全局状态，等于在树上留下一处
+    卸载时无人打扫的脏东西。dsh 的代码评审会把这当成缺陷，而不是风格问题。
+    如果卸载顺序重要，把相关的几件事放进<strong>同一个</strong> effect 里，
+    让清理按你 yield 的反序解开。
+  </p>
+
+  <h2 id="sec-events">2.5 事件：插件之间的通话方式</h2>
+
+  <p>
+    服务方法适合「直接使唤」：<code>ctx.shell.run(...)</code> 就是跑一条命令。
+    但很多场合你需要的是<strong>旁观或拦截</strong>——工具要执行了，我想检查一眼、改一下、甚至否决它。
+    这就是事件的领地：<code>ctx.on()</code> 订阅，四种方式分发。
+  </p>
+
+  <p>四种分发模式是理解 dsh 事件系统的钥匙（来自 <code>docs/cordis-primer.md</code>）：</p>
+
+  <table>
+    <thead>
+      <tr><th>模式</th><th>等待监听器？</th><th>顺序</th><th>有返回值？</th><th>典型用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>emit</code></td><td>否</td><td>按注册顺序</td><td>无</td><td>纯观察：工具跑完了、注册表变了</td></tr>
+      <tr><td><code>waterfall</code></td><td>否</td><td>按注册顺序</td><td><strong>有</strong></td><td>包裹与拦截：改写请求、否决调用（洋葱模型）</td></tr>
+      <tr><td><code>parallel</code></td><td>是</td><td>并行</td><td>无</td><td>扇出通知：广播给互不依赖的观察者</td></tr>
+      <tr><td><code>serial</code></td><td>是</td><td>按注册顺序</td><td>有</td><td>有序处理且要结果</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    注意两件事。第一，<strong>分发模式是事件公共契约的一部分</strong>：同一个事件只能用属于它的那一种方式分发，
+    dsh 要求新事件的 JSDoc 用 <code>@mode</code> 标注，生成的目录会据此核对声明与分发点是否一致。
+    第二，事件名里的类型也是<strong>声明合并</strong>出来的——和 <code>Context</code> 接口同一招，只是这次合并的是
+    <code>Events</code> 接口：
+  </p>
+
+  <pre><code><span class="code-comment">// packages/core/tools/src/index.ts（节选、简化）</span>
+<span class="code-key">declare module</span> <span class="code-str">'@deepseek-ai/cordis'</span> {
+  <span class="code-key">interface</span> Events {
+    <span class="code-comment">/** Allow, deny, or ask before dispatch. …
+     *  @mode waterfall */</span>
+    <span class="code-str">'tools/pre-execute'</span>(exec: ToolExecution,
+                      next: () =&gt; <span class="code-key">Promise</span>&lt;PreToolDecision&gt;): <span class="code-key">Promise</span>&lt;PreToolDecision&gt;
+    <span class="code-comment">/** Observe the frozen final outcome. …
+     *  @mode emit */</span>
+    <span class="code-str">'tools/result'</span>(exec: <span class="code-key">readonly</span> ToolExecution,
+                  result: <span class="code-key">readonly</span> ToolExecutionResult): <span class="code-key">undefined</span>
+  }
+}</code></pre>
+
+  <p>
+    读这段真实声明能学到三件事：<code>tools/pre-execute</code> 是 waterfall（有 <code>next</code>、有返回值），
+    用于「放行 / 拒绝 / 先问人」的决策；<code>tools/result</code> 是 emit（无返回值），用于观察最终结果；
+    每个事件的 JSDoc 写明契约，<code>@mode</code> 让工具可以机器核对。
+  </p>
+
+  <h2 id="sec-waterfall">2.6 waterfall：洋葱、包裹与短路</h2>
+
+  <p>
+    四种模式里最值得吃透的是 <code>ctx.waterfall()</code>——dsh 的拦截层全部建在它上面：
+    <code>agent/pre-step</code>、<code>agent/request</code>、<code>llm/stream</code>、
+    <code>tools/pre-execute</code>、<code>tools/execute</code>、<code>tools/post-execute</code> 全是 waterfall
+    （对照：<code>agent/turn-stopping</code> 是 serial，没有 <code>next</code>）。
+  </p>
+
+  <p>语义一句话：<strong>waterfall 是 around 中间件</strong>。监听器收到 <code>(…args, next)</code>：</p>
+
+  <ul>
+    <li>调 <code>next()</code>：把（可能改写过的）请求交给下一层；<code>next()</code> 的<strong>返回值</strong>是下层的结果；</li>
+    <li><strong>不调 <code>next()</code> 就返回</strong>：整条链在此<strong>短路</strong>——后面的监听器和真正的执行都不会发生，
+      你的返回值成为最终结果。</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="waterfall 洋葱模型与短路对比">
+      <text x="170" y="24" text-anchor="middle" style="fill:var(--pass)" font-size="13" font-weight="700">每层都调 next()：正常穿过</text>
+      <rect x="40" y="40" width="260" height="250" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="62" y="66" style="fill:var(--fg)" font-size="12" font-weight="700">监听器 A</text>
+      <rect x="70" y="80" width="200" height="190" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="92" y="106" style="fill:var(--fg)" font-size="12" font-weight="700">监听器 B</text>
+      <rect x="100" y="120" width="140" height="130" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="122" y="146" style="fill:var(--fg)" font-size="12" font-weight="700">监听器 C</text>
+      <rect x="130" y="160" width="80" height="60" rx="8" style="fill:var(--accent);fill-opacity:0.18;stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="170" y="188" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">真正的执行</text>
+      <text x="170" y="204" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">（如 LLM 请求）</text>
+      <text x="170" y="316" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">请求向下穿、结果向上回：每层都能改写、计时、放行</text>
+
+      <text x="500" y="24" text-anchor="middle" style="fill:var(--fail)" font-size="13" font-weight="700">B 不调 next()：在此短路</text>
+      <rect x="370" y="40" width="260" height="250" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="392" y="66" style="fill:var(--fg)" font-size="12" font-weight="700">监听器 A</text>
+      <rect x="400" y="80" width="200" height="190" rx="8" style="fill:var(--surface-2);stroke:var(--fail)" stroke-width="2.5"/>
+      <text x="422" y="106" style="fill:var(--fail)" font-size="12" font-weight="700">监听器 B</text>
+      <text x="500" y="126" text-anchor="middle" style="fill:var(--fail)" font-size="10">直接 return，没调 next()</text>
+      <rect x="430" y="140" width="140" height="80" rx="8" style="fill:none;stroke:var(--fg-dim);stroke-dasharray:5 4" stroke-width="1.5"/>
+      <text x="500" y="168" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-weight="700">监听器 C</text>
+      <text x="500" y="186" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">不会发生</text>
+      <rect x="460" y="230" width="80" height="34" rx="8" style="fill:none;stroke:var(--fg-dim);stroke-dasharray:5 4" stroke-width="1.5"/>
+      <text x="500" y="251" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">真正的执行</text>
+      <text x="500" y="316" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">B 的返回值成为最终结果，链条到此为止</text>
+    </svg>
+    <figcaption>waterfall 的洋葱模型。左：每层调 next()，请求层层下传、结果层层上回。右：B 不调 next()，C 与真正的执行被跳过——链在 B 短路。</figcaption>
+  </figure>
+
+  <p>用伪代码把两种结局写出来：</p>
+
+  <pre><code><span class="code-comment">// 协作型监听器：改一改，然后放行</span>
+ctx.<span class="code-fn">on</span>(<span class="code-str">'tools/execute'</span>, <span class="code-key">async</span> (exec, next) =&gt; {
+  exec.timeoutMs = 30_000                    <span class="code-comment">// 包裹：改写共享请求</span>
+  <span class="code-key">return await</span> <span class="code-fn">next</span>()                        <span class="code-comment">// 必须放行，结果从这层返回</span>
+})
+
+<span class="code-comment">// 决策型监听器：我拥有这个决定，到此为止</span>
+ctx.<span class="code-fn">on</span>(<span class="code-str">'tools/pre-execute'</span>, <span class="code-key">async</span> (exec, next) =&gt; {
+  <span class="code-key">if</span> (exec.name === <span class="code-str">'bash'</span> &amp;&amp; isDangerous(exec.args)) {
+    <span class="code-key">return</span> { kind: <span class="code-str">'deny'</span> }               <span class="code-comment">// 不调 next()：短路即否决</span>
+  }
+  <span class="code-key">return await</span> <span class="code-fn">next</span>()                        <span class="code-comment">// 其余放行</span>
+})</code></pre>
+
+  <p>什么时候短路是<strong>对的</strong>、什么时候是<strong>事故</strong>？判据一句话：</p>
+
+  <ul>
+    <li><strong>单决策事件里，短路是设计</strong>。一个策略监听器拥有决策权时（拒绝一条危险命令），
+      不调 <code>next()</code> 就是它的表达方式。</li>
+    <li><strong>只标注或观察的监听器必须调 <code>next()</code></strong>。忘调 <code>next()</code> 的包裹层不是「跳过自己」，
+      而是「掐死后面所有人」——后面的监听器和真正的执行全部静默消失，这是 dsh 文档里反复强调的事故模式。</li>
+    <li>另外两个小知识：结果值沿 <code>next()</code> 的返回值往回传；监听器也可以整体替换下层结果，
+      下游看到的将是替换后的值。<code>prepend: true</code> 只在该监听器必须先于普通注册运行时使用。</li>
+  </ul>
+
+  <div class="demo" data-demo="waterfallChain">
+    <div class="demo-title">试一试 —— waterfall 忘了 next() 会怎样</div>
+    <p>三个监听器依次包裹一次模型请求：</p>
+    <label><input type="checkbox"> 让监听器 B 不调用 next()</label>
+    <button data-run>运行请求</button>
+    <div class="demo-output empty">点击运行。</div>
+  </div>
+
+  <h2 id="sec-event-domains">2.7 三个事件域：先见森林</h2>
+
+  <p>
+    dsh 的事件按「事实属于谁」分三个域。现在只需要认识这三个名字和选域的直觉，
+    每个域后面都有整章展开：session events 第 4 章、agent events 第 6/7 章、
+    capability events 第 8/11 章。
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>事件域</th><th>例子</th><th>本质</th><th>什么时候选它</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>session events</strong></td>
+        <td><code>user/message</code>、<code>assistant/message</code>、<code>tool/call</code>、<code>turn/*</code></td>
+        <td>持久事实，追加进会话日志并通过 <code>session/event</code> 广播</td>
+        <td>这个事实必须<strong>活过重启</strong>、要能被回放</td>
+      </tr>
+      <tr>
+        <td><strong>agent events</strong></td>
+        <td><code>agent/pre-step</code>、<code>agent/request</code>、<code>agent/turn-stopping</code></td>
+        <td>携带一个活的 <code>Agent</code>：收件箱、步骤、状态、请求、校验、续跑</td>
+        <td>想观察或拦截<strong>进行中的工作</strong></td>
+      </tr>
+      <tr>
+        <td><strong>capability events</strong></td>
+        <td><code>tools/*</code>、<code>fs/*</code>、<code>telemetry/*</code></td>
+        <td>能力 seam 上的策略与适配器挂点</td>
+        <td>想给某个能力加<strong>策略</strong>而不碰 agent loop</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    选域的直觉：事实要留痕 → session；盯着正在跑的活 → agent；给能力加政策 → capability。
+    dsh 的架构文档说「事件就是扩展点，选对域是大多数改动的第一个决策」——这句话你会在第 24 章实践时反复体会到。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">补一句：模型可见 ⟺ 已记录</div>
+    <p>
+      dsh 还有一条和事件域相关的铁律，先记住结论（第 4 章展开）：凡是到达模型请求的内容，
+      都必须能从会话日志重建。想新增一种模型可见的输入，就必须新增一个 session event——
+      「模型看见的」和「日志里记的」永远一一对应。
+    </p>
+  </div>
+
+  <h2 id="sec-recap">2.8 本章回顾</h2>
+
+  <ul>
+    <li>Cordis 是 dsh 脚下的插件框架，vendored 于 <code>vendor/</code>（钉住的上游源码副本，rescope 成 <code>@deepseek-ai/cordis</code>，所有 harness 包以它为 peerDependency）；同步走 <code>vendor/README.md</code> 的流程。</li>
+    <li><strong>一切皆插件</strong>：模型适配器、工具注册表、会话日志、agent loop 本身都是插件，都能在配置层替换；没有特权核心可打补丁。</li>
+    <li><strong>Context 是服务仓库</strong>：服务按 key 上桌（<code>ctx.tools</code>、<code>ctx.llm</code>、<code>ctx.sessions</code>…），插件按 key 取用；服务是 <code>Service</code> 子类，接口（Service Definition）与实现分离；类型靠声明合并。</li>
+    <li>插件两种写法：函数插件（<code>name</code> + <code>inject</code> + <code>apply</code>）或 <code>Service</code> 子类；<code>inject</code> 声明服务依赖，加载顺序由依赖关系表达。</li>
+    <li><strong>注册即效应</strong>：一切贡献走 <code>ctx.effect()</code> / <code>ctx.on()</code>，注册返回 disposer；插件卸载时注册自动按序退场。</li>
+    <li>事件四种分发模式（emit / waterfall / parallel / serial），模式是事件契约的一部分（<code>@mode</code> 标注）；<strong>waterfall 监听器必须调 <code>next()</code></strong>，不调即短路整条链——单决策事件里短路是设计，观察型监听器忘了调是事故。</li>
+    <li>三个事件域：session（持久事实）、agent（进行中的工作）、capability（能力上的策略）。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>为了用某个服务去 import 它的实现类——按 key 从 <code>ctx</code> 取；依赖 Service Definition，不依赖 Provider。</li>
+      <li>waterfall 监听器忘了调 <code>next()</code>——不是「跳过自己」，是掐死后面所有层和真正的执行。</li>
+      <li>期待 <code>emit</code> 事件有返回值——emit 只观察、无返回值；要包裹与拦截找 waterfall。</li>
+      <li>把 <code>ctx.effect()</code> 当可选的风格偏好——绕过它直接改全局状态会留下卸载时无人清理的脏东西，这是缺陷。</li>
+      <li>想改行为就去改 <code>agent-loop</code>——先找对应域的事件挂上去；改循环本身要更新架构文档，是最后手段。</li>
+      <li>以为 <code>vendor/</code> 是从 npm 装的普通依赖——它是钉住的源码副本，有自己的同步流程和本地修改日志。</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="2">
+    <h2>第 2 章 测验</h2>
+
+    <div class="q" data-id="2-1" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 以上都是插件：dsh 里没有非插件的特权部分。"
+         data-rationale="D 正确：everything is a plugin——模型适配器、会话日志、agent loop 全是插件、全都可在配置层替换，没有特权核心可打补丁。A、B、C 各自单独选都不完整，也都把某一插件当成了例外。"
+         data-review="sec-what-is-cordis">
+      <div class="prompt"><span class="qnum">Q1.</span> 在 dsh 里，下列哪一项<strong>不是</strong>插件？</div>
+      <label class="opt"><input type="radio" name="q-2-1" value="a"> A. DeepSeek 模型适配器（llm-deepseek）</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="b"> B. 会话日志（core/session）</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="c"> C. agent loop 本身（core/agent-loop）</label>
+      <label class="opt"><input type="radio" name="q-2-1" value="d"> D. 以上都是插件——没有例外，也没有特权核心</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— vendor/ 是钉住的上游 Cordis 源码副本，已 rescope 为 @deepseek-ai/cordis，所有 harness 包以它为 peerDependency。"
+         data-rationale="B 正确。A 错：不是 npm 普通依赖，是可审计、可打补丁、钉版本的源码副本。C 错：Cordis 是上游框架，dsh 在其上组装。D 错：它真实参与构建与发布——发布 dsh 就连这层框架一起发布。"
+         data-review="sec-what-is-cordis">
+      <div class="prompt"><span class="qnum">Q2.</span> <code>vendor/</code> 目录里的 Cordis 是什么？</div>
+      <label class="opt"><input type="radio" name="q-2-2" value="a"> A. 从 npm 安装的普通第三方依赖</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="b"> B. 钉住的上游源码副本，rescope 为 <code>@deepseek-ai/cordis</code>，harness 包以它为 peerDependency</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="c"> C. dsh 团队自己从零写的框架</label>
+      <label class="opt"><input type="radio" name="q-2-2" value="d"> D. 只读的参考代码，不参与构建</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 服务仓库：插件按稳定的 ctx key 找到服务，而不是 import 具体实现。"
+         data-rationale="C 正确，这是 Context 的定义性角色。A 错：ctx 上的 key 是声明合并出的强类型成员，不是随意挂变量的桶。B 错：ctx 与数据库无关。D 错：配置由 cordis.yml 与补丁层提供（第 3 章），ctx 是运行时的服务目录。"
+         data-review="sec-context">
+      <div class="prompt"><span class="qnum">Q3.</span> Cordis 里 <code>ctx</code>（Context）的角色最准确的描述是？</div>
+      <label class="opt"><input type="radio" name="q-2-3" value="a"> A. 一个可以随意挂任意属性的全局变量桶</label>
+      <label class="opt"><input type="radio" name="q-2-3" value="b"> B. 数据库连接池</label>
+      <label class="opt"><input type="radio" name="q-2-3" value="c"> C. 服务仓库：插件按稳定的 key（如 <code>ctx.tools</code>）找到服务，不 import 具体实现</label>
+      <label class="opt"><input type="radio" name="q-2-3" value="d"> D. 存放 YAML 配置文件的对象</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-4" data-type="fill" data-accepted='["tools","ctx.tools"]'
+         data-answer="tools（即 ctx.tools）。"
+         data-rationale="构造器里 super(ctx, 'tools') 的第二个参数就是服务上桌的 key，它同时通过声明合并进 Context 接口，成为 ctx.tools 的类型来源。"
+         data-review="sec-context">
+      <div class="prompt"><span class="qnum">Q4.</span> 填空：<code>ToolRuntime</code> 在构造器里写 <code>super(ctx, 'tools')</code>，它在 Context 桌上占用的 key 是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 声明服务依赖：等这些服务存在才激活，加载顺序由依赖关系表达。"
+         data-rationale="B 正确：inject 让 Cordis 等待所需服务出现，取代手工启动排序。A 错：npm 依赖在 package.json 里声明。C 错：事件订阅走 ctx.on。D 错：配置是独立机制（第 3 章）。"
+         data-review="sec-plugin-shapes">
+      <div class="prompt"><span class="qnum">Q5.</span> 插件的 <code>inject</code> 字段的作用是？</div>
+      <label class="opt"><input type="radio" name="q-2-5" value="a"> A. 声明 npm 依赖，让包管理器安装它们</label>
+      <label class="opt"><input type="radio" name="q-2-5" value="b"> B. 声明服务依赖：插件等到这些服务存在才激活，加载顺序由需求表达</label>
+      <label class="opt"><input type="radio" name="q-2-5" value="c"> C. 声明要订阅的事件列表</label>
+      <label class="opt"><input type="radio" name="q-2-5" value="d"> D. 声明插件接受哪些配置字段</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 正确：ctx.effect 返回 disposer、generator 里 yield 清理动作、卸载时注册自动按序退场——三者合起来就是可逆性。C 错：它是硬性规矩，绕过它直接改全局状态会留下卸载时无人清理的注册，是缺陷而非风格。"
+         data-review="sec-effects">
+      <div class="prompt"><span class="qnum">Q6.</span> 关于「注册即效应」，下列说法正确的有哪些？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="a"> A. <code>ctx.effect()</code> 返回一个 disposer，调用即撤销整套注册</label>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="b"> B. 在 generator 里 <code>yield</code> 出清理动作，卸载时按反序执行</label>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="c"> C. 它只是推荐的风格，直接改全局变量也可以</label>
+      <label class="opt"><input type="checkbox" name="q-2-6" value="d"> D. 插件卸载时，它通过 <code>ctx.effect()</code> / <code>ctx.on()</code> 做的注册会自动退场</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-7" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— waterfall：不等待监听器、按注册顺序、有返回值。"
+         data-rationale="C 正确，三种性质同时满足的只有 waterfall。A 错：emit 无返回值。B 错：parallel 并行且无返回值。D 错：serial 要等待监听器完成。"
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q7.</span> 哪种分发模式「不等待监听器、按注册顺序、且有返回值」？</div>
+      <label class="opt"><input type="radio" name="q-2-7" value="a"> A. <code>emit</code></label>
+      <label class="opt"><input type="radio" name="q-2-7" value="b"> B. <code>parallel</code></label>
+      <label class="opt"><input type="radio" name="q-2-7" value="c"> C. <code>waterfall</code></label>
+      <label class="opt"><input type="radio" name="q-2-7" value="d"> D. <code>serial</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 链在 B 短路：C 和真正的执行都不会发生，B 的返回值成为最终结果。"
+         data-rationale="B 正确：不调 next() 就是返回而不委托，后面整条链被跳过。A 错：B 不是被跳过，是 B 掐死了后面。C 错：这不是报错，是静默短路——恰恰因为不报错才危险。D 错：waterfall 的规则对所有层一视同仁，不存在自动重试。"
+         data-review="sec-waterfall">
+      <div class="prompt"><span class="qnum">Q8.</span> 监听器 A、B、C 依次注册在一次模型请求的 waterfall 上。B 收到请求后直接 <code>return</code>、没调 <code>next()</code>，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-2-8" value="a"> A. B 被跳过，C 继续执行</label>
+      <label class="opt"><input type="radio" name="q-2-8" value="b"> B. 链在 B 短路：C 和真正的 LLM 调用都不会发生，B 的返回值成为最终结果</label>
+      <label class="opt"><input type="radio" name="q-2-8" value="c"> C. Cordis 抛出异常并终止整个进程</label>
+      <label class="opt"><input type="radio" name="q-2-8" value="d"> D. 请求被自动重试一次</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 单决策事件里你拥有决策权时：拒绝就是你的返回值，短路是设计。"
+         data-rationale="C 正确：策略监听器拥有决定（如否决危险命令）时，不调 next() 正是表达方式。A 错：观察者必须调 next()，否则掐死后面所有层。B 错：包裹改写后恰恰要靠 next() 把请求传下去、把结果拿回来。D 错：prepend 只是排序选项，与是否调 next() 无关。"
+         data-review="sec-waterfall">
+      <div class="prompt"><span class="qnum">Q9.</span> 什么情况下 waterfall 监听器<strong>不调</strong> <code>next()</code> 是正确做法？</div>
+      <label class="opt"><input type="radio" name="q-2-9" value="a"> A. 只想观察事件、不改结果的时候</label>
+      <label class="opt"><input type="radio" name="q-2-9" value="b"> B. 想改写请求再传下去的时候</label>
+      <label class="opt"><input type="radio" name="q-2-9" value="c"> C. 单决策事件里你拥有这个决定：例如策略监听器决定拒绝一条危险命令</label>
+      <label class="opt"><input type="radio" name="q-2-9" value="d"> D. 用了 prepend: true 的时候</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-10" data-type="fill" data-accepted='["declaration merging","declaration merge","声明合并"]'
+         data-answer="declaration merging（声明合并）。"
+         data-rationale="typed events 靠 declare module 向 Events 接口合并成员；Context 的服务 key 用同一机制。这让每个服务包自己贡献类型，无需中央注册表。"
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q10.</span> 填空：typed events 和 Context 服务 key 的类型，都靠 TypeScript 的 <code>______</code> 机制合并扩展。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 事件的分发模式（emit / waterfall / parallel / serial）。"
+         data-rationale="B 正确：@mode 是事件公共契约的一部分，生成目录据此核对声明与分发点一致。A 错：运行模式是 profile/bundle 的事（第 3 章）。C 错：作用域标注另有机制（第 6 章）。D 错：优先级不是它标注的内容。"
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q11.</span> 事件 JSDoc 里的 <code>@mode</code> 标签标注的是什么？</div>
+      <label class="opt"><input type="radio" name="q-2-11" value="a"> A. 插件的运行模式（web / headless）</label>
+      <label class="opt"><input type="radio" name="q-2-11" value="b"> B. 事件的分发模式（emit / waterfall / parallel / serial）</label>
+      <label class="opt"><input type="radio" name="q-2-11" value="c"> C. 事件的作用域过滤方式</label>
+      <label class="opt"><input type="radio" name="q-2-11" value="d"> D. 监听器的注册优先级</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-12" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— session event：追加进会话日志的持久事实，能活过重启。"
+         data-rationale="A 正确：要跨重启、可回放的事实是 session events 的定义。B 错：agent events 面向进行中的工作，不保证持久。C 错：capability events 是能力上的策略挂点。D 错：绕开日志直接写文件违反模型可见 ⟺ 已记录的铁律（第 4 章）。"
+         data-review="sec-event-domains">
+      <div class="prompt"><span class="qnum">Q12.</span> 你要新增一个「必须活过进程重启、之后还能回放」的事实，应该用哪个事件域？</div>
+      <label class="opt"><input type="radio" name="q-2-12" value="a"> A. session event</label>
+      <label class="opt"><input type="radio" name="q-2-12" value="b"> B. agent event</label>
+      <label class="opt"><input type="radio" name="q-2-12" value="c"> C. capability event</label>
+      <label class="opt"><input type="radio" name="q-2-12" value="d"> D. 不用事件，直接写个文件</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-13" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 依赖 Service Definition（key + 类型），不依赖具体 Provider。"
+         data-rationale="C 正确：扩展插件通过 ctx key 和声明合并出的类型使用服务，实现可整体替换。A 错：import Provider 类会把调用方焊死在一个实现上。B 错：复制代码是反模式。D 错：配置行选择的是哪个 Provider 上桌，不改变调用方写法（第 3 章）。"
+         data-review="sec-context">
+      <div class="prompt"><span class="qnum">Q13.</span> 你的插件想用 shell 能力，正确的依赖方式是？</div>
+      <label class="opt"><input type="radio" name="q-2-13" value="a"> A. import shell-local 的实现类直接调用</label>
+      <label class="opt"><input type="radio" name="q-2-13" value="b"> B. 把 shell-local 的代码复制一份到自己包里</label>
+      <label class="opt"><input type="radio" name="q-2-13" value="c"> C. 依赖 Service Definition：inject 声明后从 <code>ctx.shell</code> 取用</label>
+      <label class="opt"><input type="radio" name="q-2-13" value="d"> D. 在 cordis.yml 里写死 provider 的绝对路径</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="2-14" data-type="short"
+         data-key-points='["waterfall 是 around 中间件：监听器收到 (...args, next)","调 next() 把（可能改写过的）请求交给下一层，值沿 next() 的返回值回传","不调 next() 就返回 = 短路：后面的监听器和真正执行都不发生，返回值成为最终结果","单决策事件里策略监听器拥有决定，短路是设计","只观察或标注的监听器必须调 next()，忘调会静默掐死整条链"]'
+         data-answer="waterfall 是洋葱式的 around 中间件：每个监听器收到 (...args, next)；调 next() 表示放行，请求（可改写后）传给下一层，结果沿 next() 的返回值回到自己手里；不调 next() 直接返回则在此短路——后续监听器和真正的执行全部跳过，返回值成为最终结果。策略监听器在单决策事件里拥有决定权时，短路正是表达拒绝的方式；而只观察或标注的监听器必须调 next()，否则会静默掐死整条链。"
+         data-rationale="五个要点：around 中间件、next() 放行与返回值回传、短路后果、短路何时是设计、观察者为何必须放行。"
+         data-review="sec-waterfall">
+      <div class="prompt"><span class="qnum">Q14.</span> 用你自己的话解释 waterfall 语义：监听器收到什么、调 <code>next()</code> 意味着什么、不调会发生什么？为什么策略监听器可以不调，而观察者必须调？</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正答到的要点——少勾会损害校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="03-runtime-assembly.html"><strong>第 3 章 · 组装一个运行时</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

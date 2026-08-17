@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 11 章 · Capability Seam 模式：三角色方法论 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 11 章 · Capability Seams</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="11">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 11 章 · 第三部分 · Capability Seams 专题</div>
+    <h1>Capability Seam 模式：三角色方法论</h1>
+    <p class="lede">
+      前 10 章你见过的每一个能力——<code>ctx.llm</code>、<code>ctx.tools</code>、<code>ctx.systemPrompt</code>——背后都是同一个结构。
+      本章把这个结构命名清楚：<strong>capability seam</strong>，一个可替换能力的完整切口，由
+      Service Definition、Service Provider、Consumer 三个角色合起来构成。掌握了这个模式，
+      你就能回答 dsh 里最重要的工程问题：加一个能力要设计哪几块？换一个实现要动哪几块？答案是三块和一块。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能说出三角色各自的职责与边界，以及为什么 Service Definition 必须是 Cordis Service 子类而不是 TypeScript interface</li>
+      <li>能以 <code>dsh-shell</code> 家族为范本，指出每个包扮演哪个角色</li>
+      <li>能解释「换一个 provider 就换一个产品形态」的连锁机制——执行世界为什么是成组搬迁的</li>
+      <li>会查 <code>docs/capability-seams.md</code> 这张脚本生成的全图，定位任意 <code>ctx.*</code> 服务的 owner、implementations 和 consumers</li>
+      <li>拿到一个新能力需求时，能按三角色清单完成设计而不是只写一个插件</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-what-is-seam">11.1 什么是 capability seam</h2>
+
+  <p>
+    dsh 的仓库说明里有一条反复出现的约定：<strong>A capability seam comprises Service Definition /
+    Service Provider / Consumer roles. It is complete, never one role.</strong>
+    一个 capability seam 是一个<strong>可替换能力的完整切口</strong>：沿这条缝切下去，能力可以被整体换掉，
+    而切口的两侧都不知道对方的具体实现。
+  </p>
+
+  <p>
+    <code>docs/glossary.md</code> 的 <code>capability-seam</code> 条目给出了精确定义，三个角色是：
+  </p>
+  <ul>
+    <li>
+      <strong>Service Definition</strong>——一个 Cordis <code>Service</code> 子类，拥有自己的
+      <code>ctx.&lt;key&gt;</code> 服务键和全部词汇类型（vocabulary types）。它可以是抽象类
+      （如 <code>ShellExecutor</code>），也可以是具体注册表（如 web 能力的 registry），
+      但<strong>绝不是 TypeScript <code>interface</code></strong>。interface 没有声明合并、没有
+      <code>ctx.shell</code> 这个键、没有生命周期——它挂不到 Cordis 的服务图上。
+    </li>
+    <li>
+      <strong>Service Provider</strong>——实现者。子类化抽象 Service 或向注册表注册，把「怎么做」填进去。
+      一个 seam 可以有一个 provider，也可以有一组并列的 provider。
+    </li>
+    <li>
+      <strong>Consumer</strong>——使用者。通过 <code>inject</code> 拿到 <code>ctx.&lt;key&gt;</code>，
+      只面对 Definition 的词汇编程。最常见的 Consumer 是模型可见工具（如 <code>dsh-tool-bash</code>），
+      但也可以是别的插件。
+    </li>
+  </ul>
+
+  <p>
+    两个容易忽略的细则。第一，<strong>角色通常分包，但不强制</strong>：当两个角色会一起演进时，
+    一个包可以兼任多角色——<code>dsh-llm</code> 同时拥有 LLM 能力的 Service Definition（<code>ctx.llm</code>）
+    和它的 Consumer（流式调用逻辑）；但只占一个角色不构成 seam，seam 这个词永远指完整切口。
+    第二，<strong>词汇类型归 Definition 所有</strong>：request、spec、result、事件名这些跨包共享的类型
+    定义在 Definition 包里，provider 和 consumer 都 import 它，谁也不自己另写一份。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">为什么不是 interface</div>
+    <p>
+      Cordis 的服务发现靠声明合并：包里写 <code>declare module '@deepseek-ai/cordis' { interface Context {
+      shell: ShellExecutor } }</code>，<code>ctx.shell</code> 这个键才存在。TypeScript interface
+      表达不了「我注册了一个服务键」，也表达不了 effect 作用域与 dispose。所以 Definition 一定是
+      <code>Service</code> 的子类——它既是类型，也是运行时对象。
+    </p>
+  </div>
+
+  <h2 id="sec-three-roles">11.2 三角色关系图</h2>
+
+  <p>
+    把依赖方向画出来，模式的核心一目了然：<strong>两侧都指向中间，两侧互不相识</strong>。
+    Provider 子类化 Definition 的抽象服务；Consumer 注入 Definition 的 <code>ctx.&lt;key&gt;</code>。
+    从 Provider 到 Consumer 没有任何一条边——这正是「可替换」的来源。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三角色关系图">
+      <rect x="20" y="60" width="170" height="90" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="105" y="90" text-anchor="middle" style="fill:var(--accent-2)" font-size="14" font-weight="700">Service Provider</text>
+      <text x="105" y="112" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">dsh-bash-local</text>
+      <text x="105" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">dsh-bash-sandbox</text>
+
+      <rect x="225" y="45" width="170" height="120" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2.5"/>
+      <text x="310" y="75" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">Service Definition</text>
+      <text x="310" y="97" text-anchor="middle" style="fill:var(--fg)" font-size="12">dsh-shell</text>
+      <text x="310" y="117" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">ShellExecutor</text>
+      <text x="310" y="137" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">ctx.shell + 词汇类型</text>
+
+      <rect x="430" y="60" width="170" height="90" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="515" y="90" text-anchor="middle" style="fill:var(--pass)" font-size="14" font-weight="700">Consumer</text>
+      <text x="515" y="112" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">dsh-tool-bash</text>
+      <text x="515" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">inject: bash</text>
+
+      <line x1="190" y1="90" x2="222" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="225,90 217,86 217,94" style="fill:var(--muted)"/>
+      <text x="206" y="80" text-anchor="middle" style="fill:var(--muted)" font-size="10">子类化 / 注册</text>
+
+      <line x1="430" y1="90" x2="398" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="395,90 403,86 403,94" style="fill:var(--muted)"/>
+      <text x="412" y="80" text-anchor="middle" style="fill:var(--muted)" font-size="10">注入使用</text>
+
+      <line x1="105" y1="150" x2="105" y2="185" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <line x1="105" y1="185" x2="430" y2="185" style="stroke:var(--fail)" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <line x1="430" y1="185" x2="430" y2="150" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <text x="267" y="205" text-anchor="middle" style="fill:var(--fail)" font-size="11">这条依赖不存在：Provider 与 Consumer 互不 import</text>
+
+      <text x="310" y="238" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">角色可分包也可同包（dsh-llm 兼任 Definition 与 Consumer），但 seam 永远指三者齐全的切口</text>
+    </svg>
+    <figcaption>capability seam 三角色：依赖全部指向 Definition，两侧之间零依赖。</figcaption>
+  </figure>
+
+  <p>
+    图里那条红色虚线是审查 PR 时最值得盯的一条边。如果你发现 <code>tool-bash</code> 直接
+    <code>import</code> 了 <code>dsh-bash-local</code>，或者 <code>bash-local</code> 反过来 import 了某个工具包，
+    seam 就裂了——换 provider 的自由立刻消失。
+  </p>
+
+  <h2 id="sec-shell-example">11.3 范本：dsh-shell 家族</h2>
+
+  <p>
+    仓库自己指定的范本是 <code>packages/shell/</code>。<code>packages/shell/shell/README.md</code> 开头的角色表：
+  </p>
+
+  <table>
+    <thead><tr><th>包</th><th>角色</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>@deepseek-ai/dsh-shell</code></td><td>Service Definition</td><td>抽象 <code>ShellExecutor</code> + 词汇类型（<code>ShellExecRequest</code> / <code>ShellExecSpec</code> / <code>ShellRunResult</code>）</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-bash-local</code></td><td>Provider</td><td>本机子进程实现</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-bash-sandbox</code></td><td>Provider</td><td>沿用 bash-local 的机制，但每次 spawn 前经 <code>ctx.sandbox</code> 包装约束</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-pwsh-local</code></td><td>Provider</td><td>Windows PowerShell 家族的本机实现</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-tool-bash</code></td><td>Consumer</td><td>模型可见的 <code>bash</code> 工具，建在 <code>ctx.shell</code> 上</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-tool-pwsh</code></td><td>Consumer</td><td>模型可见的 <code>pwsh</code> 工具</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    读这个范本时注意三处「Definition 拥有什么」的细节，它们示范了词汇归谁所有：
+  </p>
+  <ul>
+    <li>
+      <strong>能力事实 <code>sandboxMode</code></strong>。基类上它默认 <code>undefined</code>（「这个执行器不沙箱化」）；
+      <code>bash-sandbox</code> 挂载时报告约束模式。<code>tool-bash</code> 在注册时读这个事实，
+      决定要不要给模型暴露 <code>sandbox_permissions</code> 升级参数——<strong>探测能力，不 import provider</strong>。
+      一个容器化或远端执行器以同样方式接入，工具层一行不改。
+    </li>
+    <li>
+      <strong><code>SHELL_SETTINGS_NAMESPACE</code>（值为 <code>bash</code>）由 Definition 导出</strong>，
+      因为它命名的是能力而不是某个实现。host 恰好组装一个 <code>ctx.shell</code> provider
+      ——Windows 层把 POSIX 行换成 pwsh 行，同时挂两个会在重复服务注册上失败——所以各家 provider
+      都注册这同一个命名空间而永不冲突，一份 <code>settings.yaml</code> 跨平台仍然可解析。
+    </li>
+    <li>
+      <strong>渲染契约 <code>parseExitStatus</code></strong>。<code>[exit code: N]</code> /
+      <code>[killed by signal: X]</code> 标记的解析函数放在 Definition 包里，
+      让 <code>tool-bash</code> 和 <code>tool-pwsh</code> 两个 Consumer 永远不会在标记格式上漂移。
+    </li>
+  </ul>
+
+  <div class="box key">
+    <div class="box-title">关键点</div>
+    <p>
+      Definition 拥有的不只是抽象方法：能力事实、设置命名空间、跨实现共享的解析契约、事件词汇，全都归它。
+      判断一个类型该放哪个包，问一句「它是能力的一部分，还是某个实现的一部分」就够了。
+    </p>
+  </div>
+
+  <h2 id="sec-provider-swap">11.4 换一个 provider，搬走整个执行世界</h2>
+
+  <p>
+    单个 seam 的可替换性已经很有用，但 dsh 真正的产品级威力来自<strong>成组的 seam 共享同一个执行世界</strong>。
+    回顾 <code>docs/capability-seams.md</code> 里的两条边：<code>fs-e2b</code> 与 <code>subprocess-e2b</code>
+    都注入 <code>ctx.e2b</code>——它们不是两个孤立的 provider，而是同一个远端 Linux 世界的两张本地面孔。
+  </p>
+
+  <p>
+    谁在消费 <code>ctx.subprocess</code>？bash 执行器（<code>bash-local</code>、<code>bash-sandbox</code>）、
+    PTY 后端（<code>terminal-bash</code>）、LSP 宿主（<code>lsp-stdio</code>）、三个进程外子代理后端
+    （<code>subagent-acp</code>、<code>subagent-codex</code>、<code>subagent-claude-code</code>）。
+    谁在消费 <code>ctx.fs</code>？文件工具 <code>tool-fs</code>。这意味着：把
+    <code>fs-local</code> 换成 <code>fs-e2b</code>、把 <code>subprocess-local</code> 换成
+    <code>subprocess-e2b</code>，Bash、终端、LSP、文件读写就<strong>一起</strong>搬进了远端沙箱——
+    没有一个工具包需要改代码，也没有任何 provider 分叉出「E2B 专用版工具」。
+  </p>
+
+  <div class="demo" data-demo="seamSwap">
+    <div class="demo-title">试一试 —— 换一个 provider，搬走整个执行世界</div>
+    <p>fs 与 subprocess 共享一个执行世界。切换 provider：</p>
+    <label><input type="radio" name="d11" value="local" checked> fs-local + subprocess-local</label>
+    <label><input type="radio" name="d11" value="sandbox"> fs-sandbox + 沙箱进程世界</label>
+    <div class="demo-output empty">切换 provider 试试。</div>
+  </div>
+
+  <p>
+    下图把切换前后并排画出。上层工具纹丝不动，变的只是 provider 层的几个盒子——
+    这就是「换一个 provider 等于换一个产品形态」的字面意思：本机开发机、安全沙箱机、
+    远端沙箱集群，三种部署共用同一套工具与 Definition 代码。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 660 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="换 provider 前后对照">
+      <rect x="15" y="15" width="300" height="290" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="165" y="40" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">本机执行世界</text>
+
+      <rect x="40" y="60" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="165" y="88" text-anchor="middle" style="fill:var(--pass)" font-size="11">tool-bash · tool-terminal · tool-fs · tool-lsp</text>
+
+      <rect x="40" y="130" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="165" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="11">ctx.shell · ctx.terminals · ctx.fs · ctx.subprocess</text>
+
+      <rect x="40" y="200" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="165" y="228" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">bash-local · terminal-bash · fs-local · subprocess-local</text>
+
+      <text x="165" y="280" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">你的笔记本：进程树与磁盘都在本机</text>
+
+      <line x1="165" y1="106" x2="165" y2="127" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="165,130 161,122 169,122" style="fill:var(--muted)"/>
+      <line x1="165" y1="176" x2="165" y2="197" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="165,200 161,192 169,192" style="fill:var(--muted)"/>
+
+      <rect x="345" y="15" width="300" height="290" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="495" y="40" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">远端 / 沙箱执行世界</text>
+
+      <rect x="370" y="60" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="495" y="88" text-anchor="middle" style="fill:var(--pass)" font-size="11">tool-bash · tool-terminal · tool-fs · tool-lsp（同一批包）</text>
+
+      <rect x="370" y="130" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="495" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="11">ctx.shell · ctx.terminals · ctx.fs · ctx.subprocess（同一批 seam）</text>
+
+      <rect x="370" y="200" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="495" y="222" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">fs-e2b · subprocess-e2b（或 fs-sandbox · bash-sandbox）</text>
+      <text x="495" y="238" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">背后是 ctx.e2b 或 ctx.sandbox</text>
+
+      <text x="495" y="280" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">云上微虚拟机：进程与文件都在远端，模型无感</text>
+
+      <line x1="495" y1="106" x2="495" y2="127" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="495,130 491,122 499,122" style="fill:var(--muted)"/>
+      <line x1="495" y1="176" x2="495" y2="197" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="495,200 491,192 499,192" style="fill:var(--muted)"/>
+
+      <text x="330" y="160" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">换 provider</text>
+      <line x1="318" y1="170" x2="342" y2="170" style="stroke:var(--warn)" stroke-width="2"/>
+      <polygon points="345,170 337,166 337,174" style="fill:var(--warn)"/>
+    </svg>
+    <figcaption>切换前后：工具层与 seam 层完全相同，只有 provider 层换盒子——执行世界成组搬迁。</figcaption>
+  </figure>
+
+  <h2 id="sec-depend-on-definition">11.5 扩展插件依赖 Definition，从不 import provider</h2>
+
+  <p>
+    这条规则不仅适用于工具包，也适用于所有想搭在能力之上的扩展插件。想给 bash 结果做审计？
+    监听 seam 的事件、注入 seam 的服务，别去 import <code>dsh-bash-local</code>。
+    想在每组 provider 之上加行为？写成对 Definition 的消费，让所有 provider 免费获得。
+  </p>
+
+  <p>
+    更进一步：<strong>dsh-agent-loop 本身也是可换的</strong>。在 <code>docs/capability-seams.md</code>
+    的表里，<code>ctx.agentLoop</code> 的角色是 <code>bundle</code>——「唯一的具体循环插件；
+    扩展包依赖 dsh-agent 的事件和服务，而不是依赖这个包」。turn/step 循环是产品 API 脊柱的一部分
+    （改它要更新 <code>docs/architecture.md</code>），但从插件体系的角度看，它只是组装时的一个选择：
+    扩展从不直接耦合循环实现，而是挂在 <code>agent/pre-step</code>、<code>tools/*</code>
+    这些文档化的扩展点上。第 7 章你学的所有拦截点，就是这种解耦的受益面。
+  </p>
+
+  <p>
+    由此得到一张依赖方向的速查表：
+  </p>
+  <table>
+    <thead><tr><th>写这种代码</th><th>可以依赖</th><th>禁止依赖</th></tr></thead>
+    <tbody>
+      <tr><td>新 provider</td><td>Definition 包（类型 + 基类）</td><td>其他 provider、Consumer 包</td></tr>
+      <tr><td>新 Consumer（工具、桥接）</td><td>Definition 包的 <code>ctx.&lt;key&gt;</code> 与词汇</td><td>任何具体 provider</td></tr>
+      <tr><td>能力之上的扩展插件</td><td>seam 的事件与服务（如 <code>fs/*</code> 事件闸门）</td><td>seam 的具体实现包</td></tr>
+      <tr><td>循环行为扩展</td><td><code>dsh-agent</code> 事件与服务、文档化扩展点</td><td><code>dsh-agent-loop</code> 包本身</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-seam-map">11.6 查图：docs/capability-seams.md 全景</h2>
+
+  <p>
+    你不需要背下 150 个包的依赖关系——仓库已经替你生成了全图。
+    <code>docs/capability-seams.md</code> 由 <code>scripts/gen-doc-graphs.ts</code> 生成
+    （本地跑 <span class="kbd">pnpm run gen-doc-graphs</span> 重新生成），文件头写着 <em>do not edit by hand</em>。
+    当前快照收录 <strong>56 个 <code>ctx.*</code> 服务，其中 26 个标记为 <code>seam</code></strong>，
+    其余是 <code>core</code>（脊柱服务，如 <code>ctx.sessions</code>、<code>ctx.tools</code>）或
+    <code>bundle</code>（组装点，如 <code>ctx.agentLoop</code>）。
+  </p>
+
+  <p>表格的每一行长这样（以 <code>ctx.fs</code> 为例），七列的读法：</p>
+  <table>
+    <thead><tr><th>列</th><th>含义</th><th><code>ctx.fs</code> 行的内容</th></tr></thead>
+    <tbody>
+      <tr><td><code>ctx key</code></td><td>服务键与一句话职责</td><td><code>ctx.fs</code> Filesystem provider seam</td></tr>
+      <tr><td><code>Role</code></td><td><code>seam</code> / <code>core</code> / <code>bundle</code></td><td><code>seam</code></td></tr>
+      <tr><td><code>Owner</code></td><td>Definition 所在包</td><td><code>fs</code>（<code>packages/fs/fs</code>）</td></tr>
+      <tr><td><code>Implementations</code></td><td>已知 provider 包</td><td><code>fs-local</code>、<code>fs-sandbox</code>、<code>fs-e2b</code></td></tr>
+      <tr><td><code>Direct consumers</code></td><td>直接消费服务的包</td><td><code>tool-fs</code></td></tr>
+      <tr><td><code>Companion plugins</code></td><td>不走服务注入、通过事件闸门参与的伴生插件</td><td><code>fs-observation-policy</code></td></tr>
+      <tr><td><code>Note</code></td><td>这一行的设计要点</td><td>fs-sandbox 按共享沙箱模式围栏变更；观测策略经 <code>fs/*</code> 事件闸门参与</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    三种典型查法：
+  </p>
+  <ul>
+    <li>
+      <strong>「这个 <code>ctx.foo</code> 是谁家的？」</strong>——按 <code>ctx key</code> 列扫。
+      Owner 列直接给出 Definition 包路径；表上方还有一张 mermaid 图，
+      <code>pkg_* --&gt; svc_*</code> 边是「谁实现/注入谁」，<code>svc_* --&gt; pkg_*</code> 边是「谁消费谁」。
+    </li>
+    <li>
+      <strong>「给这个能力加实现要动哪些包？」</strong>——看 Owner 与 Implementations。
+      你只写一个新 provider 包，注册到同一个服务键上；Owner 与所有 Consumer 都不用动。
+    </li>
+    <li>
+      <strong>「这个插件事先没注入服务，凭什么参与？」</strong>——查 Companion plugins 列与图里的
+      虚线边（<code>svc_fs -. event gate .-&gt; pkg_fs_observation_policy</code>）。
+      伴生插件走事件闸门而非方法注入，这是第 13 章的主角。
+    </li>
+  </ul>
+
+  <p>
+    注意这张表的生成是<strong>带完整性守卫的</strong>：角色分类写在生成脚本里，新服务如果漏了
+    implementation/consumer 归类，<code>doc-sync</code> 门禁会失败。所以它是可以当真话引用的活文档，
+    不是手维护、随时过期的那种 README。
+  </p>
+
+  <h2 id="sec-design-checklist">11.7 实战清单：加一个能力 = 设计全三角色</h2>
+
+  <p>
+    把模式收拢成可执行的清单。假设需求是「给 dsh 加一个截图能力」，按三角色逐项设计：
+  </p>
+  <ol>
+    <li>
+      <strong>Definition 包 <code>dsh-screenshot</code></strong>：一个 Cordis <code>Service</code> 子类
+      （<code>ctx.screenshot</code>），词汇类型（request / spec / result），以及任何跨实现共享的事实与
+      错误码。想清楚它是抽象类（单 provider，像 <code>ShellExecutor</code>）还是命名注册表
+      （多 provider 并存，像 <code>ctx.web</code> 的 search/fetch、<code>ctx.subagents</code> 的七种后端）。
+    </li>
+    <li>
+      <strong>至少一个 provider</strong>（如 <code>screenshot-local</code>），子类化或注册实现；
+      部署差异化的参数全部进它的 <code>Config</code>（由 cordis.yml 校验），不写死 <code>DEFAULT_*</code>。
+    </li>
+    <li>
+      <strong>至少一个 Consumer</strong>（如 <code>tool-screenshot</code>），注入
+      <code>inject: ['tools', 'screenshot', 'systemPrompt']</code>，只依赖词汇类型编程；
+      渲染意图（<code>generic</code> / <code>terminal</code> / <code>diff</code> / <code>locations</code>）
+      在设计时一次定好。
+    </li>
+    <li>
+      <strong>检查事件面</strong>：有模型可见的输入就要有 SessionEvent（model-visible ⟺ logged，
+      第 4 章的不变量）；有伴生策略就考虑事件闸门而不是再立一个服务。
+    </li>
+    <li>
+      <strong>回填全图</strong>：让 <code>gen-doc-graphs</code> 把新服务收录进
+      <code>docs/capability-seams.md</code>，同 PR 更新组 README 的包/ctx 键表。
+    </li>
+  </ol>
+
+  <p>
+    这份清单的每一项都对应仓库里一条硬约定：seam 完整性、Config 可配置、misconfiguration fails loud、
+    文档随代码走。第 24 章会把这份清单再走一遍 cookbook 级的实操。
+  </p>
+
+  <h2 id="sec-recap">11.8 本章回顾</h2>
+  <ul>
+    <li>capability seam = 可替换能力的完整切口：Service Definition（Cordis Service 子类，拥有 <code>ctx.&lt;key&gt;</code> 与词汇类型）+ Provider + Consumer，缺一不成 seam。</li>
+    <li>依赖方向：两侧都指向 Definition，Provider 与 Consumer 互不 import；探测能力用能力事实（如 <code>sandboxMode</code>），不用类型引用。</li>
+    <li><code>dsh-shell</code> 是范本：shell（Definition）/ bash-local、bash-sandbox、pwsh-local（Provider）/ tool-bash、tool-pwsh（Consumer）。</li>
+    <li>fs 与 subprocess 共享一个执行世界：换 <code>fs-e2b</code> + <code>subprocess-e2b</code>，Bash、PTY、LSP、文件工具一起搬进远端沙箱。</li>
+    <li>扩展插件依赖 Definition 与事件，不依赖具体 provider；连 <code>dsh-agent-loop</code> 也是可换的 bundle 角色。</li>
+    <li><code>docs/capability-seams.md</code> 是脚本生成的活图（56 个服务、26 个 seam），查 owner / implementations / consumers / companion 四列即可定位任何能力的结构。</li>
+    <li>加能力 = 同时设计三角色 + 事件面 + 回填全图。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>把 seam 当成「接口」：用 TypeScript <code>interface</code> 写 Definition，<code>ctx.&lt;key&gt;</code> 根本不存在，声明合并挂不上。</li>
+      <li>Consumer import 具体 provider（或反过来）——seam 裂开，换实现自由消失；探测 provider 特性请用能力事实。</li>
+      <li>词汇类型放错包：request/result 放在 provider 里，第二个 provider 出现时就得抄一份。</li>
+      <li>只写一个插件就宣称「加了一个能力」——一个角色不是 seam；至少把三角色的边界想清楚、写进组 README。</li>
+      <li>手改 <code>docs/capability-seams.md</code>——它是生成物，改 <code>scripts/gen-doc-graphs.ts</code> 再重新生成。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="11">
+    <h2>第 11 章测验</h2>
+
+    <div class="q" data-id="11-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— Service Definition 必须是 Cordis Service 子类，拥有 ctx.&lt;key&gt; 服务键与词汇类型。"
+         data-rationale="B 正确：声明合并把服务键挂到 Context 上，interface 做不到这一点，也没有生命周期与 effect 作用域。A 错在 seam 要求的是 Cordis 运行时对象而非纯类型。C 把注册表形式误当成不允许——web 就是注册表式 Definition。D 颠倒了：角色可同包（dsh-llm 兼任两角），但 seam 一词永远指完整切口。"
+         data-review="sec-what-is-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> 关于 Service Definition，下面哪个说法是对的？</div>
+      <label class="opt"><input type="radio" name="q-11-1" value="a"> A. 它可以是任意 TypeScript interface，只要字段齐全</label>
+      <label class="opt"><input type="radio" name="q-11-1" value="b"> B. 它是一个 Cordis Service 子类（抽象类或具体注册表），拥有 ctx.&lt;key&gt; 与词汇类型</label>
+      <label class="opt"><input type="radio" name="q-11-1" value="c"> C. 它只能是抽象类，具体注册表不算 Definition</label>
+      <label class="opt"><input type="radio" name="q-11-1" value="d"> D. 它必须与 Provider 同包，否则不构成 seam</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-2" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A、C、D 都成立：能力事实、共享设置命名空间、跨实现解析契约都归 Definition 所有。B 错在 bash 的超时默认值是 provider（bash-local）的 Config 字段——部署差异属于实现，不属于能力词汇。"
+         data-review="sec-shell-example">
+      <div class="prompt"><span class="qnum">Q2.</span> 在 dsh-shell 范本中，哪些东西由 Definition 包 dsh-shell 拥有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="a"> A. 能力事实 <code>sandboxMode</code></label>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="b"> B. 前台命令的超时默认值（如 120000ms）</label>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="c"> C. <code>SHELL_SETTINGS_NAMESPACE</code>（值为 bash）</label>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="d"> D. <code>parseExitStatus</code> 退出标记解析契约</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 它读取 ctx.shell.sandboxMode 能力事实，据此决定是否暴露升级参数，从不 import provider。"
+         data-rationale="C 正确：能力探测走 Definition 上的事实字段，这正是 seam 保持可替换的机制。A、B 都建立了对具体实现的 import 依赖，破坏 seam。D 不可行——TypeScript 无法从注入的抽象服务静态判断具体子类，能力必须是运行时事实。"
+         data-review="sec-shell-example">
+      <div class="prompt"><span class="qnum">Q3.</span> dsh-tool-bash 如何知道当前挂载的执行器支持沙箱升级（从而暴露 sandbox_permissions 参数）？</div>
+      <label class="opt"><input type="radio" name="q-11-3" value="a"> A. import dsh-bash-sandbox 并 instanceof 判断</label>
+      <label class="opt"><input type="radio" name="q-11-3" value="b"> B. 读取 cordis.yml 里 provider 的包名做字符串匹配</label>
+      <label class="opt"><input type="radio" name="q-11-3" value="c"> C. 读取 <code>ctx.shell.sandboxMode</code> 能力事实</label>
+      <label class="opt"><input type="radio" name="q-11-3" value="d"> D. 静态类型收窄：给沙箱执行器声明独立接口</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-4" data-type="fill"
+         data-accepted='["ctx.e2b","e2b","ctx.e2b (dsh-e2b)"]'
+         data-answer="ctx.e2b（由 dsh-e2b 拥有的共享生命周期服务）。"
+         data-rationale="fs-e2b 与 subprocess-e2b 都注入 ctx.e2b，共享同一个远端 Linux 工作树与进程世界——这就是「一个执行世界、两张本地面孔」。填 bash 或 sandbox 都不对：那是进程约束 seam，不是 E2B 的生命周期 owner。"
+         data-review="sec-provider-swap">
+      <div class="prompt"><span class="qnum">Q4.</span> 填空：fs-e2b 与 subprocess-e2b 两个 provider 共享同一个远端执行世界，因为它们都注入了 ______ 服务。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 扩展包依赖 dsh-agent 的事件和服务，不依赖 agent-loop 这个包；ctx.agentLoop 在全图里就是 bundle 角色。"
+         data-rationale="D 正确。A 与 dsh「Plugins, not loop changes」的约定直接冲突。B 错：agent-loop 是产品脊柱的一部分，改动要更新 docs/architecture.md，只是扩展不该耦合它。C 无中生有——扩展点一直可用，不需要复制循环。"
+         data-review="sec-depend-on-definition">
+      <div class="prompt"><span class="qnum">Q5.</span> 想给 turn/step 循环加行为时，dsh 的立场是什么？</div>
+      <label class="opt"><input type="radio" name="q-11-5" value="a"> A. 直接修改 dsh-agent-loop 的源码加一个分支</label>
+      <label class="opt"><input type="radio" name="q-11-5" value="b"> B. agent-loop 是不可替换的核心，扩展只能绕开它</label>
+      <label class="opt"><input type="radio" name="q-11-5" value="c"> C. 复制一份 agent-loop 改成自己的循环，再手动桥接事件</label>
+      <label class="opt"><input type="radio" name="q-11-5" value="d"> D. 挂在文档化扩展点上（agent/*、tools/* 等事件与服务），依赖 dsh-agent 而非 dsh-agent-loop 包</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-6" data-type="mcq" data-multiselect="true" data-correct='["b","d"]'
+         data-answer="B、D。"
+         data-rationale="B、D 正确：Companion plugins 列与 mermaid 图的虚线边（event gate）标出伴生插件的参与方式。A 错——伴生插件恰恰不注入服务（fs-observation-policy 注册的是 fs/* 监听器，没有服务）。C 把方向说反了：图里是 svc_fs -. event gate .-&gt; pkg_fs_observation_policy，服务的事件词汇指向监听者。"
+         data-review="sec-seam-map">
+      <div class="prompt"><span class="qnum">Q6.</span> 在 docs/capability-seams.md 里，如何识别 fs-observation-policy 这类「伴生插件」？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="a"> A. 它出现在 Direct consumers 列</label>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="b"> B. 它出现在 Companion plugins 列</label>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="c"> C. 图里从插件指向服务的是实线 inject 边</label>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="d"> D. 图里有一条标注 event gate 的虚线边连到它</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— Owner 列给出 Definition 所在包（这里是 packages/fs/fs）。"
+         data-rationale="A 正确：ctx 键定位行，Owner 列给出声明包。B 错——Implementations 是 provider 列表，不是声明处。C 错——Note 是设计要点注释。D 无此机制：图由脚本从 Cordis 声明发现，不靠人工标签。"
+         data-review="sec-seam-map">
+      <div class="prompt"><span class="qnum">Q7.</span> 想知道 <code>ctx.fs</code> 这个服务的 Definition 在哪个包，查表时看哪一列？</div>
+      <label class="opt"><input type="radio" name="q-11-7" value="a"> A. 先按 ctx key 找到行，再看 Owner 列</label>
+      <label class="opt"><input type="radio" name="q-11-7" value="b"> B. Implementations 列的第一个包</label>
+      <label class="opt"><input type="radio" name="q-11-7" value="c"> C. Note 列的链接</label>
+      <label class="opt"><input type="radio" name="q-11-7" value="d"> D. Role 列（seam/core/bundle）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 同一个执行世界：bash 执行器、PTY 后端、LSP 宿主都经 ctx.subprocess spawn，fs 工具经 ctx.fs；换掉这两个 seam 的 provider，它们整体搬迁。"
+         data-rationale="C 正确。A 错——E2B 不是 ctx.sandbox 的 backend，容器/微虚拟机/远端执行器是替换整个 seam 的 provider 组（sandbox README 明言 same-world confinement only）。B 错——没有任何工具被 fork 出远端专用版，这正是模式的意义。D 说法不成立：subagent-acp/codex/claude-code 作为 ctx.subprocess 的 consumer 也会跟着进入新执行世界。"
+         data-review="sec-provider-swap">
+      <div class="prompt"><span class="qnum">Q8.</span> 把 subprocess-local 换成 subprocess-e2b、fs-local 换成 fs-e2b 之后，Bash、terminal、LSP 工具发生了什么？</div>
+      <label class="opt"><input type="radio" name="q-11-8" value="a"> A. 它们各自新增一个 E2B 专用分支包</label>
+      <label class="opt"><input type="radio" name="q-11-8" value="b"> B. 它们降级为只读，直到换回本机 provider</label>
+      <label class="opt"><input type="radio" name="q-11-8" value="c"> C. 什么都不用改：它们消费的是 seam，执行世界整体搬到了远端</label>
+      <label class="opt"><input type="radio" name="q-11-8" value="d"> D. 只有 bash 工具可用，terminal 与 LSP 不兼容远端</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-9" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A、B、C 都是清单项：Cordis Service 子类、校验过的 Config、注入服务的 Consumer。D 错——单 provider 时恰好可以不 import 任何兄弟 provider；「至少 import 一个现有 provider」既不必要也违反解耦方向。E（若你考虑过）事件面检查属于第 4 步，但「必须有伴生策略插件」不是要求。"
+         data-review="sec-design-checklist">
+      <div class="prompt"><span class="qnum">Q9.</span> 按本章的三角色清单新增一个能力，以下哪些是必做项？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="a"> A. 一个拥有 ctx.&lt;key&gt; 与词汇类型的 Cordis Service 子类</label>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="b"> B. 至少一个 provider，部署差异走 Config 而非写死常数</label>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="c"> C. 至少一个 Consumer，只依赖 Definition 的词汇编程</label>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="d"> D. 新 provider 必须 import 一个现有 provider 复用其机制</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-10" data-type="fill"
+         data-accepted='["gen-doc-graphs","pnpm run gen-doc-graphs","scripts/gen-doc-graphs.ts"]'
+         data-answer="pnpm run gen-doc-graphs（脚本 scripts/gen-doc-graphs.ts）。"
+         data-rationale="该文件头部标注 Generated by scripts/gen-doc-graphs.ts - do not edit by hand，重新生成走 pnpm run gen-doc-graphs。手改会在 doc-sync 门禁下失效。"
+         data-review="sec-seam-map">
+      <div class="prompt"><span class="qnum">Q10.</span> 填空：docs/capability-seams.md 是生成文件，重新生成它要跑 ______。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 角色通常分包以便独立演进，但同一关注点的角色可同包；一个角色永远不等于 seam。"
+         data-rationale="B 正确（glossary 原文：a package may own multiple roles when they are one concern）。A 绝对化了分包。C 错——dsh-llm 就是兼任 Definition 与 Consumer 的例子。D 错——把 seam 降格成了单个角色。"
+         data-review="sec-what-is-seam">
+      <div class="prompt"><span class="qnum">Q11.</span> 关于「一个包与多个角色」，正确的说法是？</div>
+      <label class="opt"><input type="radio" name="q-11-11" value="a"> A. 三角色必须严格分属三个包</label>
+      <label class="opt"><input type="radio" name="q-11-11" value="b"> B. 角色会独立演进时分包；是同一关注点时可同包（如 dsh-llm 兼任 Definition 与 Consumer）</label>
+      <label class="opt"><input type="radio" name="q-11-11" value="c"> C. 一个包最多只能兼任两个角色</label>
+      <label class="opt"><input type="radio" name="q-11-11" value="d"> D. seam 一词也可以指单个角色，视上下文而定</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-12" data-type="short"
+         data-key-points='["三角色齐全：Service Definition（Cordis Service 子类 + ctx 键 + 词汇类型）、Provider、Consumer","依赖方向：两侧都指向 Definition，Provider 与 Consumer 互不 import","换 provider 的连锁效应：共享执行世界的 seam 成组搬迁，工具层零改动","docs/capability-seams.md 是脚本生成的全图，查 owner / implementations / consumers / companion"]'
+         data-answer="用三角色 + 依赖方向 + 执行世界成组搬迁 + 活图查询四点作答：Definition 是拥有 ctx 键与词汇的 Cordis Service；Provider 实现它、Consumer 注入它，两侧互不依赖；因此换 provider（如 fs-e2b + subprocess-e2b）能把 Bash/PTY/LSP/文件工具整体搬进远端；全图在 docs/capability-seams.md，由 gen-doc-graphs 生成。"
+         data-rationale="抓住这四点，你就有了在仓库里定位任何能力的地图；下一章我们沿这张地图走进最大的执行世界。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> 用自己的话说明：什么是 capability seam，为什么换一个 provider 能产生「换产品」的连锁效应，以及你以后如何查全图？</div>
+      <textarea class="short" placeholder="你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正覆盖了某个要点才勾选它——少选伤害校准，多选只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="12-execution-world.html"><strong>第 12 章 · 执行世界：shell、subprocess、terminal、sandbox</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

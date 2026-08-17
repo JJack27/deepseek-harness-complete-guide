@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 18 章 · dsh CLI 与 boot 深入 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 18 章 · CLI 与 boot</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="18">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 18 章 · 第四部分 · 产品端与协议</div>
+    <h1>dsh CLI 与 boot 深入</h1>
+    <p class="lede">
+      前面十七章里你一直在「已经组装好的运行时」里工作。本章回到起点：<span class="kbd">dsh</span>
+      这条命令本身。谁解析参数、谁加载插件、剩余的 argv 最后落到谁手里——这条启动链路是
+      apps/cli 与 packages/boot 两组包的领地。读懂它，你才能回答「我的 flag 为什么没生效」
+      和「profile 的插件树到底怎么长出来」这两类最常见的现场问题。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出 <code>apps/cli</code> 中 bin 与 args 的分工，以及 bin.ts 按模式动态 import 的理由。</li>
+      <li>默写 dsh 的入口模式（profile、一次性 headless、web 别名、plugin 管理）与各自的参数归属。</li>
+      <li>画出 profile 的分层配置树：bundle 补丁 → profile 补丁 → home 补丁 → <code>--patch</code> overlay。</li>
+      <li>描述 <code>dsh-app-boot</code> 的启动守卫（分层 env、fail-loud、watchUserPatches）与信号语义。</li>
+      <li>解释剩余 argv 如何经 <code>ctx.cmdlineArgs</code> 交还 app 插件，以及源码启动的 ESM 契约。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-entry-and-grammar">18.1 入口与参数语法：bin 与 args 的分工</h2>
+
+  <p>
+    <code>dsh</code> 的 npm 入口在 <code>apps/cli/package.json</code> 里只有一行：
+    <code>"bin": { "dsh": "lib/bin.js" }</code>。安装形态下它启动构建产物；仓库里源码形态则是
+    <code>apps/cli/src/bin.ts</code>。这个文件刻意保持「薄」：读一次自己的版本号，调用
+    <code>parseDshArgs</code> 解析 argv，然后按解析出的模式<strong>动态 import</strong> 对应的
+    runner——<code>profile-boot.ts</code>、<code>plugin.ts</code> 或 <code>dump-config.ts</code>。
+  </p>
+
+  <pre><code><span class="code-key">const</span> invocation = <span class="code-fn">parseDshArgs</span>(process.argv.<span class="code-fn">slice</span>(<span class="code-key">2</span>), <span class="code-fn">readVersion</span>())
+
+<span class="code-key">switch</span> (invocation.mode) {
+  <span class="code-key">case</span> <span class="code-str">'profile'</span>: {
+    <span class="code-key">const</span> { runProfile } = <span class="code-key">await</span> <span class="code-key">import</span>(<span class="code-str">'./profile-boot.ts'</span>)
+    <span class="code-key">await</span> <span class="code-fn">runProfile</span>({ environment: <span class="code-fn">loadLayeredEnv</span>(<span class="code-str">'dsh'</span>), <span class="code-comment">/* … */</span> })
+    <span class="code-key">break</span>
+  }
+  <span class="code-comment">// plugin 与 dump-config 同样只动态 import 选中的 runner</span>
+}</code></pre>
+
+  <p>
+    动态 import 不是风格偏好，而是加载面的控制：走 <code>dsh plugin</code> 管依赖时，进程完全不需要
+    把 profile 启动链（Cordis Loader、bundle 解析、HMR watcher）拉进来。每个分发路径只加载自己用得到的
+    插件面，这正是「everything is a plugin」在进程入口处的回声。
+  </p>
+
+  <p>
+    参数语法的唯一属主是 <code>apps/cli/src/args.ts</code> 的 <code>parseDshArgs</code>。它基于
+    commander，但配置得非常克制：<code>helpOption(false)</code>（launcher 不拥有
+    <span class="kbd">-h</span>）、<code>allowUnknownOption()</code> 加 <code>passThroughOptions()</code>
+    加 <code>enablePositionalOptions()</code>。三者合起来表达一条位置规则：<strong>launcher 的
+    flag 在最前，第一个它不认识的 token 就是 app 参数的开始</strong>。所以
+    <code>dsh --profile web --port 8080</code> 里 <code>--port</code> 属于 web app，
+    <code>dsh --profile web --help</code> 打印的是 web app 的帮助；只有不带 profile 的裸
+    <code>dsh --help</code> 才打印 launcher 自己的帮助。另一个细节：<code>--patch</code>
+    用可重复的单值收集器实现，绝不做成变长参数——变长的 <code>--patch</code> 会把后面的 app
+    参数整口吞掉。
+  </p>
+
+  <h2 id="sec-modes">18.2 四种入口模式</h2>
+
+  <p>
+    <code>args.ts</code> 把一次调用解析成三种 invocation（profile / dump-config / plugin），
+    加上 <code>web</code> 这个硬编码别名，构成产品文档里的四种入口模式：
+  </p>
+
+  <table>
+    <thead><tr><th>命令</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh --profile &lt;name&gt;</code></td><td>启动 <code>$DSH_HOME/profiles/&lt;name&gt;</code> 下的 profile，argv 里 launcher flag 之后的部分原样交给 app。</td></tr>
+      <tr><td><code>dsh --profile headless "任务"</code></td><td>一次性执行：创建一个全新持久化 Agent，提交任务，等到静默，flush 会话，打印最终回答后退出；turn 以 <code>completed</code> 结束则退出码 0，否则 1。</td></tr>
+      <tr><td><code>dsh web</code></td><td><code>--profile web</code> 的硬编码别名；后面的 flag 属于 web app（<code>--host</code>、<code>--port</code>、可重复的 <code>--trusted-host</code>）。</td></tr>
+      <tr><td><code>dsh plugin --profile &lt;name&gt; &lt;pnpm args&gt;</code></td><td>在 profile 目录里把参数原样转发给 pnpm：安装、卸载、查询外部插件。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    两个细节值得记。第一，<code>web</code> 与 <code>headless</code> profile 首次使用时从随产品
+    分发的模板自动初始化（web 是 base + web-app，headless 是 base + headless）；其他名字的
+    profile 缺失时 fail-loud，提示你先跑 <code>dsh plugin --profile &lt;name&gt; add …</code>。
+    第二，headless 的一次性运行是「纯核」路径：它不挂 ApiProxy、不挂 Host、不开 HTTP 端口、
+    不加载 Web runtime 与浏览器 client——成功的运行 stderr 一字不出。
+  </p>
+
+  <p>
+    <code>dsh plugin</code> 子命令本身也值得看一眼：<code>add</code> 相对路径（如
+    <span class="kbd">.</span>、<code>../plugin</code>）会先锚定到调用目录，所以在插件源码检出里
+    <code>dsh plugin --profile tui add .</code> 安装的是这份检出而不是 profile 里的什么。每次成功
+    运行后，<code>dsh.profile.bundles</code> 会和实际安装状态对账：装上的包若声明了
+    <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code> 就进入层叠栈，卸载的依赖
+    离开栈。
+  </p>
+
+  <p>
+    最后是两个「看树不启动」的诊断模式：<code>--dump-config</code> 打印组合完成的配置树
+    （含用户层与 <code>--patch</code>），<code>--dump-default-config</code> 只打 bundle 层。dump
+    不运行任何 app 命令行 provider，因此它展示的是 app 参数被解析<strong>之前</strong>的树——
+    这也是它拒绝携带 app 参数的原因：打印一棵和同参数实际启动不一致的树只会误导。
+  </p>
+
+  <h2 id="sec-profile-layers">18.3 profile 与分层配置树</h2>
+
+  <p>
+    profile 是一个目录：<code>$DSH_HOME/profiles/&lt;name&gt;</code>（<code>$DSH_HOME</code>
+    未设时是 <code>~/.dsh</code>）。目录里三样东西各司其职：
+  </p>
+
+  <ul>
+    <li><code>package.json</code> —— 树外插件依赖，外加 profile 清单 <code>dsh.profile</code>，其中有有序的 <code>bundles</code> 列表；</li>
+    <li><code>cordis.patch.yml</code> —— 你自己的补丁层；</li>
+    <li><code>cordis.yml</code> —— 根配置，内容是一个空 entry 列表，每次启动都会重写。</li>
+  </ul>
+
+  <p>
+    整棵插件树是在空根上<strong>贴补丁贴出来的</strong>。应用顺序固定：
+  </p>
+
+  <ol>
+    <li><code>dsh.profile.bundles</code> 里每个 bundle 的补丁，按列表顺序（盒内 bundle
+        <code>@deepseek-ai/dsh-base</code>、<code>@deepseek-ai/dsh-web-app</code>、
+        <code>@deepseek-ai/dsh-headless</code> 先从 dsh 安装处解析，再从 profile 自己的
+        node_modules 解析）；</li>
+    <li>profile 自己的 <code>cordis.patch.yml</code>；</li>
+    <li>home 级的 <code>$DSH_HOME/cordis.patch.yml</code>（机器级偏好，对每个 profile 生效，所以排在 per-profile 层之上）；</li>
+    <li>每个 <code>--patch</code> overlay，按 argv 顺序。</li>
+  </ol>
+
+  <p>
+    后层按行获胜，而「获胜」的方式是<strong>整体替换</strong>目标行的 <code>config</code>，
+    不是深合并——想保留的字段要在补丁里重述一遍。补丁指向不存在的行 id 只是 stderr 警告；
+    空文件或只有注释的文件会抛错（它解析不出任何列表；想禁用这一层写 <code>[]</code>）。
+    另外有一个环境开关会变成最顶层的补丁：任何非空的
+    <code>DSH_TELEMETRY_DISABLED</code>（哪怕是 <code>0</code> 或 <code>false</code>）都会生成
+    一条把 telemetry 行 disable 掉的 patch——隐私开关宁可误关，不可误开。
+  </p>
+
+  <p>
+    还有两个基础设施工件让树外插件能被裸名字解析：<code>healProfilesModuleFallback</code>
+    每次启动维护 <code>$DSH_HOME/profiles/node_modules</code> 这个扁平目录（安装所依赖的每个包
+    一条符号链接），让任何 profile 里的裸插件名都能走 Node 的普通父目录查找。
+  </p>
+
+  <h2 id="sec-app-boot">18.4 app-boot：启动链路与 fail-loud 守卫</h2>
+
+  <p>
+    <code>packages/boot/app-boot</code>（<code>@deepseek-ai/dsh-app-boot</code>）是共享的启动
+    胶水，<code>dsh</code> 与 <code>dsh-acp-demo</code> 两个 bin 都靠它，使 loader 失败行为只有
+    一个属主。一次 <code>runProfile</code> 的关键序列：
+  </p>
+
+  <ol>
+    <li><code>loadLayeredEnv('dsh')</code> 冻结环境快照：继承环境 &gt; 调用目录的 <code>.env</code> &gt; Harness home 的 <code>.env</code>，拒绝 bootstrap-only 的文件变量，接受的值落进 <code>process.env</code>；</li>
+    <li><code>composeProfile</code> 按上节顺序叠出补丁栈（每层用 <code>structuredClone</code> 克隆——补丁里的 <code>insert</code> 行是按引用推进树的，复用同一解析对象会把用户覆盖烤死在内存里的 bundle 行上）；</li>
+    <li><code>installFailLoud</code> 装上守卫：启动期或之后的 Loader 拒绝变成一行带标签的 stderr 加 <code>exit(1)</code>，退出前先 await 一次有界的 release 清理（终端持有面先恢复终端再死）；</li>
+    <li><code>boot()</code> 创建根 context，向 Loader 的 <code>!!js</code> 表达式暴露 <code>dshHomePath()</code>，安装 vendored Cordis Loader，在<strong>任何配置树条目挂载之前</strong>运行 prepare 钩子——launcher 在这里提供环境快照服务和 <code>provideCmdline</code>——然后挂载并等待整棵 include 树，断言每个启用的 entry 既 loaded 又 activated；失败则销毁半个 context 再抛带 bin 名的错。</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 880 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="dsh 启动时序图">
+      <rect x="10" y="30" width="120" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="70" y="58" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">argv</text>
+      <text x="70" y="76" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">dsh --profile web --port 8080</text>
+
+      <line x1="130" y1="65" x2="165" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="165,65 157,61 157,69" style="fill:var(--muted)"/>
+
+      <rect x="165" y="30" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="2"/>
+      <text x="240" y="53" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">launcher</text>
+      <text x="240" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">args.ts 只解析</text>
+      <text x="240" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">--profile/--patch/dump</text>
+
+      <line x1="315" y1="65" x2="350" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="350,65 342,61 342,69" style="fill:var(--muted)"/>
+
+      <rect x="350" y="30" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="2"/>
+      <text x="425" y="53" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">bin.ts</text>
+      <text x="425" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">动态 import</text>
+      <text x="425" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">选中的模式 runner</text>
+
+      <line x1="500" y1="65" x2="535" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="535,65 527,61 527,69" style="fill:var(--muted)"/>
+
+      <rect x="535" y="16" width="335" height="98" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="702" y="36" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">分层配置树（空根上依序贴补丁）</text>
+      <rect x="700" y="44" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--muted)"/>
+      <text x="776" y="55" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">--patch overlays</text>
+      <rect x="700" y="61" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--muted)"/>
+      <text x="776" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">$DSH_HOME/cordis.patch.yml</text>
+      <rect x="700" y="78" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--muted)"/>
+      <text x="776" y="89" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">profile/cordis.patch.yml</text>
+      <rect x="700" y="95" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--pass)"/>
+      <text x="776" y="106" text-anchor="middle" style="fill:var(--pass)" font-size="9">bundle 补丁（bundles 顺序）</text>
+
+      <line x1="425" y1="100" x2="425" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="425,140 421,132 429,132" style="fill:var(--muted)"/>
+
+      <rect x="290" y="140" width="270" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="425" y="163" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">app-boot: boot()</text>
+      <text x="425" y="181" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">loadLayeredEnv · installFailLoud · vendored Loader</text>
+
+      <line x1="425" y1="198" x2="425" y2="238" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="425,238 421,230 429,230" style="fill:var(--muted)"/>
+
+      <rect x="290" y="238" width="270" height="66" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="425" y="261" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Cordis 插件树（根 ctx）</text>
+      <text x="425" y="279" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">prepare 钩子先行提供：</text>
+      <text x="425" y="293" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">环境快照 + provideCmdline</text>
+
+      <rect x="610" y="238" width="260" height="66" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="740" y="261" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">app 插件认领剩余 argv</text>
+      <text x="740" y="279" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">ctx.cmdlineArgs 快照 → 自家服务</text>
+      <text x="740" y="293" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">['--port','8080'] → webStartup</text>
+
+      <line x1="560" y1="271" x2="610" y2="271" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="610,271 602,267 602,275" style="fill:var(--muted)"/>
+
+      <text x="70" y="180" style="fill:var(--fg-dim)" font-size="10" font-style="italic">watchUserPatches：</text>
+      <text x="70" y="194" style="fill:var(--fg-dim)" font-size="10" font-style="italic">两层 cordis.patch.yml</text>
+      <text x="70" y="208" style="fill:var(--fg-dim)" font-size="10" font-style="italic">编辑后事务性重组合</text>
+      <line x1="170" y1="180" x2="288" y2="169" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4,4"/>
+      <polygon points="288,169 279,167 281,175" style="fill:var(--muted)"/>
+    </svg>
+    <figcaption>dsh 一次 profile 启动的链路：launcher 只认自己的 flag，配置树在空根上分层贴补丁，Cordis Loader 挂出插件树，剩余 argv 经 ctx.cmdlineArgs 交还 app 插件。</figcaption>
+  </figure>
+
+  <p>
+    启动完成后还有两件常驻事。第一，<strong>config-only HMR</strong>：<code>watchUserPatches</code>
+    把 profile 层和 home 层两个 <code>cordis.patch.yml</code> 注册到 HMR 服务，每次编辑都事务性地
+    重组合整份补丁列表——重组合时 bundle 层始终在下、overlay 始终在上，用户编辑永远无法把它们挤开；
+    读或解析失败时上一棵好树继续运行。一次性 surface（headless）则通过自己的有界 shutdown 把
+    watcher 销毁。第二，<strong>信号语义</strong>：SIGTERM 是 supervisor 的普通停止请求，所有面
+    退出码 0；SIGINT 是用户打断，退出码 130；插件树的清理有五秒预算，第二个信号直接强制退出。
+  </p>
+
+  <h2 id="sec-cmdline">18.5 剩余 argv 的归宿：cmdlineArgs 与斜杠命令</h2>
+
+  <p>
+    launcher 对 app 参数的全部责任在 <code>provideCmdline</code> 这一步就结束了。它向树提供两样
+    东西（<code>packages/boot/cmdline</code>，<code>@deepseek-ai/dsh-cmdline</code>）：
+    <code>ctx.cmdlineArgs</code>——一次调用的内部参数，<code>get()</code> 返回不可变快照（
+    <code>dsh --profile tui --resume abc</code> 得到 <code>['--resume','abc']</code>）；以及
+    <code>ctx.appExit</code>——有界的进程退出请求，接到 launcher 的 shutdown 控制器上。
+  </p>
+
+  <p>
+    之后是<strong>app 插件的事</strong>。任何插件都可以 inject <code>cmdlineArgs</code>、解析它、
+    发布一个普通服务；<code>parseCmdline(ctx, program)</code> 只是一个 commander 适配器。关键的
+    排序机制在 Loader 一侧：一行的 <code>!!js</code> 插值会推迟到该行声明的注入<strong>全部激活
+    之后</strong>才执行，所以 web bundle 能这样写：
+  </p>
+
+  <pre><code>- id: webserver
+  name: <span class="code-str">'@deepseek-ai/dsh-host-webserver'</span>
+  inject: [webStartup]
+  config:
+    port: <span class="code-str">!!js</span> ctx.webStartup.port ?? <span class="code-key">3080</span></code></pre>
+
+  <p>
+    Cordis 已经在 Loader 询问 webserver 的 config 之前把 <code>webStartup</code> 填好，于是
+    <strong>flag 赢过写在旁边的值</strong>。注意这条优先级依赖行里保留那个表达式：用户补丁若把整段
+    <code>config</code> 换成字面量，运行时读取就没了（第 18.3 节的整体替换语义）。快照是共享
+    只读的：多个插件可以各自解析同一份 argv 而互不干扰，没有读取者的 profile 则干脆忽略自己的
+    app 参数。
+  </p>
+
+  <p>
+    别把 argv 和<strong>斜杠命令</strong>混为一谈。后者发生在会话内部：用户在输入框敲
+    <span class="kbd">/compact</span>，Web 端经 <code>command.execute</code> RPC 交给 host 的
+    <code>ctx.commands</code> 注册表处理——这是第 16 章讲过的人类协作面，与进程启动参数无关。
+  </p>
+
+  <h2 id="sec-source-launch">18.6 源码启动契约：tsx 的 ESM hook</h2>
+
+  <p>
+    仓库根的 <code>pnpm dsh &lt;args…&gt;</code> 不经过构建：<code>package.json</code> 的脚本用
+    <code>node --import tsx/esm</code> 直接启动 <code>apps/cli/src/bin.ts</code>，并转发全部参数。
+    这带来一条必须遵守的契约：CLI 源码启动路径触及的每个模块都必须是 ESM——不能只有 CJS 导出。
+    原因是引擎版本范围内 Node 的原生 TypeScript 模式不可用，tsx 的 ESM-only hook 是唯一的桥；
+    完整的决策记录在
+    <code>.agents/notes/implemented/architecture/2026-07-29-dsh-source-launch-tsx-esm.md</code>。
+  </p>
+
+  <p>
+    实务上这条契约影响你两件事：给 CLI 会触及的包加依赖时，确认它在 ESM 下可加载；排查
+    <code>pnpm dsh</code> 报的模块解析错误时，先想「缺的是 Typert 主机工件还是前端产物」——
+    缺 Typert 工件会以模块解析错误炸掉 profile 启动且不带构建提示，缺前端或 client 插件 bundle
+    则启动时明确提示跑 <code>pnpm run build</code>。安装形态没有这一切：它直接启动构建好的
+    <code>apps/cli/lib/bin.js</code>。
+  </p>
+
+  <h2 id="sec-recap">18.7 本章回顾</h2>
+  <ul>
+    <li><code>apps/cli</code> 里 <code>args.ts</code> 拥有参数语法，<code>bin.ts</code> 按模式动态 import runner；launcher 的 flag 在最前，第一个不认识的 token 起是 app 参数。</li>
+    <li>四种模式：<code>--profile</code> 启动、headless 一次性、<code>web</code> 别名、<code>plugin</code> 转发 pnpm；<code>--dump-config</code> 看树不启动。</li>
+    <li>profile 树在空根上分层贴补丁：bundle 层（bundles 顺序）→ profile 层 → home 层 → <code>--patch</code>；后层整体替换目标行 config，不深合并。</li>
+    <li><code>dsh-app-boot</code> 负责 env 快照、fail-loud 守卫、vendored Loader 启动与两层用户补丁的 config-only HMR；SIGTERM 退出 0、SIGINT 退出 130。</li>
+    <li>剩余 argv 经 <code>ctx.cmdlineArgs</code>（不可变快照）交还 app 插件；Loader 等注入激活后才插值 <code>!!js</code>，所以 flag 赢过旁边写死的值；斜杠命令走 <code>ctx.commands</code>，与 argv 无关。</li>
+    <li>源码启动走 tsx 的 ESM hook（<code>node --import tsx/esm</code>），触及模块必须 ESM。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>把 <code>--port</code>、<code>--resume</code> 当成 launcher 的 flag——它们属于被启动的 app；launcher 只认 <code>--profile</code>、<code>--patch</code> 和两个 dump。</li>
+      <li>以为补丁是深合并——它整体替换目标行的 <code>config</code>，保留字段要重述；把带 <code>!!js</code> 表达式的 config 换成字面量会让 flag 失效。</li>
+      <li>在空 <code>cordis.patch.yml</code> 里只写注释——解析为空会抛错；禁用该层写 <code>[]</code>。</li>
+      <li>期望 <code>dsh --profile web --help</code> 打印 launcher 帮助——没有 profile 接手时的裸 <code>dsh --help</code> 才是 launcher 的。</li>
+      <li>给 CLI 源码路径引入 CJS-only 模块——tsx ESM hook 下直接不可加载。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="18">
+    <h2>第 18 章 测验</h2>
+
+    <div class="q" data-id="18-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 第一个 launcher 不认识的 token 之后的参数原样交给被启动的 app，--port 是 web app 的 flag。"
+         data-rationale="B 正确：launcher 只认 --profile/--patch/dump，其余 argv 经 ctx.cmdlineArgs 交给 app 插件。A 错，launcher 不知道任何 app flag。C 错，这不是错误而是设计好的归属。D 错，dump 模式才拒绝 app 参数，profile 模式照常启动。"
+         data-review="sec-cmdline">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>dsh --profile web --port 8080</code> 里的 <code>--port</code> 由谁解析？</div>
+      <label class="opt"><input type="radio" name="q-18-1" value="a"> A. launcher 的 args.ts</label>
+      <label class="opt"><input type="radio" name="q-18-1" value="b"> B. web app 注入 <code>cmdlineArgs</code> 的插件</label>
+      <label class="opt"><input type="radio" name="q-18-1" value="c"> C. 没人解析，这条命令会报 usage error</label>
+      <label class="opt"><input type="radio" name="q-18-1" value="d"> D. 只有配合 --dump-config 时才有人解析</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 每个分发路径只动态 import 选中的模式 runner，不把用不到的插件面拉进进程。"
+         data-rationale="C 正确：bin.ts 对 profile-boot/plugin/dump-config 逐一 await import，是加载面控制。A 错，commander 早已在静态依赖里。B 错，模块加载失败同样 fail-loud。D 错，解析一次是 args.ts 的职责，与动态 import 无关。"
+         data-review="sec-entry-and-grammar">
+      <div class="prompt"><span class="qnum">Q2.</span> bin.ts 为什么按模式动态 import 各 runner？</div>
+      <label class="opt"><input type="radio" name="q-18-2" value="a"> A. 为了延迟加载 commander，加快 --help</label>
+      <label class="opt"><input type="radio" name="q-18-2" value="b"> B. 为了让解析错误可以静默重试</label>
+      <label class="opt"><input type="radio" name="q-18-2" value="c"> C. 为了让每个模式只加载自己需要的插件面</label>
+      <label class="opt"><input type="radio" name="q-18-2" value="d"> D. 为了把参数解析推迟到 runner 内部做第二遍</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-3" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A/B/C 都是 launcher 自己的 flag。D 的 --port 属于 web app；E 的 --trusted-host 同样是 web app 的 flag（经 --trusted-host 重复传入 trustedHosts）。"
+         data-review="sec-entry-and-grammar">
+      <div class="prompt"><span class="qnum">Q3.</span> 下列哪些是 launcher 自己拥有的 flag？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="a"> A. <code>--profile &lt;name&gt;</code></label>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="b"> B. <code>--patch &lt;path&gt;</code>（可重复）</label>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="c"> C. <code>--dump-config</code></label>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="d"> D. <code>--port</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-4" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— bundle 补丁按 bundles 顺序、profile 层、home 层、--patch overlay 依序应用，后层按行获胜。"
+         data-rationale="D 正确：这是 profile 树的固定层次。A 把 home 层放最低，错——机器级偏好要压过 per-profile 层。B 把用户层垫在 bundle 之下，用户编辑会改不动 bundle 默认。C 把 overlay 提到用户层之前，--patch 不再是最顶层。"
+         data-review="sec-profile-layers">
+      <div class="prompt"><span class="qnum">Q4.</span> profile 的补丁层按什么顺序应用？</div>
+      <label class="opt"><input type="radio" name="q-18-4" value="a"> A. home 层 → bundle 层 → profile 层 → --patch</label>
+      <label class="opt"><input type="radio" name="q-18-4" value="b"> B. profile 层 → bundle 层 → home 层 → --patch</label>
+      <label class="opt"><input type="radio" name="q-18-4" value="c"> C. --patch → home 层 → profile 层 → bundle 层</label>
+      <label class="opt"><input type="radio" name="q-18-4" value="d"> D. bundle 层（bundles 顺序）→ profile 层 → home 层 → --patch</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-5" data-type="fill" data-accepted='["dsh.profile","dsh.profile 文件"]'
+         data-answer="dsh.profile（profile 的 package.json 里的清单字段/文件）。"
+         data-rationale="profile 目录的 package.json 携带 dsh.profile 清单，其中有有序的 bundles 列表；bundle 名先从 dsh 安装处解析，再从 profile 自己的 node_modules 解析。"
+         data-review="sec-profile-layers">
+      <div class="prompt"><span class="qnum">Q5.</span> 填空：profile 目录里有插件依赖加一份清单——那份带有序 <code>bundles</code> 列表的清单是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— id 定向补丁整体替换目标行的 config，保留的字段必须在补丁里重述。"
+         data-rationale="B 正确：替换是整段的，不逐键合并。A 错，深合并正是被明确排除的语义。C 错，指向未知 id 只是 stderr 警告。D 错，补丁可以 insert 新行，也可以带 !!js 表达式。"
+         data-review="sec-profile-layers">
+      <div class="prompt"><span class="qnum">Q6.</span> 一条 id 定向补丁命中已存在的行时，替换的粒度是什么？</div>
+      <label class="opt"><input type="radio" name="q-18-6" value="a"> A. 深合并：只覆盖出现的键</label>
+      <label class="opt"><input type="radio" name="q-18-6" value="b"> B. 整体替换该行的 config，保留字段需重述</label>
+      <label class="opt"><input type="radio" name="q-18-6" value="c"> C. 抛错，除非该行同时出现在 bundles 里</label>
+      <label class="opt"><input type="radio" name="q-18-6" value="d"> D. 只允许插入新行，不允许改旧行</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 两个用户层 cordis.patch.yml 的有效编辑会被事务性重组合，bundle 层在下、overlay 在上，用户编辑挤不开它们。"
+         data-rationale="A 正确：watchUserPatches 提供 config-only HMR。B 错，是两个用户层文件被监视。C 错，模块级热重载是另一回事（client 侧 HMR 属第 19 章）。D 错，重组合在用户层上保留应用序，不是简单重放。"
+         data-review="sec-app-boot">
+      <div class="prompt"><span class="qnum">Q7.</span> <code>watchUserPatches</code> 提供的能力是？</div>
+      <label class="opt"><input type="radio" name="q-18-7" value="a"> A. profile 与 home 两份 <code>cordis.patch.yml</code> 的 config-only 热重载</label>
+      <label class="opt"><input type="radio" name="q-18-7" value="b"> B. 只有 home 层文件的热重载</label>
+      <label class="opt"><input type="radio" name="q-18-7" value="c"> C. 浏览器 client 插件的模块热替换</label>
+      <label class="opt"><input type="radio" name="q-18-7" value="d"> D. 把用户编辑当作最底层补丁重放</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— SIGTERM 是 supervisor 的普通停止请求，各面退出码 0；SIGINT 是用户打断，退出码 130。"
+         data-rationale="C 正确。A/D 把两个信号换了或都当 0。B 错，SIGINT 报 130。注意第二个信号才强制立即退出，第一个信号给插件树最多五秒清理。"
+         data-review="sec-app-boot">
+      <div class="prompt"><span class="qnum">Q8.</span> SIGTERM 与 SIGINT 的退出码分别是？</div>
+      <label class="opt"><input type="radio" name="q-18-8" value="a"> A. 130 与 0</label>
+      <label class="opt"><input type="radio" name="q-18-8" value="b"> B. 0 与 0</label>
+      <label class="opt"><input type="radio" name="q-18-8" value="c"> C. 0 与 130</label>
+      <label class="opt"><input type="radio" name="q-18-8" value="d"> D. 1 与 130</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-9" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 正确：dump 是 boot-free 的，不运行任何 app 命令行 provider，所以要拒绝 app 参数；两个 dump 互斥；默认 dump 只含 bundle 层。C 错——正因为不运行 provider，dump 展示的是 app 参数解析之前的树，无法展示 flag 的效果。"
+         data-review="sec-modes">
+      <div class="prompt"><span class="qnum">Q9.</span> 关于配置 dump，下列说法正确的是？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="a"> A. <code>--dump-config</code> 与 <code>--dump-default-config</code> 互斥</label>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="b"> B. dump 不接受任何 app 参数，带了就报错</label>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="c"> C. dump 会运行 app 命令行 provider，因此能看到 flag 生效后的值</label>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="d"> D. <code>--dump-default-config</code> 只打印 bundle 层，且不接受 --patch</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 行的 !!js 插值被 Loader 推迟到其声明的注入全部激活之后，因此 flag 值赢过写在旁边的字面量。"
+         data-rationale="B 正确：webStartup 服务已就位，Loader 才求值 webserver 行的 config。A 错，文件写入仍由配置层负责。C 错，flag 与 YAML 值不拼加。D 错，注入是激活排序问题，不是启动顺序错误。"
+         data-review="sec-cmdline">
+      <div class="prompt"><span class="qnum">Q10.</span> 为什么 <code>port: !!js ctx.webStartup.port ?? 3080</code> 里 flag 能赢过旁边的 3080？</div>
+      <label class="opt"><input type="radio" name="q-18-10" value="a"> A. 因为 YAML 里的 3080 只是注释</label>
+      <label class="opt"><input type="radio" name="q-18-10" value="b"> B. 因为 Loader 等该行声明的注入激活后才插值表达式</label>
+      <label class="opt"><input type="radio" name="q-18-10" value="c"> C. 因为 flag 会和 3080 做字符串拼接</label>
+      <label class="opt"><input type="radio" name="q-18-10" value="d"> D. 因为 app 插件总在所有配置行之后启动</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-11" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— node --import tsx/esm 直接跑 apps/cli/src/bin.ts；该路径触及的模块必须 ESM（无 CJS-only 导出）。"
+         data-rationale="C 正确：引擎版本范围内 Node 原生 TS 模式不可用，tsx 的 ESM-only hook 是唯一的桥。A/B 错，那是安装形态与构建形态。D 错，源码路径同样缺 Typert 主机工件时以模块解析错误失败。"
+         data-review="sec-source-launch">
+      <div class="prompt"><span class="qnum">Q11.</span> 仓库根的 <code>pnpm dsh</code> 如何启动 CLI？</div>
+      <label class="opt"><input type="radio" name="q-18-11" value="a"> A. 启动构建好的 apps/cli/lib/bin.js</label>
+      <label class="opt"><input type="radio" name="q-18-11" value="b"> B. 先全量 pnpm run build 再启动</label>
+      <label class="opt"><input type="radio" name="q-18-11" value="c"> C. 用 tsx 的 ESM hook（node --import tsx/esm）直接跑 apps/cli/src/bin.ts</label>
+      <label class="opt"><input type="radio" name="q-18-11" value="d"> D. 用 Node 的原生 TypeScript strip 模式</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-12" data-type="short"
+         data-key-points='["launcher 的 flag 在最前，第一个不认识的 token 起是 app 参数，原样保留","ctx.cmdlineArgs 是共享的不可变快照，多个插件可各自解析","app 插件解析后发布普通服务，行配置经 !!js 注入该服务，Loader 等注入激活后才插值","flag 赢过写在旁边的值依赖行里保留表达式；整体替换 config 成字面量会失去该效果","斜杠命令走会话内的 ctx.commands，与进程 argv 无关"]'
+         data-answer="launcher 只解析 --profile/--patch/dump，其余 argv 原样交给树：provideCmdline 提供 ctx.cmdlineArgs（不可变快照）和 ctx.appExit；app 插件 inject cmdlineArgs、解析出自家 flag 家族并发布服务；配置行通过 inject 加 !!js 表达式读取该服务，Loader 等注入激活后才插值，所以 flag 赢过旁边写死的值。斜杠命令则完全不在 argv 世界里，走会话内的 ctx.commands。"
+         data-rationale="抓住了「位置分界 + 不可变快照 + 注入驱动的插值排序」三件事，这条链路就通了。"
+         data-review="sec-cmdline">
+      <div class="prompt"><span class="qnum">Q12.</span> 用自己的话解释：「launcher 只解析自己的 flag」这条设计如何让任意 profile 里的 app 插件拥有自己的命令行？</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="19-web-ui.html"><strong>第 19 章 · Web UI 架构</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 24 章 · 扩展实战：从 cookbook 写一个插件 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 24 章 · 扩展实战</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="24">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 24 章 · 第五部分 · 工程与贡献</div>
+    <h1>扩展实战：从 cookbook 写一个插件</h1>
+    <p class="lede">
+      前二十三章你读懂了 dsh；本章你动手改它。我们以「给 dsh 加一个新能力」为主线，把
+      docs/cookbook/ 走三遍：加一个包、加一个工具、加一个 LLM 适配器——每遍都摘真实代码骨架、
+      标注出处、点出会咬人的契约。最后看 out-of-tree 插件如何用一份 insert overlay 叠在已发布的
+      组合之上，连仓库都不用进。这一章结束时，你应该有信心提交自己的第一个扩展 PR。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>按 docs/cookbook/adding-a-package.md 的清单建一个 <code>@deepseek-ai/dsh-&lt;name&gt;</code> 包并通过约束门禁。</li>
+      <li>用 <code>defineTool</code> 写一个满足 execute() 契约与渲染意图纪律的模型可见工具。</li>
+      <li>写一个满足协议义务（usage 先于 finish、两条错误路径、<code>exec.signal</code>）的 <code>LlmAdapter</code>。</li>
+      <li>解释 <code>cordis.yml</code> 的 <code>!!js</code> 边界与 bare 插件的 dependencies 要求，并用 insert overlay 叠加 out-of-tree 能力。</li>
+      <li>为每种扩展点名它的验证义务（同一 PR 的 keyless 快照、examples 的双 smoke）。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-main-thread">24.1 实战主线：先选扩展点，再写代码</h2>
+
+  <p>
+    extension-cookbook.md 的「feature → mechanism map」是每个扩展的入口：仓库里每个产品特性
+    都映射到某个文档化扩展点上的一条监听器——这是微内核主张的可检验形态，<strong>没有任何一行
+    改 loop</strong>。动手前先在这张表里找到你的位置：想加模型工具就走 <code>ctx.tools</code>，
+    想改提示词就走 <code>ctx.systemPrompt.section()</code>，想接新供应商就走
+    <code>ctx.llm.registerAdapter</code>。选错扩展点，后面所有代码都在还债。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="扩展点选择图">
+      <rect x="270" y="196" width="240" height="76" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="390" y="226" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">文档化扩展点</text>
+      <text x="390" y="248" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">没有一行改 agent-loop</text>
+
+      <line x1="150" y1="56" x2="270" y2="216" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="32" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="50" text-anchor="middle" style="fill:var(--fg)" font-size="12">加一个模型工具</text>
+      <text x="85" y="68" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">ctx.tools.register</text>
+
+      <line x1="630" y1="56" x2="510" y2="216" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="560" y="32" width="200" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="660" y="50" text-anchor="middle" style="fill:var(--fg)" font-size="12">接一个新模型供应商</text>
+      <text x="660" y="68" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">ctx.llm.registerAdapter</text>
+
+      <line x1="140" y1="140" x2="270" y2="232" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="116" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="134" text-anchor="middle" style="fill:var(--fg)" font-size="12">改 system prompt</text>
+      <text x="85" y="152" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">systemPrompt.section</text>
+
+      <line x1="640" y1="140" x2="510" y2="232" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="560" y="116" width="200" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="660" y="134" text-anchor="middle" style="fill:var(--fg)" font-size="12">拦 / 包 / 看工具调用</text>
+      <text x="660" y="152" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">tools/pre-execute | execute | result</text>
+
+      <line x1="130" y1="330" x2="270" y2="250" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="306" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="324" text-anchor="middle" style="fill:var(--fg)" font-size="12">做一个 UI</text>
+      <text x="85" y="342" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">session/event + followup</text>
+
+      <line x1="640" y1="330" x2="510" y2="250" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="545" y="306" width="215" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="652" y="324" text-anchor="middle" style="fill:var(--fg)" font-size="12">定时 / 后台驱动一轮</text>
+      <text x="652" y="342" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">followup(source: cron) / ctx.jobs</text>
+
+      <line x1="150" y1="420" x2="270" y2="258" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="396" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="414" text-anchor="middle" style="fill:var(--fg)" font-size="12">换执行环境</text>
+      <text x="85" y="432" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">fs / subprocess provider</text>
+
+      <line x1="630" y1="420" x2="510" y2="258" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="545" y="396" width="215" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="652" y="414" text-anchor="middle" style="fill:var(--fg)" font-size="12">Web Chat 业务节点</text>
+      <text x="652" y="432" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">ConversationNodeDefinition</text>
+    </svg>
+    <figcaption>扩展点选择图（依据 extension-cookbook.md 的 feature → mechanism map）：想加什么，先找对应的注册表、事件或 seam；没有一条路通向 agent-loop 本体。</figcaption>
+  </figure>
+
+  <p>
+    本章三遍实战对应三条最常见的路径：<strong>加一个包</strong>（新能力需要新 home 时）、
+    <strong>加一个工具</strong>（模型可见的新能力）与 <strong>加一个 LLM 适配器</strong>（新供应商）。
+    每遍都以同一条收尾：验证义务。examples/AGENTS.md 要求每个 example 配双 smoke——keyless 的
+    「经真实 Loader 启动 cordis.yml、驱动、断言输出与干净退出」（专抓 hand-mounted 测试漏掉的
+    Loader 导出错误，postmortem 0001 的教训），和带密钥的「发真实 prompt、验证外部世界而非模型
+    自述」。
+  </p>
+
+  <h2 id="sec-adding-package">24.2 第一遍：加一个包</h2>
+
+  <p>
+    docs/cookbook/adding-a-package.md 给出逐文件清单（它以 bash 与 adapter 包为模板校验，漂移了
+    要先修文档）：
+  </p>
+
+  <pre><code>packages/&lt;group&gt;/&lt;pkg&gt;/
+  package.json     <span class="code-comment"># 从 packages/core/tools 拷贝，改 name/description/deps</span>
+  tsconfig.json    <span class="code-comment"># extends ../../../tsconfig.base.json，rootDir src，</span>
+                   <span class="code-comment"># outDir lib/types，references 指向 vendor 与各 dsh 依赖</span>
+  src/index.ts     <span class="code-comment"># service 默认导出或插件（name/inject/apply/Config）</span>
+  README.md        <span class="code-comment"># 服务 API、事件、扩展点、设计说明</span>
+                   <span class="code-comment"># + 门禁要求的 Model Experience 与 Known Limitations 段落</span></code></pre>
+
+  <p>
+    package.json 的不变量由 <code>pnpm run constraints</code>（scripts/check-workspace-constraints.ts）
+    执行：<code>private: true</code>、version 与根 package.json 一致、<code>type: module</code>、
+    <code>main: lib/index.js</code>、<code>types: lib/types/index.d.ts</code>、
+    <code>exports["."]</code> 的 types/default 指向同一对文件；<code>@deepseek-ai/cordis</code>
+    必须同时出现在 peerDependencies <strong>和</strong> devDependencies（同版本区间）；每个 dsh peer
+    依赖都在 devDependencies 里有镜像；<code>@deepseek-ai/schemastery</code> 属于 dependencies
+    （它是运行时校验器）；<code>files</code> 清单精确列出 <code>lib/index.js</code>、
+    <code>lib/invariant.js</code>、<code>lib/types/**/*.d.ts</code> 与包特有的运行时产物——不发布
+    src、declaration map 或 JS map。包内相对导入在源码里写显式 <code>.ts</code> 后缀
+    （如 <code>export * from './types.ts'</code>），编译器在产物里改写为 <code>.js</code>。
+  </p>
+
+  <p>
+    注册进根配置只要动两处：往 <code>tsconfig.host.json</code>（Host 包）或
+    <code>tsconfig.client.json</code>（Client 包）的 references 加一行——普通包恰好属于一个聚合，
+    绝不两边都进（<code>api/remotes</code> 的拆分是仓库特例，新包不许模仿）；新 group 才需要动
+    <code>tsconfig.base.json</code> 的通配。其余（root workspaces、publint、tsdown、oxlint、
+    constraints）都被 glob 或 manifest 发现自动覆盖。
+  </p>
+
+  <p>
+    命名是设计的一部分：给稳定存在的职责命名，不命名第一个实现或「可能的将来」。单一引擎用
+    单数 ctx 键，注册表用复数；角色词要配得上行为——<code>Registry</code> 拥有一组可增删的命名
+    注册（含查找、重复/优先规则、生命周期），<code>Runtime</code> 跑活的工作并拥有调度与取消，
+    <code>Provider</code> 供给一个能力定义的一种实现，<code>Store</code> 只拥有一份数据及其
+    CRUD/快照/订阅。README 以固定次序收尾：Model Experience（What the model sees → Verbatim
+    text → Token effect → KV Cache effect）加 Known Limitations and Deferred Work——这两段由
+    <code>doc-sync</code> 的校验器把关。最后跑清单第五步：
+  </p>
+
+  <pre><code>pnpm install        <span class="code-comment"># 注册 workspace</span>
+pnpm run doc-sync
+pnpm run constraints && pnpm run typecheck && pnpm run lint
+pnpm run build && pnpm run hygiene</code></pre>
+
+  <h2 id="sec-adding-tool">24.3 第二遍：加一个工具</h2>
+
+  <p>
+    工具参考 docs/cookbook/adding-a-tool.md（教程版在 docs/user/develop/basic/tool.md）。
+    最小形状——<code>defineTool</code> 是第一方工具的类型化助手（MCP 来源的工具则以裸
+    JSON-Schema <code>ToolDefinition</code> 直接进 <code>ctx.tools.register()</code>）：
+  </p>
+
+  <pre><code><span class="code-key">import</span> { readFile } <span class="code-key">from</span> <span class="code-str">'node:fs/promises'</span>
+<span class="code-key">import</span> <span class="code-key">type</span> { Context } <span class="code-key">from</span> <span class="code-str">'@deepseek-ai/cordis'</span>
+<span class="code-key">import</span> { defineTool } <span class="code-key">from</span> <span class="code-str">'@deepseek-ai/dsh-tools'</span>
+
+<span class="code-key">export const</span> name = <span class="code-str">'my-tool'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'tools'</span>]
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx: Context) {
+  ctx.tools.<span class="code-fn">register</span>(<span class="code-fn">defineTool</span>({
+    name: <span class="code-str">'read_file'</span>,
+    description: <span class="code-str">'Read a file from disk.'</span>,   <span class="code-comment">// 模型看到的内容</span>
+    parameters: {
+      path: { type: <span class="code-str">'string'</span>, required: <span class="code-key">true</span>, description: <span class="code-str">'Absolute path'</span> },
+      limit: { type: <span class="code-str">'number'</span> },                <span class="code-comment">// 默认可选</span>
+    },
+    output: {
+      schema: { type: <span class="code-str">'string'</span> },
+      render: (_args, value) =&gt; [{ type: <span class="code-str">'text'</span>, text: value }],
+    },
+    <span class="code-key">async</span> <span class="code-fn">execute</span>(args, exec) {
+      <span class="code-comment">// args 的类型由 schema 推导：{ path: string; limit?: number }</span>
+      <span class="code-key">return</span> readFile(args.path, { encoding: <span class="code-str">'utf8'</span>, signal: exec.signal })
+    },
+  }))
+}</code></pre>
+
+  <p>
+    注册即效应：dispose 插件 fiber 就注销工具；schema 自动流入 system-prompt 组装。execute() 的
+    契约要点：<strong>参数已被校验</strong>——<code>defineTool</code> 在 execute 之前用统一
+    ParameterSchemaSpec 校验模型生成的 arguments（类型、必填、literal 约束、exact-one union、嵌套
+    值），DSL 表达不了的约束（非空字符串、正数、跨字段规则）才需要你手查；<strong>返回恰好一个
+    canonical JSON 值</strong>——<code>output.schema</code> 可有对象/数组/标量/null 根，注册表会
+    对返回值做快照、校验、冻结，再交给 <code>output.render</code>；不要在 body 里返回 content
+    blocks、不要让调用方解析散文找 id；<strong>抛错或返回非法值都算 <code>isError</code></strong>
+    ——基础设施故障用 throw，非理想但成功的领域结果（如非零退出码）留在 canonical 值里由渲染层
+    解释；<strong>尊重 <code>exec.signal</code></strong>；异步通知用
+    <code>exec.agent.inject()</code>（追加下次模型请求可见的持久上下文，不是唤醒信号）。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">渲染意图是设计的一部分，事前决定</div>
+    <p>
+      工具的 UI 卡片与模型结果分离，用纯投影声明：<code>presentCall(args)</code> 返回 pending 卡
+      （<code>generic</code> 默认 / <code>terminal</code>——你的调用就是一条 shell 命令 /
+      <code>diff</code>——你的调用创建或修改文件，可带 <code>locations</code> 让编辑器跟随）；
+      <code>presentResult(args, { content, isError, meta })</code> 返回完成卡（还有 <code>search</code>
+      与 <code>web</code> 两种结果形态）。硬规矩：这些函数在直播流与会话日志<strong>回放</strong>时
+      都会跑，所以必须是 args（+结果）的纯函数——不许 I/O、不许读会话状态、不许时钟/随机。想要
+      文件旧内容或工作目录？停下——那属于持久化的 result metadata 或 UI 适配器。UI 专属的格式
+      （console 围栏、相对化路径）绝不进模型结果。没有 UI 呈现的工具自动落回通用卡。
+    </p>
+  </div>
+
+  <p>
+    长任务走后台：用 producer config 放开 <code>run_in_background</code>，然后经
+    <code>ctx.jobs.start({ kind, label, owner: exec.agent, run })</code> 注册。成功的后台分支返回
+    类型化句柄（如 <code>{ kind: 'background', jobId }</code>）；Native 渲染可以保留人类可读的
+    <code>started background job bash-1</code>，但 Code Mode 绝不能从这句散文里解析 jobId。
+    id 发布之后用任务自己的取消信号而不是 <code>exec.signal</code>——外层调用的取消只是不再等待，
+    杀掉已发布工作的是 <code>job_kill</code>、owner 销毁与服务 teardown。
+  </p>
+
+  <p>
+    部署策略不进工具本体：可扩展的 allow/deny/ask 用 <code>tools/pre-execute</code>（返回类型化
+    决策的 waterfall），不可撤销的最终拒绝用 <code>ctx.tools.guard()</code>，超时/重试/指标用
+    <code>tools/execute</code> 包住调度生命周期（只有 <code>exec.signal</code> 可替换），显式
+    变换结果用 <code>tools/post-execute</code>，观察不可变的最终结果用 <code>tools/result</code>。
+    而在 Code Mode 里，每个可见注册工具免费变成 <code>await tools.&lt;name&gt;(args)</code>——类型由
+    同一组 schema 生成的 <code>ToolArgsMap</code>/<code>ToolOutputMap</code> 提供。
+  </p>
+
+  <h2 id="sec-adding-llm-adapter">24.4 第三遍：加一个 LLM 适配器</h2>
+
+  <p>
+    docs/cookbook/adding-an-llm-adapter.md 连接新模型供应商；参考实现是
+    <code>packages/llm/llm-deepseek</code>（直连 HTTP、eventsource-parser 分帧）与
+    <code>packages/llm/llm-pi-ai</code>（包装一个 LLM 库）。动手前先读
+    <code>packages/llm/llm/src/types.ts</code> 里 <code>StreamChunk</code> 的文档——两个适配器
+    都按它记录的协议约定校验过。形状：
+  </p>
+
+  <pre><code><span class="code-key">class</span> MyAdapter <span class="code-key">extends</span> LlmAdapter {
+  <span class="code-key">async</span> * <span class="code-fn">stream</span>(options: GenerateOptions): AsyncIterable&lt;StreamChunk&gt; { … }
+}
+
+<span class="code-key">export const</span> name = <span class="code-str">'llm-myprovider'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'llm'</span>]
+<span class="code-key">export const</span> Config = z.<span class="code-fn">object</span>({ apiKey: z.string(), … })
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx: Context, config: Config) {
+  ctx.llm.<span class="code-fn">registerAdapter</span>([<span class="code-str">'my-provider'</span>], <span class="code-key">new</span> MyAdapter(…))
+}</code></pre>
+
+  <p>
+    注册按效应走（HMR 安全）；一条 provider 路由一个适配器——重复注册 throw，多路由注册要么全成
+    要么全不成。<code>options.provider</code> 选适配器，<code>options.model</code> 是供应商模型
+    id，所以动态目录式适配器无需生命周期重配就能服务新模型。密钥走 cordis 原生路径：schemastery
+    Config 加 env 回退，从 cordis.yml 经 <code>!!js process.env.MY_KEY</code> 喂入——代码里绝不读
+    临时密钥文件。
+  </p>
+
+  <p>
+    协议义务（两个实现验证过的契约）：<strong>usage 在 finish 之前发</strong>，finish 之后什么都不
+    发——稳妥做法是把 finish/usage 缓冲到供应商的流结束标记再冲刷；工具调用 <strong>arguments
+    端到端是裸 JSON 字符串</strong>，流式片段用 <code>argumentsDelta</code>，供应商若回解析好的
+    对象就在 <code>block-end</code> 重新序列化；block 的 <code>index</code> 按首次出现的流序分配，
+    同一块的每个 delta 复用；错误恰好两条正道——从 <code>stream()</code> throw（传输/协议失败，
+    用带稳定 code 的 <code>LlmError</code>）或以 <code>finish {kind: 'error' | 'aborted'}</code>
+    收流（供应商带内失败），按失败类别二选一并写进文档；尊重 <code>options.signal</code>；
+    无法兑现的 <code>GenerateOptions</code> 字段要 throw <code>LlmError(..., 'UNSUPPORTED')</code>
+    而不是静默丢弃；供应商需要响应 id/签名等原生元数据时，把最小无损 JSON 投影作为
+    <code>finish.replayState</code> 发出，重建历史时校验它——绝不只凭 provider/model 名字推断原生
+    重放。模型元数据走 provider 中立的能力面：实现 <code>resolveModel()</code>，推理力度是有序的
+    opaque id，由适配器映射到供应商请求。实现结构上把 wire 类型、请求序列化、传输解析、chunk 翻译
+    与适配器类分作不同职责。
+  </p>
+
+  <h2 id="sec-out-of-tree">24.5 Out-of-tree：insert overlay 与第三方边界</h2>
+
+  <p>
+    不是所有扩展都要进仓库。<code>examples/web-schedule/cordis.yml</code> 是最小可运行的
+    out-of-tree 叠加——整个文件只有一段 insert：
+  </p>
+
+  <pre><code><span class="code-comment"># Opt-in Schedule patch over the shipped Web composition.</span>
+<span class="code-comment"># The owner observes only roots published after this overlay loads.</span>
+- insert:
+    - id: time-context
+      name: <span class="code-str">'@deepseek-ai/dsh-time-context'</span>
+
+    - id: schedule
+      name: <span class="code-str">'@deepseek-ai/dsh-schedule'</span></code></pre>
+
+  <p>
+    它是发布 Web 组合（dsh-base + dsh-web-app 的 bundle 层）之上的一份 patch overlay：insert 把
+    这些行追加到同一 include 层的尾部，加载顺序决定可见性——owner 只观察 overlay 加载之后发布的
+    根。<code>dsh web --patch &lt;path&gt;</code> 即可启用。对照 <code>examples/web-cordis/cordis.yml</code>
+    能看到另一种 patch：不带 insert 的行直接<strong>替换</strong>目标行（同 id）的整个
+    <code>config</code>——它在 webserver 行上钉死 <code>127.0.0.1:3081</code>，再用 insert 加进
+    cordis 自检工具。
+  </p>
+
+  <p>
+    cordis.yml 的两条安全边界来自根 AGENTS.md：<code>!!js</code>（绝不 <code>!js</code>）只允许
+    出现在插件 <code>config</code> 与条目 <code>disabled</code> 下，其余元数据保持字面量——所以
+    条件式组合也用 overlay 表达；Raw/Web cordis.yml 里的 bare 插件必须出现在其 resolver manifest
+    的 <code>dependencies</code> 里，<code>verify-cordis-config</code> 强制检查。第三方能力的样板
+    是 <code>examples/mcp-memory/</code>：三份默认关闭的参考配置（memorix、mcp-reference-memory、
+    engram），每份一个 insert，把 <code>@deepseek-ai/dsh-mcp-client</code> 指向各自的 stdio 命令
+    ——DSH 解析 overlay、起子进程、发现 MCP 工具、以 <code>mcp__&lt;serverName&gt;__&lt;tool&gt;</code>
+    暴露；DSH 不下载服务器、不建库、不管账号。stdio 桥接在拉起子进程前刻意剥掉名字里通常带凭证的
+    环境变量与全部 <code>DSH_*</code> 变量。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">示例的边界</div>
+    <p>
+      examples/AGENTS.md：examples 是可运行组合，不是构建目标；可复用逻辑要抽进 packages/（那里有
+      per-file 覆盖与 README 门禁），examples 只留 cordis.yml 接线、demo 产物与 e2e/snapshot 场景；
+      app 包的 bin 拥有启动胶水。每个 example 都有 keyless 与 with-key 两个 smoke。
+    </p>
+  </div>
+
+  <h2 id="sec-verify">24.6 每一遍的终点：验证义务</h2>
+
+  <p>
+    三遍 cookbook 的「Verification」小节都指回同一份 docs/testing.md（第 22 章）。映射到本章的三种
+    扩展：<strong>新包</strong>——包级行为进 unit + 覆盖率门禁，产品可见插件必须有非 unit 的真实
+    组合测试（手搭 <code>ctx.plugin(...)</code> 不算数，要 boot 测试专用 cordis.yml 穿过 Loader）；
+    <strong>新工具或改工具</strong>——模型可见与 UI 可见的 shipped 变化都要组装后的覆盖（同 PR 的
+    keyless 快照场景，UI 卡片变化进 web 快照），渲染回放要能在 macOS/Linux 重放；<strong>新
+    适配器</strong>——testing.md 拥有适配器覆盖、真实供应商检查与发布入口要求：协议义务逐条有
+    测试，真实 provider 行为跑 e2e，发布入口跑 built smoke。若 harness 还表达不了你要的场景，
+    政策要求先扩展 harness 再实现——这也是 acp-snapshot 把比对机制集中成一个包的原因。
+  </p>
+
+  <h2 id="sec-recap">24.7 本章回顾</h2>
+  <ul>
+    <li>先在 feature → mechanism map 里选扩展点，再写代码；没有一行路通向 agent-loop。</li>
+    <li>加包：清单五件套（package.json/tsconfig/src/README/注册），constraints 门禁的不变量，命名配角色，README 以 Model Experience + Known Limitations 收尾。</li>
+    <li>加工具：<code>defineTool</code> 的 execute() 契约（参数已校验、一个 canonical JSON 值、throw 即 isError、尊重 signal）；渲染意图事前决定且是 args 的纯函数；后台走 <code>ctx.jobs.start</code> 返回类型化句柄；策略上扩展点不进本体。</li>
+    <li>加适配器：<code>ctx.llm.registerAdapter</code> 按路由注册；usage 先于 finish、arguments 是裸 JSON 字符串、错误只有 throw 与 <code>finish {kind}</code> 两条路、不支持的选项 throw UNSUPPORTED、原生重放态走 <code>finish.replayState</code>。</li>
+    <li>Out-of-tree：insert overlay 叠加在发布组合之上（web-schedule 是最小样板）；不带 insert 的行替换目标行整个 config；<code>!!js</code> 只在 config 与 disabled 下；bare 插件必须在 resolver manifest 的 dependencies。</li>
+    <li>每一遍的终点都是验证义务：同 PR 的 keyless 快照 + examples 双 smoke + 真实组合测试。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>在 <code>execute()</code> 里手写参数校验——<code>defineTool</code> 已按 schema 校验，只补 DSL 表达不了的约束。</li>
+      <li>在 <code>presentCall</code> 里想读文件旧内容或工作目录——那是持久化 result metadata 或 UI 适配器的职责，presenter 必须纯。</li>
+      <li>让 Code Mode 从渲染散文里解析 jobId——后台分支返回类型化句柄，散文只给人看。</li>
+      <li>把部署策略（超时、权限）写进工具本体——分别上 <code>tools/execute</code> 与 <code>tools/pre-execute</code>。</li>
+      <li>适配器把 finish 之后的尾部 usage 直接丢弃或乱序发——缓冲到流结束标记再冲刷。</li>
+      <li>供应商回解析好的参数对象就直接塞给流——arguments 端到端是裸 JSON 字符串，在 block-end 重新序列化。</li>
+      <li>在 cordis.yml 的插件 id/name 等元数据上写 <code>!!js</code>——只允许 config 与 disabled。</li>
+      <li>新包同时挂进 Host 与 Client 聚合——普通包恰好属于一个；<code>api/remotes</code> 的拆分不许模仿。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="24">
+    <h2>第 24 章测验</h2>
+
+    <div class="q" data-id="24-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— defineTool 在 execute 之前按统一 ParameterSchemaSpec 校验模型生成的 arguments；DSL 表达不了的约束才手查。"
+         data-rationale="B 正确：进入 execute 时 args 已匹配 InferArgs。A 把校验推给模型不可靠。C 描述的是裸 JSON-Schema 工具（MCP 来源）的义务——它们自己拥有输入校验。D 与校验无关。"
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>defineTool</code> 的 execute() 里，参数校验由谁负责？</div>
+      <label class="opt"><input type="radio" name="q-24-1" value="a"> A. 模型自己保证参数合法</label>
+      <label class="opt"><input type="radio" name="q-24-1" value="b"> B. defineTool 在 execute 之前按 schema 校验；DSL 表达不了的约束（如正数、跨字段规则）才由作者手查</label>
+      <label class="opt"><input type="radio" name="q-24-1" value="c"> C. 完全由工具作者在 execute 开头手写校验</label>
+      <label class="opt"><input type="radio" name="q-24-1" value="d"> D. 由调用方（Code Mode 程序）负责校验</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A/B/D 都是 execute() 契约：返回恰好一个匹配 output.schema 的 canonical JSON 值、抛错算 isError、尊重 exec.signal。C 错：content blocks 不属于 body；渲染由 output.render 与 UI 卡片投影负责，把 UI 格式混进 canonical 值违反硬规矩。"
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于工具 execute() 的契约，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="a"> A. 返回恰好一个 canonical JSON 值，注册表对其快照、校验、冻结</label>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="b"> B. 抛出异常意味着 isError；基础设施故障用 throw 表达</label>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="c"> C. 非理想但成功的领域结果应返回 content blocks 并让调用方解析</label>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="d"> D. 取消发生时要在 execute 内尊重并中止在途工作（exec.signal）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— presentCall/presentResult 在直播与日志回放都会跑，必须是 args（+结果）的纯函数。"
+         data-rationale="C 正确：回放也要出卡片，I/O、会话状态、时钟/随机都会让回放漂移。A 与纯度矛盾。B 是 render 的职责（模型面向），卡片是另一回事。D 恰是反例——soft-validate 让 display 永不炸回放，而不是让它有权抛错。"
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q3.</span> 为什么 <code>presentCall</code> / <code>presentResult</code> 必须是纯函数？</div>
+      <label class="opt"><input type="radio" name="q-24-3" value="a"> A. 为了性能，渲染频繁发生</label>
+      <label class="opt"><input type="radio" name="q-24-3" value="b"> B. 它们与 <code>output.render</code> 一样，属于模型可见内容的一部分</label>
+      <label class="opt"><input type="radio" name="q-24-3" value="c"> C. 它们在实时流与会话日志回放两种场景都会执行；I/O、会话状态、时钟/随机会让回放不可重现</label>
+      <label class="opt"><input type="radio" name="q-24-3" value="d"> D. 因为 defineTool 会在注册期调用它们做校验，抛错会炸注册</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-4" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 返回类型化句柄 { kind: 'background', jobId }；人类可读散文可以有，但 Code Mode 绝不从中解析 id。"
+         data-rationale="D 正确。A/B 都让程序靠解析英文找 id，被明确禁止。C 与契约相反——非零退出这类领域结果留在 canonical 值，由渲染解释，不是 throw。"
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q4.</span> 一个后台分支的工具调用成功后应如何向 Code Mode 暴露 jobId？</div>
+      <label class="opt"><input type="radio" name="q-24-4" value="a"> A. 在输出散文里写 started background job bash-1，让程序正则提取</label>
+      <label class="opt"><input type="radio" name="q-24-4" value="b"> B. 塞进 output.render 的第一个 content block</label>
+      <label class="opt"><input type="radio" name="q-24-4" value="c"> C. 后台任务一律 throw，让上层重试</label>
+      <label class="opt"><input type="radio" name="q-24-4" value="d"> D. 返回类型化 canonical 句柄如 { kind: 'background', jobId }；散文只保留给人类</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 需要一个后监听者无法撤销的最终拒绝时用 ctx.tools.guard()。"
+         data-rationale="B 正确：guard 是单调的最终拒绝。A 是可扩展的 allow/deny/ask 策略层（waterfall，可被后续层影响）。C 用于包住调度生命周期（超时/重试/指标）。D 只观察不可变的最终结果，不改决策。"
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q5.</span> 你要一条「任何后续监听器都不能翻案」的最终拒绝，用哪个扩展点？</div>
+      <label class="opt"><input type="radio" name="q-24-5" value="a"> A. <code>tools/pre-execute</code> 返回 deny</label>
+      <label class="opt"><input type="radio" name="q-24-5" value="b"> B. <code>ctx.tools.guard()</code></label>
+      <label class="opt"><input type="radio" name="q-24-5" value="c"> C. <code>tools/execute</code> 包住调度</label>
+      <label class="opt"><input type="radio" name="q-24-5" value="d"> D. <code>tools/result</code> 观察</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A/B/C 都是协议义务。D 错：无法兑现的字段要 throw LlmError(..., 'UNSUPPORTED')，静默丢弃违反契约。另外还有：尊重 options.signal、block index 按首现流序分配、错误恰好两条路径。"
+         data-review="sec-adding-llm-adapter">
+      <div class="prompt"><span class="qnum">Q6.</span> LLM 适配器的协议义务包括？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="a"> A. usage 在 finish 之前发出，finish 之后什么都不发</label>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="b"> B. 工具调用 arguments 端到端是裸 JSON 字符串，流片段用 argumentsDelta</label>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="c"> C. 错误只有两条正道：从 stream() throw LlmError，或以 finish {kind: 'error' | 'aborted'} 收流</label>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="d"> D. 供应商不支持的 GenerateOptions 字段直接静默忽略</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-7" data-type="fill" data-accepted='["ctx.llm.registeradapter","ctx.llm","registeradapter"]'
+         data-answer="ctx.llm.registerAdapter（一条 provider 路由一个适配器，重复注册 throw）。"
+         data-rationale="适配器插件 inject ['llm']，在 apply 里调用 ctx.llm.registerAdapter(['my-provider'], adapter)；options.provider 选适配器，options.model 是供应商模型 id。"
+         data-review="sec-adding-llm-adapter">
+      <div class="prompt"><span class="qnum">Q7.</span> 填空：LLM 适配器在 apply 里通过 <code>______</code> 完成注册。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— @deepseek-ai/cordis 必须同时在 peerDependencies 和 devDependencies（同区间）。"
+         data-rationale="C 正确，由 constraints 门禁执行。A/B 违反镜像规则：每个 dsh peer 依赖都要在 devDependencies 有镜像。D 说反了：schemastery 是运行时校验器，属于 dependencies。"
+         data-review="sec-adding-package">
+      <div class="prompt"><span class="qnum">Q8.</span> 新包 package.json 的依赖不变量，正确的是？</div>
+      <label class="opt"><input type="radio" name="q-24-8" value="a"> A. <code>@deepseek-ai/cordis</code> 只放 peerDependencies</label>
+      <label class="opt"><input type="radio" name="q-24-8" value="b"> B. dsh peer 依赖只放 dependencies</label>
+      <label class="opt"><input type="radio" name="q-24-8" value="c"> C. <code>@deepseek-ai/cordis</code> 同时出现在 peerDependencies 与 devDependencies（同区间），dsh peer 依赖在 devDependencies 有镜像</label>
+      <label class="opt"><input type="radio" name="q-24-8" value="d"> D. <code>@deepseek-ai/schemastery</code> 放 peerDependencies</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 普通包恰好注册进一个聚合（Host 或 Client），绝不两边都进。"
+         data-rationale="A 正确：两侧在相同键下 declaration-merge 出不同的 Context，进两个聚合会撞合并。api/remotes 的拆分是仓库特例且明令不许模仿。B 缺第二处。C 恰是被禁止的。D 不是注册方式。"
+         data-review="sec-adding-package">
+      <div class="prompt"><span class="qnum">Q9.</span> 新 Host 包在根配置的注册方式是？</div>
+      <label class="opt"><input type="radio" name="q-24-9" value="a"> A. 往 tsconfig.host.json 的 references 加一行；普通包恰好属于一个聚合</label>
+      <label class="opt"><input type="radio" name="q-24-9" value="b"> B. 同时加进 tsconfig.host.json 与 tsconfig.client.json</label>
+      <label class="opt"><input type="radio" name="q-24-9" value="c"> C. 仿照 api/remotes 拆成两份 tsconfig</label>
+      <label class="opt"><input type="radio" name="q-24-9" value="d"> D. 在 tsconfig.base.json 里给包加 include</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-10" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A、C。"
+         data-rationale="A 正确：!!js（绝不 !js）只允许在插件 config 与条目 disabled 下，其余元数据保持字面量。C 正确：web-schedule 整份文件就是一段 insert，把行追加到组合尾部。B 是 web-cordis 的行为——不带 insert 的行替换同 id 目标行的整个 config，但那不是 insert。D 没有这条要求，示例本就默认关闭、按需 --patch。"
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q10.</span> 关于 cordis.yml 与 overlay，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="a"> A. <code>!!js</code> 只允许出现在插件 <code>config</code> 与条目 <code>disabled</code> 下</label>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="b"> B. insert 段会替换同 id 目标行的整个 config</label>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="c"> C. web-schedule 的 insert overlay 把行追加到同一 include 层尾部，owner 只观察其后发布的根</label>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="d"> D. mcp-memory 的三份配置默认启用，需手动关闭</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— Raw/Web cordis.yml 的 bare 插件必须出现在 resolver manifest 的 dependencies，verify-cordis-config 强制。"
+         data-rationale="B 正确。A 是另一条规则（!!js 边界）不是 dependencies 检查。C 说反了。D 混淆了 bundle 补丁层与示例接线两个概念。"
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q11.</span> <code>verify-cordis-config</code> 强制的一条规则是？</div>
+      <label class="opt"><input type="radio" name="q-24-11" value="a"> A. 所有 config 值必须是字面量</label>
+      <label class="opt"><input type="radio" name="q-24-11" value="b"> B. Raw/Web cordis.yml 的 bare 插件必须出现在其 resolver manifest 的 dependencies 里</label>
+      <label class="opt"><input type="radio" name="q-24-11" value="c"> C. 每个插件必须显式声明 disabled: false</label>
+      <label class="opt"><input type="radio" name="q-24-11" value="d"> D. 示例配置必须挂进 bundle 补丁层</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-12" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— examples 只留接线、demo 产物与测试场景；可复用逻辑抽进 packages/（那里有覆盖率与 README 门禁）。"
+         data-rationale="D 正确，examples/AGENTS.md 原文。A 违反「examples 不是构建目标」。B 恰是反模式——测试专用组合放在 example 的 tests/fixtures 下且包要在配置里声明。C 无此要求。"
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q12.</span> examples 与 packages 的边界是什么？</div>
+      <label class="opt"><input type="radio" name="q-24-12" value="a"> A. examples 也要作为构建目标产出 lib/</label>
+      <label class="opt"><input type="radio" name="q-24-12" value="b"> B. 可复用逻辑留在 examples 里，用起来更快</label>
+      <label class="opt"><input type="radio" name="q-24-12" value="c"> C. 每个 example 必须自带一份启动胶水 bin</label>
+      <label class="opt"><input type="radio" name="q-24-12" value="d"> D. examples 只留 cordis.yml 接线、demo 产物与 e2e/snapshot 场景；可复用逻辑抽进 packages/</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-13" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— MCP 工具以 mcp__serverName__tool 形式的名字注册进 ctx.tools；一个 MCP 服务器一个插件。"
+         data-rationale="C 正确，feature→mechanism map 与 mcp-memory README 一致。A/B/D 都绕开了工具注册表这一唯一入口。"
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q13.</span> MCP 服务器接入后，其工具如何进入 dsh？</div>
+      <label class="opt"><input type="radio" name="q-24-13" value="a"> A. 作为独立的 MCP 工具协议直连模型</label>
+      <label class="opt"><input type="radio" name="q-24-13" value="b"> B. 经 system prompt section 注入说明书</label>
+      <label class="opt"><input type="radio" name="q-24-13" value="c"> C. 发现工具后以 <code>mcp__&lt;serverName&gt;__&lt;tool&gt;</code> 注册进 <code>ctx.tools</code>（一个服务器一个插件）</label>
+      <label class="opt"><input type="radio" name="q-24-13" value="d"> D. 包装成 subagent provider</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-14" data-type="short"
+         data-key-points='["presenter 在实时流与日志回放两种场景都执行","回放要求可重现：I/O、会话状态、时钟/随机都会让卡片漂移","渲染意图属于设计的一部分，generic/terminal/diff/locations 要事前选定","UI 专属格式不进模型结果，output.render 管模型散文、卡片投影管 UI"]'
+         data-answer="因为 presentCall/presentResult 不仅在实时流上跑，也在会话日志回放时跑；任何 I/O、会话状态、时钟或随机都会让回放出的卡片与当时不一致。所以渲染意图是工具设计的一部分（事前选定卡片种类与 locations），presenter 保持纯函数，UI 专属格式留在卡片投影、模型散文留在 output.render。"
+         data-rationale="抓住「直播 + 回放双场景」「纯函数保证可重现」「意图事前决定」「UI 格式与模型结果分离」即达标。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q14.</span> 用自己的话解释：为什么工具的渲染意图必须事前决定、presenter 必须是纯函数？</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="25-contributing-map.html"><strong>第 25 章 · 贡献地图与专家导航</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

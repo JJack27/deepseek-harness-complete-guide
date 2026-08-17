@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 21 章 · ACP、SDK 与 Python — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 21 章 · ACP、SDK 与 Python</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="21">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 21 章 · 第四部分 · 产品端与协议</div>
+    <h1>ACP、SDK 与 Python</h1>
+    <p class="lede">
+      Web UI 只是人类开车的方式之一。当驱动者是另一个程序——编排器、测试框架、另一个 agent
+      harness——dsh 提供三条进程外的路：ACP 服务器、TypeScript SDK、Python SDK。三条路形态
+      不同，底座一致：都经 stdio 上的 JSON-RPC 驱动一个完整的 harness 进程，都不需要浏览器。
+      本章把它们并排讲清楚，并给出选择依据。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出三条进程外驱动路径的共同底座与各自形态。</li>
+      <li>描述 ACP 的 automation-only 定位、方法面与「已提交消息才上 wire」的取舍。</li>
+      <li>分清 SDK 三个包的角色：protocol（wire 契约）、server（插件）、client（TS 客户端）。</li>
+      <li>解释 Python 两个发行版的分工，以及「零配置」为什么是显式参数传递而非隐藏回退。</li>
+      <li>按场景为调用方选路径：标准协议客户端、repo 相邻 TS 自动化、pip 安装即用。</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-three-paths">21.1 三条进程外驱动路径</h2>
+
+  <p>
+    把第 19、20 章的浏览器半区整个拿掉，剩下的 host 进程依然是完整的 harness：agents、会话
+    日志、工具管道、全部能力面都在。于是「程序当客户端」只需要一件事——一条进程间协议。
+    dsh 提供三条：
+  </p>
+
+  <ul>
+    <li><strong>ACP</strong>（<code>packages/acp/acp</code>）：实现外部的
+        <a href="https://agentclientprotocol.com">Agent Client Protocol</a>，JSON-RPC over
+        stdio，给任何说这门标准协议的客户端用；仓库内的典型客户端是
+        <code>dsh-subagent-acp</code>（第 14 章）。</li>
+    <li><strong>TypeScript SDK</strong>（<code>packages/sdk/</code>）：自家的
+        <code>deepseek-harness</code> 式协议——换行分隔 JSON-RPC 2.0 over stdio——的 TS 客户端
+        与服务端插件；示例 bin 是 <code>dsh-jsonrpc-agent</code>。</li>
+    <li><strong>Python SDK</strong>（<code>python/</code>）：同一协议的 Python 客户端，加一个
+        捆绑了 runtime 二进制的发行版，pip 装完即用。</li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 900 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三条进程外驱动路径对照">
+      <rect x="10" y="20" width="270" height="96" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="145" y="46" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">路一：ACP 客户端</text>
+      <text x="145" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">标准 Agent Client Protocol</text>
+      <text x="145" y="82" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">典型：dsh-subagent-acp（第 14 章）</text>
+      <text x="145" y="98" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">别的 dsh 当它的子代理后端</text>
+
+      <rect x="10" y="128" width="270" height="96" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="145" y="154" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">路二：TypeScript SDK</text>
+      <text x="145" y="174" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">dsh-sdk-client（DeepSeekHarness /</text>
+      <text x="145" y="188" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">HarnessClient），launch 全显式</text>
+      <text x="145" y="204" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">bin：dsh-jsonrpc-agent</text>
+
+      <rect x="10" y="236" width="270" height="96" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="145" y="262" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">路三：Python SDK</text>
+      <text x="145" y="282" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">deepseek-harness-sdk（deepseek_harness）</text>
+      <text x="145" y="296" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">＋ deepseek-harness-runtime-bin</text>
+      <text x="145" y="312" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">未钉 channel 时自动启动捆绑 runtime</text>
+
+      <rect x="330" y="110" width="200" height="132" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="430" y="138" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">stdio 上的 JSON-RPC</text>
+      <text x="430" y="160" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ACP：JSON-RPC over stdio</text>
+      <text x="430" y="176" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">SDK：换行分隔 JSON-RPC 2.0</text>
+      <text x="430" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">每行一帧，\n 结尾</text>
+      <text x="430" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9" font-style="italic">stdout 是协议；</text>
+      <text x="430" y="228" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9" font-style="italic">诊断走 stderr</text>
+
+      <line x1="280" y1="68" x2="328" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="328,140 319,138 322,146" style="fill:var(--muted)"/>
+      <line x1="280" y1="176" x2="328" y2="176" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="328,176 320,172 320,180" style="fill:var(--muted)"/>
+      <line x1="280" y1="284" x2="328" y2="212" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="328,212 320,215 326,221" style="fill:var(--muted)"/>
+
+      <line x1="530" y1="176" x2="578" y2="176" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="578,176 570,172 570,180" style="fill:var(--muted)"/>
+
+      <rect x="578" y="110" width="312" height="132" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="734" y="138" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">dsh 子进程（完整 harness）</text>
+      <text x="734" y="160" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">ACP 面：dsh-acp-demo（pnpm run demo:acp）</text>
+      <text x="734" y="176" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">SDK 面：jsonrpc 插件（inject: agents）</text>
+      <text x="734" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">Python 捆绑：dsh-jsonrpc-agent-pkg-*</text>
+      <text x="734" y="214" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">进程内：ctx.agents + 会话日志 + 工具管道</text>
+      <text x="734" y="230" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">（第 3–17 章的全部能力面）</text>
+
+      <text x="450" y="60" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10" font-style="italic">三条路共同点：都不需要浏览器</text>
+      <text x="450" y="330" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10" font-style="italic">差异在上游生态（协议标准 vs 自家 SDK）与分发形态（npm 包 vs pip 包＋捆绑二进制）</text>
+    </svg>
+    <figcaption>三驱动路径对照：ACP、TS SDK、Python SDK 都经 stdio JSON-RPC 驱动一个完整的 dsh 子进程；差别在协议属主、客户端生态与 runtime 的获取方式。</figcaption>
+  </figure>
+
+  <h2 id="sec-acp">21.2 ACP：automation-only 的 Agent Client Protocol</h2>
+
+  <p>
+    <code>packages/acp/acp</code>（<code>@deepseek-ai/dsh-acp</code>）是 stdio 上的
+    <strong>automation-only</strong> ACP 服务器。定位要读准：它是<strong>传输适配器</strong>，
+    不是 UI 集成，也不是 capability seam——不提供编辑器导航、transcript 回放、命令、模式、
+    配置选择器、elicitation、推理展示、计划、标题或工具呈现；交互渲染和人类提问属于 Web host
+    与 client 模块（第 19 章）。插件 <code>apply</code> 在 stdin/stdout 上开一条
+    <code>AgentSideConnection</code> 驱动 <code>ctx.agents</code>；stdout 保留给协议帧，
+    诊断走 stderr。
+  </p>
+
+  <p>方法面很小而克制：</p>
+
+  <table>
+    <thead><tr><th>方法</th><th>行为</th></tr></thead>
+    <tbody>
+      <tr><td><code>initialize</code></td><td>协商支持版本，只宣告 baseline-only 提示能力；不宣告任何 session、编辑器、终端、文件系统或 MCP 能力。<code>authenticate</code> 是 no-op。</td></tr>
+      <tr><td><code>session/new</code></td><td>创建全新 agent，主 <code>cwd</code> 取绝对路径；空的 <code>additionalDirectories</code> 与 <code>mcpServers</code> 可接受，非空拒绝。</td></tr>
+      <tr><td><code>session/prompt</code></td><td>拼接文本块，把 baseline 资源链接渲染成括号文本引用；拒绝空输入；每会话一次一个在途请求；等整个 agent 空闲。正常静默报告 <code>end_turn</code>，显式取消或废弃的准入报告 <code>cancelled</code>。</td></tr>
+      <tr><td><code>session/cancel</code></td><td>只取消被点名的 agent；未知 id 是 no-op。</td></tr>
+      <tr><td><code>session/update</code></td><td>对每条<strong>已提交</strong> <code>assistant/message</code> 的每个非空文本块发一个 <code>agent_message_chunk</code>；原始 delta 与非消息事件不上 wire。</td></tr>
+      <tr><td><code>session/request_permission</code></td><td>为带工具调用 id 的一次性审批请求提供 allow/reject 选择；客户端可以自动作答。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    「只发已提交消息」是刻意用 token 级延迟换干净的自动化结果：未提交的 provider 流块与
+    重试尝试不可能漏出半截文本；推理与工具活动留在会话日志里，供其他界面观察。模型视角一如既往
+    地干净（第 4 章的法则在这里同样成立）：<code>session/prompt</code> 的文本逐字并成一条用户
+    消息，协议元数据、客户端能力、权限选择、会话 id 永不进入模型请求；权限决定的产物只是 owning
+    工具的正常 tool 结果。生命周期上，断连与 Cordis 销毁共用一次 memoized 清理：先拒绝新会话与
+    prompt、结算在途 prompt，再只在这条连接<strong>精确拥有的</strong> continuable 后代范围内
+    排干并并行销毁——其他前端共享的 Context 保留自己的森林，ACP-only 的插件重载不留孤儿
+    agent。可运行的组合是 <code>pnpm run demo:acp</code>（<code>packages/examples/acp-demo</code>
+    的 <code>dsh-acp-demo</code> bin：agent spine + JSONL 持久化 + 检查点策略 + ACP 传输，
+    stdout 即协议）。
+  </p>
+
+  <h2 id="sec-sdk">21.3 TS SDK：protocol、server、client</h2>
+
+  <p>
+    <code>packages/sdk/</code> 三个包把「自家协议」拆成三层：
+  </p>
+
+  <ul>
+    <li><code>dsh-sdk-protocol</code> —— 共享 wire 契约：<code>JsonRpcLineTransport</code> 把
+        JSON-RPC 2.0 装帧在调用方自有的字节流上（一行一帧、<code>\n</code> 结尾的紧凑 JSON；
+        有 id 有 method 是请求、只有 id 是响应、只有 method 是通知；坏 JSON 行忽略），加上两端
+        共用的命名请求/结果/通知类型。纯库，无插件。</li>
+    <li><code>dsh-sdk-jsonrpc-server</code>（server）—— <code>inject: ['agents']</code> 的
+        <code>jsonrpc</code> 插件：每 <code>sessionId</code> 取或建一个 agent，把每个持久的
+        会话事实作为 <code>session.event</code> 流出、每个整 agent 生命周期翻转作为
+        <code>session.status</code> 流出。<code>shutdown</code> 回复后销毁根 context 到静默再
+        退出 0。</li>
+    <li><code>dsh-sdk-client</code>（client）—— TS 客户端，两层：<code>DeepSeekHarness</code>
+        是高层 owned-run API，<code>HarnessClient</code> 是低层协议客户端。与 Python SDK 是
+        设计孪生，差别在 launch spec 全显式（<code>command</code>/<code>args</code>）——捆绑
+        runtime 的发现留给 Python 发行版。</li>
+  </ul>
+
+  <p>
+    wire 的请求/通知面值得背下来。请求三个：<code>initialize</code>（cwd 绝对化后过 wire，
+    附 provider/model 路由与可选的正整数 <code>maxTokens</code> 输出上限——对根 agent 及其进程内
+    后代生效）、<code>session/prompt</code>（排队一条带 id 的用户消息，<strong>立即</strong>返回
+    <code>{ messageId }</code> 入队回执）、<code>shutdown</code>。通知四个：
+    <code>session.event</code>（runtime 里<strong>每个</strong>会话的事件，不过滤——按会话收敛是
+    客户端自己的事）、<code>session.status</code>（整 agent 的 running/idle 翻转）、
+    <code>subagent.started</code>、<code>subagent.finished</code>（仅进程内运行）。
+    <code>messageId</code> 标识的是排队的那条 <code>UserMessage</code>——<strong>不是</strong>
+    后来的助手消息、turn 结束或「该 prompt 的结果」。协议没有取消方法：放弃一个 turn 的办法是
+    关掉 runtime 进程。
+  </p>
+
+  <p>
+    高层 <code>DeepSeekHarness</code> 怎么在这片原语上造出「跑一次拿结果」：
+  </p>
+
+  <pre><code><span class="code-key">await using</span> harness = <span class="code-key">new</span> <span class="code-fn">DeepSeekHarness</span>({
+  launch: { command: <span class="code-str">'node'</span>, args: [<span class="code-str">'lib/bin.js'</span>, <span class="code-str">'cordis.yml'</span>] },
+  provider: <span class="code-str">'deepseek-official'</span>,
+  model: <span class="code-str">'deepseek-v4-flash'</span>,
+})
+<span class="code-key">const</span> result = <span class="code-key">await</span> harness.<span class="code-fn">run</span>(<span class="code-str">'say hi'</span>)
+console.<span class="code-fn">log</span>(result.finalResponse)</code></pre>
+
+  <p>
+    <code>run()</code> 拥有<strong>一个活动区间</strong>：提交 prompt，等它的 <code>MessageId</code>
+    出现在持久的 <code>agent/inbox/spliced</code> 回执里，然后一路收集到下一个整 agent
+    <code>idle</code>；返回 <code>RunResult</code>（sessionId、finalResponse、events、
+    notifications）。<code>finalResponse</code> 是该区间内根会话<strong>最后一条已提交</strong>的
+    助手文本——不是因果上归属这个 prompt 的回复；转向消息、注入上下文和其他排队工作都可能在
+    idle 之前贡献内容。子进程懒启动、由实例持有跨 <code>run()</code> 复用，<code>close()</code>
+    （或 <code>await using</code>）必调，内部走协议 <code>shutdown</code> → stdin-EOF →
+    SIGTERM → SIGKILL 的梯子直到进程真的退出。示例 bin 是
+    <code>packages/examples/jsonrpc-demo</code> 提供的 <code>dsh-jsonrpc-agent</code>：只负责
+    启动外部 <code>cordis.yml</code>（<code>$DSH_CORDIS_CONFIG</code> 或位置参数，缺配置一行
+    usage 退出 1），不指定服务插件——组合里有 <code>dsh-sdk-jsonrpc-server</code> 才有东西可
+    serve。stdin EOF 与信号走同样的销毁；EOF 可能切断在途 turn，要有序收尾就用协议级
+    <code>shutdown</code>。
+  </p>
+
+  <h2 id="sec-python">21.4 Python：两个发行版与捆绑 runtime</h2>
+
+  <p>
+    <code>python/</code> 出两个发行版：<code>deepseek-harness-sdk</code>（模块
+    <code>deepseek_harness</code>，高层 turns API + 低层 JSON-RPC 客户端）与
+    <code>deepseek-harness-runtime-bin</code>（模块 <code>deepseek_harness_runtime</code>，
+    捆绑的 runtime 二进制与默认 agent 配置）。装前者会带上同版本的后者平台 wheel：
+  </p>
+
+  <pre><code><span class="code-key">from</span> deepseek_harness <span class="code-key">import</span> DeepSeekHarness
+
+<span class="code-key">with</span> <span class="code-fn">DeepSeekHarness</span>() <span class="code-key">as</span> harness:
+    result = harness.<span class="code-fn">run</span>(<span class="code-str">"Say hi."</span>)</code></pre>
+
+  <p>
+    未钉 channel 时，SDK 自动启动匹配的捆绑 runtime：默认发射单文件可执行
+    <code>dsh-jsonrpc-agent-pkg-&lt;platform&gt;-&lt;arch&gt;</code>（linux/macos × x64/arm64；
+    目标机不需要装 Node），并经 <code>DSH_CORDIS_CONFIG</code> 注入该包自带的默认组合——
+    stdio JSON-RPC 服务入口、agent 核心、预载的 DeepSeek 适配器、带显式语义检查点策略的 JSONL
+    持久化、本地 bash。另有一个 dev-only 的 node 载体（完整 deploy closure 跑在系统 Node 上），
+    <strong>必须</strong>显式 <code>DSH_RUNTIME_MODE=node</code> 才会选中——生产部署永远不能悄悄
+    骑在源码构建上。想要自己的插件组合：保留配置里的
+    <code>@deepseek-ai/dsh-sdk-jsonrpc-server</code> 条目，把 <code>cordis=</code> 指到你的
+    cordis.yml。runtime 继承 <code>DEEPSEEK_API_KEY</code>、<code>DEEPSEEK_BASE_URL</code> 等
+    环境变量。
+  </p>
+
+  <p>
+    这里有一处设计必须读准：<strong>runtime 永远要求显式配置</strong>——没有
+    <code>$DSH_CORDIS_CONFIG</code> 或位置参数就大声退出，这是 runtime 的设计语义，
+    <code>deepseek-harness-runtime-bin</code> 不软化它。「零配置」是 wrapper 侧一次显式、可见的
+    参数注入，不是 runtime 里的隐藏回退。高层 API 的语义与 TS 孪生一致：
+    <code>Session.run()</code> 拥有从持久入队回执到下一个整 agent idle 的活动区间，返回
+    <code>RunResult(session_id, final_response, finish_reason, events, notifications,
+    session_root)</code>；<code>finish_reason</code> 是区间内最后一条根会话
+    <code>turn/end</code> 的 <code>kind</code>（如 <code>completed</code>、
+    <code>max-tokens</code>、<code>error</code>），无 turn 结束则 <code>None</code>。
+    <code>events</code> 只含根会话事件——后代消息不能顶替根回答；<code>notifications</code> 与
+    <code>on_notification</code> 按 wire 顺序收到根会话加已发现后代的全部通知。低层
+    <code>session_prompt()</code> 同样只回 <code>MessageId</code>，活动边界自理。
+  </p>
+
+  <h2 id="sec-choosing">21.5 怎么选</h2>
+
+  <p>
+    三条路不是三种品味，是三种处境：
+  </p>
+
+  <table>
+    <thead><tr><th>处境</th><th>选</th><th>理由</th></tr></thead>
+    <tbody>
+      <tr><td>客户端说标准 ACP（编排器、别的 harness、通用 agent 客户端）</td><td>ACP</td><td>标准协议面小而稳；automation-only 语义与外部驱动天然匹配；dsh 可以当别的 dsh 的子代理后端（<code>dsh-subagent-acp</code>，第 14 章）。</td></tr>
+      <tr><td>repo 相邻的 TypeScript 自动化、CI、自家工具</td><td>TS SDK</td><td>launch spec 全显式，类型直接来自 <code>dsh-sdk-protocol</code>；适合知道自己要启动哪个 runtime 的调用方。</td></tr>
+      <tr><td>Python 生态、脚本、 notebook、最快上手</td><td>Python SDK</td><td>pip 装完即用，捆绑 runtime 免 Node 安装；<code>DeepSeekHarness().run()</code> 三行见结果。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    无论选哪条，三件事不变：stdout 是协议（部署不得组合 stdout logger）；「结果」是活动区间的
+    聚合而非因果归属（要因果，自己在事件流上定义区间）；取消靠关进程或 ACP 的显式
+    <code>session/cancel</code>，SDK wire 上没有 per-prompt 取消。
+  </p>
+
+  <h2 id="sec-recap">21.6 本章回顾</h2>
+  <ul>
+    <li>三条进程外驱动路径（ACP、TS SDK、Python SDK）共同点：都经 stdio JSON-RPC 驱动完整 harness 子进程，都不需要浏览器。</li>
+    <li>ACP 是 automation-only 传输适配器：方法面 initialize/session/new|prompt|cancel/update/request_permission；只发已提交的 assistant 文本；权限选择不进模型请求；连接销毁只清自己精确拥有的 continuable 后代。</li>
+    <li>SDK 三包：protocol（换行分隔 JSON-RPC 2.0 wire 契约，纯库）、server（<code>jsonrpc</code> 插件，inject agents）、client（<code>DeepSeekHarness</code>/<code>HarnessClient</code>，launch 全显式）。</li>
+    <li>wire 语义：<code>session/prompt</code> 立即回 <code>{ messageId }</code> 入队回执；通知是 session.event/session.status/subagent.started|finished；无取消方法，放弃 turn 靠关进程。</li>
+    <li>Python 两发行版：sdk 自动启动匹配捆绑 runtime 并经 <code>DSH_CORDIS_CONFIG</code> 注入默认组合；runtime 本身永远要求显式配置——零配置是 wrapper 的显式注入，不是隐藏回退。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>把 ACP 当 UI 集成或 capability seam——它是 automation-only 传输适配器；编辑器导航、transcript、模式切换都不在面上。</li>
+      <li>期待 ACP 流式 token——只有已提交 <code>assistant/message</code> 的文本块上 wire，原始 delta 不出。</li>
+      <li>把 <code>{ messageId }</code> 当「prompt 的回复 id」——它标识入队的 UserMessage；最终回复靠活动区间聚合。</li>
+      <li>给 runtime 的组合加 stdout logger——stdout 是 JSON-RPC 通道，日志去 stderr。</li>
+      <li>以为 Python 零配置是 runtime 的默认行为——runtime 无显式配置会大声退出；注入发生在 wrapper 的 <code>start()</code>。</li>
+      <li>忘了 <code>close()</code>/<code>await using</code>——子进程由实例持有，不关就漏。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="21">
+    <h2>第 21 章 测验</h2>
+
+    <div class="q" data-id="21-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 三条路都经 stdio 上的 JSON-RPC 驱动完整 harness 子进程，不需要浏览器。"
+         data-rationale="B 正确。A 错，ACP 之外两条是自家协议。C 错，ACP 走 stdio，SDK 也是。D 错，三条路的进程都是完整 harness 组合，由各自配置决定能力面。"
+         data-review="sec-three-paths">
+      <div class="prompt"><span class="qnum">Q1.</span> 三条进程外驱动路径的共同底座是什么？</div>
+      <label class="opt"><input type="radio" name="q-21-1" value="a"> A. 都说标准 Agent Client Protocol</label>
+      <label class="opt"><input type="radio" name="q-21-1" value="b"> B. 都经 stdio 上的 JSON-RPC 驱动一个完整的 harness 子进程，不需要浏览器</label>
+      <label class="opt"><input type="radio" name="q-21-1" value="c"> C. 都走 HTTP 上的 JSON-RPC</label>
+      <label class="opt"><input type="radio" name="q-21-1" value="d"> D. 都只挂最小 agent 核心，不含工具管道</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— automation-only 的传输适配器：只服务程序化客户端，不提供编辑器导航、transcript、模式、配置选择器等人类交互面。"
+         data-rationale="C 正确。A 错，交互渲染属于 Web host/client 模块。B 错，它驱动 ctx.agents 但自身定位是传输适配器而非 seam。D 错，仓库内它有真实客户端（subagent-acp）。"
+         data-review="sec-acp">
+      <div class="prompt"><span class="qnum">Q2.</span> <code>@deepseek-ai/dsh-acp</code> 的定位是什么？</div>
+      <label class="opt"><input type="radio" name="q-21-2" value="a"> A. 带交互界面的完整客户端</label>
+      <label class="opt"><input type="radio" name="q-21-2" value="b"> B. 一个 capability seam 的 Service Definition</label>
+      <label class="opt"><input type="radio" name="q-21-2" value="c"> C. automation-only 的传输适配器，程序化客户端专用</label>
+      <label class="opt"><input type="radio" name="q-21-2" value="d"> D. 仅供仓库内部测试使用，无真实客户端</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-3" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 对每条已提交 assistant/message 的每个非空文本块发一个 agent_message_chunk；原始 delta 与非消息事件不上 wire。"
+         data-rationale="A 正确：用 token 级延迟换干净的自动化结果——未提交内容不可能漏出半截。B/C/D 分别把未提交 delta、推理、工具活动搬上 wire，都与设计相反。"
+         data-review="sec-acp">
+      <div class="prompt"><span class="qnum">Q3.</span> ACP 的 <code>session/update</code> 发什么？</div>
+      <label class="opt"><input type="radio" name="q-21-3" value="a"> A. 已提交 assistant/message 的非空文本块，一块一个 agent_message_chunk</label>
+      <label class="opt"><input type="radio" name="q-21-3" value="b"> B. provider 的原始流式 delta</label>
+      <label class="opt"><input type="radio" name="q-21-3" value="c"> C. 模型推理内容</label>
+      <label class="opt"><input type="radio" name="q-21-3" value="d"> D. 全部工具调用活动</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-4" data-type="fill" data-accepted='["subagent-acp","dsh-subagent-acp","subagent_acp"]'
+         data-answer="dsh-subagent-acp（ACP provider，仓库内的主要 ACP 客户端）。"
+         data-rationale="它把每个子代理跑在全新子进程里、自己当 ACP 客户端——也就是 dsh 可以当别的 dsh 的子代理后端，第 14 章讲过。"
+         data-review="sec-acp">
+      <div class="prompt"><span class="qnum">Q4.</span> 填空：仓库内 ACP 的主要客户端是 <code>______</code>（第 14 章的进程外 subagent provider）。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— dsh-sdk-protocol：换行分隔 JSON-RPC 2.0 的传输类加上两端共用的命名请求/结果/通知类型，纯库、无插件。"
+         data-rationale="B 正确。A 错，那是 server 包。C 错，那是 client 包。D 错，Python SDK 镜像这些类型但不导入它。"
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q5.</span> wire 契约（帧格式与命名类型）由哪个包拥有？</div>
+      <label class="opt"><input type="radio" name="q-21-5" value="a"> A. dsh-sdk-jsonrpc-server</label>
+      <label class="opt"><input type="radio" name="q-21-5" value="b"> B. dsh-sdk-protocol</label>
+      <label class="opt"><input type="radio" name="q-21-5" value="c"> C. dsh-sdk-client</label>
+      <label class="opt"><input type="radio" name="q-21-5" value="d"> D. deepseek-harness-sdk（Python）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 立即返回 { messageId }：它是排队 UserMessage 的入队回执，不等待 agent 活动。"
+         data-rationale="C 正确。A/D 错，协议没有 per-prompt 结果，活动区间由客户端自己定义和观察。B 错，返回发生在 agent 活动之前。"
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q6.</span> SDK 协议的 <code>session/prompt</code> 返回什么？</div>
+      <label class="opt"><input type="radio" name="q-21-6" value="a"> A. 最终助手消息全文</label>
+      <label class="opt"><input type="radio" name="q-21-6" value="b"> B. 等到 agent idle 后的 turn 结束原因</label>
+      <label class="opt"><input type="radio" name="q-21-6" value="c"> C. 立即返回 { messageId } 入队回执</label>
+      <label class="opt"><input type="radio" name="q-21-6" value="d"> D. 该 prompt 的因果结果对象</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A、B、C。"
+         data-rationale="A/B/C 都是协议通知。D 错：没有 per-prompt 结果通知——结果语义由客户端的活动区间聚合，这正是 protocol 的 Known Limitations 之一。"
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q7.</span> 下列哪些是 SDK wire 上的通知类型？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="a"> A. <code>session.event</code></label>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="b"> B. <code>session.status</code></label>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="c"> C. <code>subagent.started</code> / <code>subagent.finished</code></label>
+      <label class="opt"><input type="checkbox" name="q-21-7" value="d"> D. <code>prompt.result</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— stdout 只承载 JSON-RPC 帧；诊断走 stderr，部署不得组合 stdout logger（server 插件不检查兄弟 logger，纪律是部署责任）。"
+         data-rationale="D 正确。A/B/C 都把 stdout 混作日志通道，会腐蚀协议。jsonrpc-demo 的 bin 与 boot 守卫也都只在 stderr 诊断。"
+         data-review="sec-sdk">
+      <div class="prompt"><span class="qnum">Q8.</span> 关于 stdio 通道的纪律，正确的是？</div>
+      <label class="opt"><input type="radio" name="q-21-8" value="a"> A. 日志可以混在 stdout，客户端会过滤</label>
+      <label class="opt"><input type="radio" name="q-21-8" value="b"> B. stderr 与 stdout 都可承载协议帧</label>
+      <label class="opt"><input type="radio" name="q-21-8" value="c"> C. server 插件会主动否决 stdout logger</label>
+      <label class="opt"><input type="radio" name="q-21-8" value="d"> D. stdout 只承载 JSON-RPC 帧，诊断走 stderr</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 自动解析只找生产 exe；dev-only node 载体必须显式 DSH_RUNTIME_MODE=node，生产部署不能悄悄骑在源码构建上。"
+         data-rationale="B 正确。A 错，自动档只认 exe。C 错，默认配置经 DSH_CORDIS_CONFIG 注入的是 runtime-bin 自带的 cordis.yml，Python 侧不写配置内容。D 错，runtime 继承 DEEPSEEK_API_KEY 等环境变量。"
+         data-review="sec-python">
+      <div class="prompt"><span class="qnum">Q9.</span> Python SDK 未指定 channel 时的 runtime 选择行为是？</div>
+      <label class="opt"><input type="radio" name="q-21-9" value="a"> A. 优先 exe，找不到自动改用 node 载体</label>
+      <label class="opt"><input type="radio" name="q-21-9" value="b"> B. 只自动选生产 exe；dev-only node 载体必须显式 DSH_RUNTIME_MODE=node</label>
+      <label class="opt"><input type="radio" name="q-21-9" value="c"> C. 直接用 Python 内置的配置生成器现场写一份 cordis.yml</label>
+      <label class="opt"><input type="radio" name="q-21-9" value="d"> D. 不启动 runtime，等第一次 run() 再现装 Node</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-10" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— runtime 永远要求显式配置（$DSH_CORDIS_CONFIG 或位置参数），没有就大声退出；零配置是 SDK 在 start() 里显式注入配置路径。"
+         data-rationale="C 正确：runtime-bin 不软化 runtime 的硬语义，零配置是 wrapper 一次显式可见的参数注入。A/B 把回退放进 runtime，恰好是被排除的设计。D 错，缺配置是响亮退出，不是空树。"
+         data-review="sec-python">
+      <div class="prompt"><span class="qnum">Q10.</span> 「零配置」在 Python 发行版里的真实机制是什么？</div>
+      <label class="opt"><input type="radio" name="q-21-10" value="a"> A. runtime 内置了默认插件树，无配置时静默启用</label>
+      <label class="opt"><input type="radio" name="q-21-10" value="b"> B. runtime 发现无配置时回退到随包 cordis.yml</label>
+      <label class="opt"><input type="radio" name="q-21-10" value="c"> C. runtime 永远要求显式配置；SDK 侧在 start() 里把默认配置路径注入 DSH_CORDIS_CONFIG</label>
+      <label class="opt"><input type="radio" name="q-21-10" value="d"> D. 缺配置时 runtime 以空组合启动并静默 serve</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="21-11" data-type="short"
+         data-key-points='["ACP：标准协议客户端与跨 harness 委派（subagent-acp 后端，第 14 章）","TS SDK：repo 相邻 TS 自动化/CI，launch spec 全显式，类型直接来自 protocol 包","Python：pip 安装零配置上手，捆绑 runtime 免装 Node，适合脚本与数据侧","三者共同底座：stdio JSON-RPC 驱动完整 harness 子进程，stdout 即协议","共同注意：结果=活动区间聚合而非因果归属；SDK wire 无取消，放弃 turn 靠关进程（ACP 有显式 session/cancel）"]'
+         data-answer="给说标准 ACP 的客户端或要做跨 harness 委派的场景选 ACP——它是 dsh-subagent-acp 的后端，dsh 可以当别的 dsh 的子代理。repo 相邻的 TypeScript 自动化选 TS SDK：launch spec 全显式，调用方知道自己启动的是哪个 runtime。Python 生态、脚本、notebook 选 Python SDK：pip 装完自动带匹配的捆绑 runtime，三行代码见结果。三者共同点是 stdio JSON-RPC 驱动完整 harness 子进程、stdout 即协议；共同的注意点是结果为活动区间聚合而非因果归属，且 SDK wire 上没有取消——放弃一个 turn 要关掉 runtime 进程（ACP 才有显式 session/cancel）。"
+         data-rationale="三个场景对三条路，加上共同底座与两条共同注意事项，选型就完整了。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> 一个新调用方来找你：分别什么处境选 ACP、TS SDK、Python SDK？顺带说说三条路共同的注意事项。</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正回答到的要点——少勾影响校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="22-testing.html"><strong>第 22 章 · 测试体系</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

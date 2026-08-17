@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 7 章 · Agent Loop：Turn/Step 生命周期 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 7 章 · Agent Loop</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="7">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 7 章 · 第二部分 · 核心脊柱</div>
+    <h1>Agent Loop：Turn/Step 生命周期</h1>
+    <p class="lede">
+      前六章你认识了插件、事件、会话日志和 Agent 接口，但一直有一个黑盒：
+      消息进了 inbox 之后，到底是谁、按什么顺序、把「模型请求 → 工具调用 → 再请求」
+      这台机器转起来的？这一章打开这个黑盒。读完你会知道一个 turn 从开门到关门
+      发生的每一件事、哪些事件进日志、哪些只在进程里活着，以及你能在哪些点拦截它。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出 <code>ctx.agentLoop</code>、<code>ReactLoopAgent</code> 与第 6 章 <code>Agent</code> 接口的关系</li>
+      <li>区分 driver（外层循环）、turn（一次被准入的输入排空）、step（一次模型请求 + 它的工具）三层</li>
+      <li>按顺序复述一个完整 turn 的全部事件与扩展点</li>
+      <li>分清 durable 会话事件与 live 进程内事件，以及哪些 waterfall 必须调 <code>next()</code></li>
+      <li>解释 inbox 的 <code>followup</code> / <code>steer</code> / <code>inject</code> 三种投递与并行工具调度、取消恢复的行为</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-driver">7.1 唯一的驱动：ReactLoopAgent 与 ctx.agentLoop</h2>
+
+  <p>
+    第 6 章说过，<code>Agent</code> 是所有插件（UI、hooks、编排器）编程面对的表面：
+    <code>ctx.agents.get(id)</code> 拿到它，往上调 <code>followup()</code>、往下等
+    <code>whenIdle()</code>。但 <code>Agent</code> 只是一个接口 —— 谁来实现「把消息变成模型请求、
+    把模型回复变成工具调用、再把工具结果变成下一个请求」这个循环？
+  </p>
+  <p>
+    答案在 <code>packages/core/agent-loop/</code>。它有两个角色：
+  </p>
+  <ul>
+    <li>
+      <strong><code>AgentLoop</code> 服务（<code>ctx.agentLoop</code>）</strong>：插在
+      <code>packages/core/agent-loop/src/index.ts</code>，是一个 <code>AgentFactory</code> ——
+      负责按配置创建/恢复 agent、发布进 <code>ctx.agents</code> / <code>ctx.sessions</code> 注册表、
+      并拥有有序拆除。它声明 <code class="small">static inject = ['agents', 'sessions', 'llm', 'tools', 'systemPrompt']</code>，
+      也就是说一个 agent loop 天然站在这五个服务的交汇点上。
+    </li>
+    <li>
+      <strong><code>ReactLoopAgent</code>（<code>src/agent.ts</code>）</strong>：真正实现
+      <code>Agent</code> 接口的驱动器。它的模块文档一句话讲清了自己：
+      <em>「驱动排队轮次与步骤边界输入的默认 Agent 驱动；每个请求都从会话日志推导」</em>
+      （Default Agent driver over queued turns and step-boundary input. Every request is
+      derived from the session log.）。它是 <strong>Agent 接口在仓库里的唯一具体驱动</strong>，
+      而且是包内私有实现 —— 循环之外没有任何代码依赖这个类，大家都只依赖接口。
+    </li>
+  </ul>
+  <p>
+    「每个请求都从会话日志推导」值得停一秒。这不是风格偏好，而是第 4 章那条不变量的落点：
+    每个步骤里，模型历史不是内存里攒出来的数组，而是调用
+    <code class="small">session.deriveMessages()</code> 从日志事件流投影出来的。
+    你在本章末尾会看到 <code>packages/core/agent-loop/src/invariant.ts</code> 甚至在
+    <code>llm/stream</code> 上挂了运行时断言：请求里的 messages 必须和日志推导结果逐字节一致。
+  </p>
+  <p>
+    <code>ReactLoopAgent</code> 内部维护一个三态的 <code>Phase</code>：
+    <code>idle</code>（没有活动）、<code>running</code>（一个 driver 正在跑 turn，带 turn/step 计数与
+    AbortController）、<code>maintenance</code>（跑一个非 turn 的维护任务）。状态切换会对外广播
+    <code>agent/status</code>（<code>idle</code> / <code>running</code>），这就是 UI 里那个小状态灯的来源。
+  </p>
+
+  <h2 id="sec-vocabulary">7.2 三层词汇：driver、turn、step</h2>
+
+  <p>
+    先把词表立起来。从外到内三层：
+  </p>
+  <ul>
+    <li>
+      <strong>driver（外层循环，有的系统叫 round）</strong>：一个被唤醒的驱动器会连续拉起 turn，
+      直到没有欠账也没有排队输入才回到 idle。诚实说明：dsh 源码里没有叫 round 的实体 ——
+      外层就是 <code class="small">kick()</code> 里的 <code class="small">while (await this.turn()) {}</code>
+      循环；持久化编号也只到 turn/step 两级。把这一层记成「策略迭代层」即可：它决定要不要再开一个 turn。
+    </li>
+    <li>
+      <strong>turn（轮次）</strong>：一次「把被准入的输入排空」的完整过程，包含零或多个 step。
+      <code>docs/architecture.md</code> 的定义原文是：turn <em>在认领它的第一条输入之前打开，
+      在没有欠账（nothing is owed）时关闭</em>。每个 turn 有单调递增的编号，日志里以
+      <code>turn/start</code> 和 <code>turn/end</code> 一对事件框住，<code>turn/end</code> 携带结束原因
+      <code>TurnEndReason</code>：<code>completed</code> / <code>max-tokens</code> / <code>blocked</code> /
+      <code>aborted</code> / <code>error</code>。
+    </li>
+    <li>
+      <strong>step（步骤）</strong>：一次模型请求加上它调用的全部工具。日志里以
+      <code>step/start</code> 和 <code>step/end</code> 框住，编号在 turn 内从 1 递增。
+      工具结果「欠」一次回应、或有新输入插队，都会催生下一个 step。
+    </li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="driver/turn/step 层级图">
+      <rect x="10" y="20" width="740" height="210" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="30" y="45" style="fill:var(--fg-dim)" font-size="13" font-weight="700">driver（kick 循环 · 书中称 round：策略迭代层）</text>
+      <rect x="30" y="60" width="340" height="150" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="50" y="85" style="fill:var(--accent)" font-size="13" font-weight="700">turn #1（turn/start … turn/end）</text>
+      <rect x="50" y="100" width="140" height="90" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="120" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">step 1</text>
+      <text x="120" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">模型请求</text>
+      <text x="120" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">+ 工具调用</text>
+      <rect x="210" y="100" width="140" height="90" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="280" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">step 2</text>
+      <text x="280" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">工具结果欠回应</text>
+      <text x="280" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ 再请求一次</text>
+      <line x1="190" y1="145" x2="210" y2="145" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="210,145 203,141 203,149" style="fill:var(--muted)"/>
+      <rect x="400" y="60" width="180" height="150" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="420" y="85" style="fill:var(--accent)" font-size="13" font-weight="700">turn #2</text>
+      <rect x="420" y="100" width="140" height="90" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="490" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">step 1</text>
+      <text x="490" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">无工具调用</text>
+      <text x="490" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ 自然收尾</text>
+      <line x1="370" y1="135" x2="400" y2="135" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="400,135 393,131 393,139" style="fill:var(--muted)"/>
+      <rect x="610" y="85" width="120" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="670" y="112" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">idle</text>
+      <text x="670" y="132" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">inbox 空且无欠账</text>
+      <line x1="580" y1="135" x2="610" y2="135" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="610,135 603,131 603,139" style="fill:var(--muted)"/>
+    </svg>
+    <figcaption>driver 连续拉起 turn；一个 turn 含零或多个 step；一个 step = 一次模型请求 + 它调用的工具。</figcaption>
+  </figure>
+
+  <p>
+    一个 turn 也可以<strong>零个 step</strong>：输入被 <code>agent/pre-step</code> 拒绝、或第一批被改写为空时，
+    turn 照样开门和关门（下面 7.3 讲为什么这不是浪费）。反过来，一个 turn 里 step 的数量没有静态上限，
+    只由「有没有欠账」决定。
+  </p>
+
+  <h2 id="sec-turn-flow">7.3 一个完整 turn 的生命周期</h2>
+
+  <p>
+    下面这段流程照 <code>docs/architecture.md</code>「Turn flow」一节展开，每一步我都标了
+    <code>agent.ts</code> 里对应的代码位置。你可以把这一节当成排查问题时的检查清单。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="完整 turn 事件流">
+      <text x="130" y="28" style="fill:var(--fg)" font-size="13" font-weight="700">durable（进日志）</text>
+      <rect x="30" y="18" width="200" height="14" rx="7" style="fill:var(--accent);opacity:.25"/>
+      <text x="420" y="28" style="fill:var(--fg)" font-size="13" font-weight="700">live 扩展点（进程内）</text>
+      <rect x="300" y="18" width="240" height="14" rx="7" style="fill:var(--accent-2);opacity:.25"/>
+
+      <rect x="50" y="45" width="160" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="64" text-anchor="middle" style="fill:var(--fg)" font-size="12">turn/start</text>
+      <line x1="130" y1="75" x2="130" y2="95" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,95 126,88 134,88" style="fill:var(--muted)"/>
+      <rect x="30" y="95" width="200" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="130" y="113" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">claim：认领 next-step 输入</text>
+      <text x="130" y="129" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">+ 一条排队消息（inbox.claim）</text>
+      <line x1="230" y1="117" x2="300" y2="117" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,117 293,113 293,121" style="fill:var(--muted)"/>
+      <rect x="300" y="95" width="240" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="113" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">装配 prompt section + 工具 schema</text>
+      <text x="420" y="129" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">（ctx.systemPrompt.assemble）</text>
+      <line x1="420" y1="139" x2="420" y2="159" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="420,159 416,152 424,152" style="fill:var(--muted)"/>
+      <rect x="300" y="159" width="240" height="38" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="420" y="177" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">agent/pre-step（waterfall）</text>
+      <text x="420" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">reject | enter(messages)</text>
+      <line x1="420" y1="197" x2="420" y2="230" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="420,230 416,223 424,223" style="fill:var(--muted)"/>
+      <rect x="300" y="230" width="240" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--fail)" stroke-width="1.5"/>
+      <text x="420" y="251" text-anchor="middle" style="fill:var(--fail)" font-size="11">reject / 首个 enter 为空 → 无 step 关闭 turn</text>
+      <line x1="130" y1="139" x2="130" y2="290" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,290 126,283 134,283" style="fill:var(--muted)"/>
+      <rect x="50" y="290" width="160" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="309" text-anchor="middle" style="fill:var(--fg)" font-size="12">step/start</text>
+      <line x1="130" y1="320" x2="130" y2="340" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,340 126,333 134,333" style="fill:var(--muted)"/>
+      <rect x="30" y="340" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="359" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">enter 的消息落为 user/message</text>
+      <line x1="130" y1="370" x2="130" y2="390" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,390 126,383 134,383" style="fill:var(--muted)"/>
+      <rect x="30" y="390" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="409" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">deriveMessages() 从日志推历史</text>
+      <line x1="230" y1="405" x2="300" y2="405" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,405 293,401 293,409" style="fill:var(--muted)"/>
+      <rect x="300" y="390" width="240" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="409" text-anchor="middle" style="fill:var(--accent-2)" font-size="12">agent/request → llm/stream</text>
+      <line x1="130" y1="420" x2="130" y2="440" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,440 126,433 134,433" style="fill:var(--muted)"/>
+      <rect x="30" y="440" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="459" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">assistant/chunk × n（逐个入日志）</text>
+      <line x1="130" y1="470" x2="130" y2="490" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,490 126,483 134,483" style="fill:var(--muted)"/>
+      <rect x="30" y="490" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="130" y="509" text-anchor="middle" style="fill:var(--fg)" font-size="12">assistant/message</text>
+      <line x1="130" y1="520" x2="130" y2="540" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,540 126,533 134,533" style="fill:var(--muted)"/>
+      <rect x="30" y="540" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="559" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool/call × n（先记再执行）</text>
+      <line x1="230" y1="555" x2="300" y2="555" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,555 293,551 293,559" style="fill:var(--muted)"/>
+      <rect x="300" y="540" width="240" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="559" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">tools/pre-execute → execute → post-execute</text>
+      <line x1="130" y1="570" x2="130" y2="590" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,590 126,583 134,583" style="fill:var(--muted)"/>
+      <rect x="30" y="590" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="609" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool/result × n</text>
+      <line x1="130" y1="620" x2="130" y2="640" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,640 126,633 134,633" style="fill:var(--muted)"/>
+      <rect x="50" y="640" width="160" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="659" text-anchor="middle" style="fill:var(--fg)" font-size="12">step/end</text>
+      <line x1="540" y1="555" x2="600" y2="555" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="600,555 593,551 593,559" style="fill:var(--muted)"/>
+      <rect x="600" y="500" width="160" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="680" y="525" text-anchor="middle" style="fill:var(--warn)" font-size="11" font-weight="700">欠账判定</text>
+      <text x="680" y="545" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">工具欠一次回应，</text>
+      <text x="680" y="560" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">或 next-step 有新输入</text>
+      <text x="680" y="580" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ 再 claim</text>
+      <text x="680" y="598" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ 下一个 step</text>
+      <line x1="680" y1="500" x2="680" y2="480" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <line x1="680" y1="480" x2="420" y2="480" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="420,480 427,476 427,484" style="fill:var(--muted)"/>
+      <text x="560" y="472" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">回到 step/start（同一 turn）</text>
+      <line x1="130" y1="670" x2="130" y2="678" style="stroke:var(--muted)" stroke-width="2"/>
+      <rect x="300" y="655" width="240" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="674" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">agent/turn-stopping（串行，无 next()）</text>
+      <line x1="230" y1="670" x2="300" y2="670" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,670 293,666 293,674" style="fill:var(--muted)"/>
+      <line x1="420" y1="685" x2="420" y2="692" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="230" y1="670" x2="230" y2="700" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="230" y1="700" x2="130" y2="700" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,700 137,696 137,704" style="fill:var(--muted)"/>
+      <rect x="30" y="686" width="200" height="28" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="130" y="704" text-anchor="middle" style="fill:var(--fg)" font-size="12">turn/end（携带 reason）</text>
+    </svg>
+    <figcaption>
+      完整 turn 事件流（对应 docs/architecture.md「Turn flow」）。蓝框（var(--accent)）是 durable 会话事件；
+      绿框（var(--accent-2)）是 live 扩展点；虚线是「无 step 直接关门」与「下一个 step」两条非常规路径。
+    </figcaption>
+  </figure>
+
+  <p>把流程走一遍，重点看四个门：</p>
+
+  <p>
+    <strong>开门（<code>turn()</code>）。</strong>
+    driver 先落 <code>turn/start</code>，编号取上一个 turn + 1（恢复会话时从日志里
+    <code class="small">findLast(turn/start)</code> 找回，所以编号跨进程持续）。
+    然后进入循环：每个候选 step 先经过 <code>preStep()</code> —— 它做三件事：
+    <code class="small">this.inbox.claim(target, turn)</code> 认领下一步输入加一条排队消息；
+    调 <code class="small">ctx.systemPrompt.assemble()</code> 装配 prompt section 与工具 schema（第 9 章展开）；
+    最后把认领结果交给 <code>agent/pre-step</code> waterfall。
+  </p>
+
+  <p>
+    <strong>准入门（<code>agent/pre-step</code>）。</strong>
+    这是「模型本轮看什么」的权威决策点。默认决定是 <code>enter(messages)</code>；
+    监听器可以改写这批消息，也可以返回 <code>reject</code>。两种结局值得记住：
+  </p>
+  <ul>
+    <li><code>reject</code> → turn 以 <code>{kind:'blocked'}</code> 关闭，一个 step 都不花；</li>
+    <li>
+      第一个 enter 被改写为空 → turn 以 <code>{kind:'completed'}</code> 关闭，同样不花 step。
+      代码注释写得很直白：<em>被移除的唤醒消息或改写为空的 enter 决定仍拥有这个 turn 边界，
+      但它不花任何模型调用</em>。
+    </li>
+  </ul>
+  <p>
+    注意「不花 step」不等于「不留痕迹」：<code>turn/start</code> 和 <code>turn/end</code> 都已落日志，
+    这次尝试永远可查。这正是第 4 章「durable 边界事件框住一切」的用意。
+  </p>
+
+  <p>
+    <strong>step 内部（<code>step()</code> 与 <code>buildRequest()</code>）。</strong>
+    准入通过后：落 <code>step/start</code>，把 enter 的每条消息以 <code>user/message</code> 追加进日志
+    （包括上一 step 工具捎带的 context 与插件注入的上下文）；然后用
+    <code class="small">session.deriveMessages()</code> 从日志推导模型历史；
+    <code>buildRequest()</code> 先让 <code>agent/request</code> waterfall 提议请求配置
+    （provider/model/采样参数），经 <code class="small">ctx.llm.prepareCall()</code> 绑定 adapter，
+    并在配置变化时落 <code>request/header</code> 与 <code>request/context</code> 事件（第 10 章展开）。
+    随后请求进入 <code>llm/stream</code>：流里每个 chunk 立刻以 <code>assistant/chunk</code> 落日志并喂给
+    <code>BlockAssembler</code>；流正常结束时组装出一条 <code>assistant/message</code> 事件
+    （携带 usage 和它引用的 chunk 序列 <code>sourceEventSeqs</code>）。
+  </p>
+
+  <p>
+    如果 assistant 消息里有 <code>tool-call</code> 块，就轮到 <code>executeToolCalls()</code>
+    （7.6）：每个调用先落 <code>tool/call</code>（先记再执行），穿过第 8 章的执行管道，
+    以 <code>tool/result</code> 收尾。工具结果天然欠一次模型回应 —— 除非某个结果标记了
+    <code>concludesTurn</code> —— 所以 loop 再认领、再开下一个 step。assistant 消息没有工具调用、
+    或撞上 <code>max-tokens</code>（该原因在 turn 内是「粘性的」：后续正常完成的 step 不能把它降级），
+    step 就以对应原因结束。
+  </p>
+
+  <p>
+    <strong>关门。</strong>
+    step 结束后若「没有欠账、next-step inbox 也空」，先广播 <code>agent/turn-stopping</code>
+    —— 这是一个<strong>串行、没有 <code>next()</code></strong> 的终局检查点（比如收尾插件在这里做最后动作）——
+    然后落 <code>turn/end</code>。无论中间发生什么，<code>turn/end</code> 在 <code>finally</code> 里追加，
+    崩溃、取消、错误都会得到一个带原因的关門事件。
+  </p>
+
+  <div class="demo" data-demo="turnStepFlow">
+    <div class="demo-title">试一试 —— 走完一个完整的 turn</div>
+    <p>逐步播放一个含两次模型请求、一次工具调用的 turn：</p>
+    <button data-run>下一步</button>
+    <div class="demo-output empty">点击开始。</div>
+  </div>
+
+  <h2 id="sec-events">7.4 两类事件：durable 与 live</h2>
+
+  <p>
+    把 7.3 的流程按「是否进日志」切成两半，你会得到一张值得背下来的表。
+    <strong>durable 事件</strong>是会话日志的一部分，重放、恢复、fork、transcript 全靠它们；
+    <strong>live 事件</strong>只在本进程内广播，用于协调与拦截，进程一死就没了。
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>类别</th><th>事件</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>durable</td>
+        <td><code>turn/start</code>、<code>turn/end</code>、<code>step/start</code>、<code>step/end</code></td>
+        <td>边界框；<code>turn/end</code> 带 <code>TurnEndReason</code></td>
+      </tr>
+      <tr>
+        <td>durable</td>
+        <td><code>user/message</code>、<code>assistant/chunk</code>、<code>assistant/message</code></td>
+        <td>对话表面；chunk 服务回放，message 服务推导</td>
+      </tr>
+      <tr>
+        <td>durable</td>
+        <td><code>tool/call</code>、<code>tool/result</code></td>
+        <td>工具调用对；先记再执行</td>
+      </tr>
+      <tr>
+        <td>durable</td>
+        <td><code>request/header</code>、<code>request/context</code>（以及 llm-retry 的 <code>llm/retry</code> 等）</td>
+        <td>请求配置与环境的可重建快照</td>
+      </tr>
+      <tr>
+        <td>live</td>
+        <td><code>agent/status</code>、<code>agent/error</code>、<code>agent/inbox/inserted|claimed|discarded</code></td>
+        <td>状态与队列协调信号</td>
+      </tr>
+      <tr>
+        <td>live · waterfall</td>
+        <td><code>agent/pre-step</code>、<code>agent/request</code>、<code>agent/request-error</code>、<code>llm/stream</code>、<code>tools/pre-execute</code>、<code>tools/execute</code>、<code>tools/post-execute</code></td>
+        <td>可拦截可改写；监听器<strong>必须调 <code>next()</code></strong> 委托下游，否则短路整条链</td>
+      </tr>
+      <tr>
+        <td>live · serial</td>
+        <td><code>agent/turn-stopping</code></td>
+        <td>串行广播，没有 <code>next()</code>；只做观察/收尾，不能改写决定</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="box note">
+    <div class="box-title">不变量的运行时证据</div>
+    <p style="margin:.4rem 0 0;">
+      <code>packages/core/agent-loop/src/invariant.ts</code> 在 <code>llm/stream</code> 最前面挂了一条断言：
+      loop 构建的请求必须被冻结、携带活的 <code>sessionId</code>，且
+      <code>request.messages</code> 必须与 <code class="small">session.deriveMessages()</code> 的结果完全一致、
+      请求头与日志折叠出的 <code>request/header</code> 一致。任何插件在半路塞给模型一个日志里不存在的东西，
+      都会在这里被抓住 —— 「model-visible ⟺ logged」不只是文档口号，它是被执行的检查。
+    </p>
+  </div>
+
+  <h2 id="sec-inbox">7.5 inbox：所有输入的唯一入口</h2>
+
+  <p>
+    UI 的聊天框、命令系统、hooks、子代理、压缩插件 —— 所有想跟 agent 说话的人，
+    走的都是同一个收件箱。<code>ReactLoopAgent</code> 构造函数里创建
+    <code class="small">new Inbox(session, {...})</code>，并把插入/丢弃/认领即时映射成
+    <code>agent/inbox/inserted</code> / <code>agent/inbox/discarded</code> / <code>agent/inbox/claimed</code> 三个 live 事件。
+    统一入口的语义在 <code>send(message, target, wakeup)</code> 上：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>方法</th><th>target</th><th>唤醒</th><th>语义</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>followup(msg)</code></td><td><code>next-turn</code></td><td>是</td><td>新的一句话，等下一个 turn 处理</td></tr>
+      <tr><td><code>steer(msg)</code></td><td><code>next-step</code></td><td>是</td><td>插队指令，尽快在下一个 step 进入模型视野</td></tr>
+      <tr><td><code>inject(msg)</code></td><td><code>next-step</code></td><td><strong>否</strong></td><td>注入上下文，排队等下一次被准入的请求</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    关键差别在 <code>wakeup</code>：有的消息会立刻唤醒 driver（followup/steer），
+    有的不会（inject）。<code>docs/architecture.md</code> 的扩展表里那句
+    「Add model-facing context → call <code>agent.inject()</code>; it lands in the next admitted request」
+    说的是：注入的内容静静躺在 next-step 队列里，直到某条消息唤醒 driver、
+    或当前 turn 的下一个 step 来认领它。一个空闲的 agent 被 <code>inject()</code> 之后仍然是空闲的。
+  </p>
+  <p>
+    取消与唤醒的交互有一个精细点（源码注释称为 wake latch）：唤醒类输入如果撞上正在取消的活动，
+    会被改派到 <code>next-turn</code> 并在活动收敛到 idle 后重放；而一个已经 idle 的 agent
+    收到的唤醒总会开自己的 turn 边界。你不需要背细节，只需要知道：<strong>唤醒不会丢，
+    顶多晚到</strong>。
+  </p>
+
+  <h2 id="sec-tool-calls">7.6 工具调用的调度：并行池与屏障</h2>
+
+  <p>
+    一个 step 的 assistant 消息可以带多个 <code>tool-call</code> 块。<code>src/tool-calls.ts</code> 的
+    <code>executeToolCalls()</code> 负责调度它们，规则只有三条：
+  </p>
+  <ul>
+    <li>
+      <strong>先分类。</strong> 每个调用经 <code class="small">ctx.tools.executionMode(exec)</code> 分类：
+      只有工具定义的 <code>isConcurrencySafe(args)</code> 恰好返回 <code>true</code> 才是
+      <code>parallel</code>；未声明、抛异常、返回非 true，统统按 <code>exclusive</code> 处理 —— 失败保守。
+    </li>
+    <li>
+      <strong>排他是屏障。</strong> 一个 exclusive 调用单独成组，形成顺序屏障；parallel 调用组成
+      <strong>有上限的滚动池</strong>（<code>maxParallelToolCalls</code>，默认 10，可经 agent-loop 的
+      settings 在运行中调整）。池里「dispatch 可重叠，策略与结果保持模型顺序」：
+      pre-execute 串行按序，工具体并发跑，结果按模型给出的顺序提交落盘。
+    </li>
+    <li>
+      <strong>启动前重新分类。</strong> 每个调用启动前重查当前注册表（工具可能中途被注册/注销），
+      后来变成 exclusive 的调用会等当前池排空、单独成屏障。
+    </li>
+  </ul>
+  <p>
+    取消的语义同样为重放服务：abort 后，<strong>已启动</strong>的调用照常排空并提交结果；
+    <strong>未启动</strong>的调用补一对合成的 <code>tool/call</code> + <code>tool/result</code>
+    （错误码 <code>ABORTED_BEFORE_DISPATCH</code>），保证日志里每个 call 都有 result，
+    重放不缺角。
+  </p>
+
+  <h2 id="sec-cancel-error">7.7 取消、维护与错误恢复：agent handle</h2>
+
+  <p>
+    <code>docs/subsystems/core.md</code>「The agent handle」一节把对外的生命周期方法讲得很清楚，
+    这里挑 loop 视角最相关的四个：
+  </p>
+  <ul>
+    <li>
+      <code>cancel(cause, options?)</code>：默认清空 inbox 并中止活动；传 <code>{keepInbox:true}</code>
+      保留排队工作。第一个原因获胜；没有活动时是 no-op。取消不是硬杀 —— 它沿 AbortSignal
+      协作传播到 step、流、每个工具（第 8 章的工具取消契约同源）。
+    </li>
+    <li>
+      <code>whenIdle()</code>：等整个 agent 达到静止（当前 driver 与后续接替者都跑完）。拆除流程
+      （dispose）就是「一次 <code>cancel({kind:'disposed'})</code> + <code>whenIdle()</code>」。
+    </li>
+    <li>
+      <code>runMaintenance(job)</code>：从真正的 idle 出发跑一个非 turn 维护任务（比如压缩的收尾）；
+      期间到达的唤醒输入留在 inbox，任务结束再重放，对外状态保持 <code>idle</code>。
+    </li>
+    <li>
+      错误恢复：<strong>结构化失败</strong>。<code>LlmError</code> 保留自己的 code/facts，
+      其他异常被 <code>errorChain()</code> 摊平为 <code>UNKNOWN</code> code 文本；失败经
+      <code>agent/error</code> 上报后由 driver 边界容纳，<code>turn/end</code> 记
+      <code>{kind:'error', error}</code>。流内失败先走 <code>agent/request-error</code> waterfall：
+      默认保留原错误；返回 <code>{kind:'retry'}</code> 则<strong>在同一步内</strong>重发请求
+      （llm-retry 插件会在等待前后落 <code>llm/retry</code> 与 <code>llm/retry-started</code> 事件；
+      失败尝试的 chunk 留在日志里，但永远不会被组装成 message，所以不会污染模型历史）。
+    </li>
+  </ul>
+
+  <div class="box key">
+    <div class="box-title">本章的关键直觉</div>
+    <p style="margin:.4rem 0 0;">
+      agent loop 是一台「日志优先」的状态机：先落事件，再做动作；一切模型输入从日志推导，
+      一切边界（turn/step/工具调用）都有 durable 框架。你以后写任何插件，只要问一句
+      「我的行为落在日志的哪一格、拦截在 live 的哪一点」，就不会迷路。
+    </p>
+  </div>
+
+  <h2 id="sec-recap">7.8 本章回顾</h2>
+  <ul>
+    <li><code>ctx.agentLoop</code>（<code>AgentLoop</code> 服务）创建/恢复 agent；<code>ReactLoopAgent</code> 是 <code>Agent</code> 接口的唯一具体驱动，包内私有、每个请求从会话日志推导。</li>
+    <li>三层词汇：driver 外层循环（书中称 round，源码无此命名）> turn（零或多个 step 的排空过程）> step（一次模型请求 + 它的工具）。</li>
+    <li>完整 turn：turn/start → claim → 装配 → agent/pre-step（reject | enter）→ step/start → user/message → derive → agent/request → llm/stream → assistant/chunk* → assistant/message → tool/call* → tools 管道 → tool/result* → step/end → （欠账则下一个 step）→ agent/turn-stopping → turn/end。</li>
+    <li>reject 或首个 enter 为空 → 无 step 关门（blocked/completed），但日志记录尝试；<code>turn/end</code> 永远落盘并携带原因。</li>
+    <li>durable：turn/*、step/*、user/message、assistant/*、tool/*、request/*；live：agent/*、llm/stream、tools/*。waterfall 监听器必须调 <code>next()</code>；<code>agent/turn-stopping</code> 串行无 next()。</li>
+    <li>inbox 统一入口：followup（next-turn，唤醒）、steer（next-step，唤醒）、inject（next-step，不唤醒）。</li>
+    <li>工具调度：isConcurrencySafe 严格判定 parallel；exclusive 成屏障；池有上限；结果按模型顺序提交；abort 为未启动调用补合成结果。</li>
+    <li>handle：cancel/keepInbox、whenIdle、runMaintenance；错误结构化，retry 在同一步内重发。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为「turn 没有执行就等于没有发生」—— 无 step 的 turn 也留下 turn/start + turn/end，这正是审计需要的。</li>
+      <li>在 waterfall 监听器里忘记调 <code>next()</code> —— 你不是「加了个钩子」，你是掐断了整条链（第 2 章语义在这是硬规则）。</li>
+      <li>把 <code>inject()</code> 当成「立刻给模型发消息」—— 它不唤醒 agent，只排队等下一次准入。</li>
+      <li>以为并行工具的「结果顺序」等于「完成顺序」—— 调度可以重叠，提交永远按模型顺序。</li>
+      <li>以为重试会新开一个编号的 turn —— 按 agent.ts 与 llm-retry 测试，retry 动作在同一个 step 内重发请求。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="7">
+    <h2>第 7 章 测验</h2>
+
+    <div class="q" data-id="7-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— ReactLoopAgent 是 Agent 接口的唯一具体驱动，实现包内私有，外部只依赖接口。"
+         data-rationale="B 正确。A 把方向搞反了：Agent 是接口，ReactLoopAgent 是实现。C 错在『多个』——仓库里只有这一个具体驱动。D 错：它没有 UI 职责，UI 通过 session/event 渲染。"
+         data-review="sec-driver">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>ReactLoopAgent</code> 与 <code>Agent</code> 接口的关系是？</div>
+      <label class="opt"><input type="radio" name="q-7-1" value="a"> A. <code>Agent</code> 是 <code>ReactLoopAgent</code> 的子类</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="b"> B. <code>ReactLoopAgent</code> 实现 <code>Agent</code> 接口，是仓库里唯一的具体驱动，且对循环外部私有</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="c"> C. 两者是同一层的两个可互换驱动之一</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="d"> D. <code>ReactLoopAgent</code> 只负责渲染 UI 状态</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— step = 一次模型请求 + 它调用的工具；turn 由零或多个 step 组成。"
+         data-rationale="C 正确。A 把粒度搞反了（那是 turn 的定义）。B 错：一个 turn 可以没有任何 step（reject 或空 enter 关门）。D 错：工具结果欠一次回应时，同一个 turn 里会有多个 step、多次模型请求。"
+         data-review="sec-vocabulary">
+      <div class="prompt"><span class="qnum">Q2.</span> 按 dsh 的定义，一个 <strong>step</strong> 是？</div>
+      <label class="opt"><input type="radio" name="q-7-2" value="a"> A. 零或多个模型请求的排空过程</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="b"> B. 一定包含至少一次模型请求的一个 turn</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="c"> C. 一次模型请求加上它调用的工具</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="d"> D. 一次工具调用及其结果</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-3" data-type="fill" data-accepted='["turn","一个 turn","the turn"]'
+         data-answer="turn（轮次）。"
+         data-rationale="完整生命周期是 turn 级的：turn/start 与 turn/end 框住一切，step 是 turn 内部的细分。填 step 或 driver 都把层级搞错了。"
+         data-review="sec-vocabulary">
+      <div class="prompt"><span class="qnum">Q3.</span> 填空：日志里以 <code>turn/start</code> / <code>turn/end</code> 一对事件框住的完整排空过程叫 ______。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-4" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 拒绝或改空仍然关闭一个 durable turn（记录尝试），但不花任何 step / 模型调用。"
+         data-rationale="D 正确。A、C 都说『什么都不会发生』，错在 turn/start 与 turn/end 仍会落日志。B 错：reject 对应的结束原因是 blocked，不是 error。"
+         data-review="sec-turn-flow">
+      <div class="prompt"><span class="qnum">Q4.</span> <code>agent/pre-step</code> 返回 reject（或首个 enter 被改写为空）时会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-7-4" value="a"> A. 什么都不会发生，日志完全不留痕</label>
+      <label class="opt"><input type="radio" name="q-7-4" value="b"> B. turn 以 error 原因关闭并重试</label>
+      <label class="opt"><input type="radio" name="q-7-4" value="c"> C. 消息被退回 inbox，等下一次唤醒</label>
+      <label class="opt"><input type="radio" name="q-7-4" value="d"> D. turn 仍会开/关（日志记录这次尝试），但不花任何 step</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-5" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A、C、D 都是 durable 事件。B 前半句错：llm/stream 是 live 的进程内 waterfall，不进日志（后半句的 request/header 确实 durable，但整句因前半句而错误）。"
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q5.</span> 下列哪些是 durable 会话事件（会进日志）？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="a"> A. <code>assistant/chunk</code> 与 <code>assistant/message</code></label>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="b"> B. <code>llm/stream</code> 与 <code>request/header</code> —— 两者都随请求落盘</label>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="c"> C. <code>tool/call</code> 与 <code>tool/result</code></label>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="d"> D. <code>turn/end</code>（携带 TurnEndReason）</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— agent/turn-stopping 是串行广播，没有 next()。"
+         data-rationale="B 正确。A、C、D 全是 waterfall，监听者必须调 next() 委托，否则短路链条 —— 这是 Cordis waterfall 语义（第 2 章）在 loop 里的直接应用。"
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q6.</span> 下列哪个 live 扩展点是<strong>串行且没有</strong> <code>next()</code> 的？</div>
+      <label class="opt"><input type="radio" name="q-7-6" value="a"> A. <code>agent/pre-step</code></label>
+      <label class="opt"><input type="radio" name="q-7-6" value="b"> B. <code>agent/turn-stopping</code></label>
+      <label class="opt"><input type="radio" name="q-7-6" value="c"> C. <code>tools/execute</code></label>
+      <label class="opt"><input type="radio" name="q-7-6" value="d"> D. <code>llm/stream</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-7" data-type="fill" data-accepted='["inject","agent.inject","agent.inject()"]'
+         data-answer="agent.inject()。"
+         data-rationale="扩展点表的原文：Add model-facing context → call agent.inject(); it lands in the next admitted request。填 followup/steer 都错 —— 它们是唤醒类投递，语义是用户输入/插队，不是静默注入。"
+         data-review="sec-inbox">
+      <div class="prompt"><span class="qnum">Q7.</span> 填空：要给模型添加可见上下文而不唤醒空闲的 agent，应调用 <code>______</code>，内容会落在下一次被准入的请求里。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— inject 是 next-step + 不唤醒；steer 是 next-step + 唤醒；followup 是 next-turn + 唤醒。"
+         data-rationale="A 正确。B 把 steer 的唤醒语义说反了。C 把 followup 的目标说反了（是 next-turn）。D 全部混淆 —— 三者的差异正是这一节的核心。"
+         data-review="sec-inbox">
+      <div class="prompt"><span class="qnum">Q8.</span> 关于 <code>followup</code> / <code>steer</code> / <code>inject</code> 三个投递方法，正确的是？</div>
+      <label class="opt"><input type="radio" name="q-7-8" value="a"> A. inject 落在 next-step 队列且不唤醒 driver；steer 落在 next-step 且唤醒；followup 落在 next-turn 且唤醒</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="b"> B. 三者都会立刻唤醒 driver，只是队列位置不同</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="c"> C. followup 落在 next-step；steer 落在 next-turn</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="d"> D. inject 会中断当前模型请求并把内容立即拼进 system prompt</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-9" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B 和 C。"
+         data-rationale="B、C 正确：dispatch（工具体）可以重叠，结果按模型顺序提交。A 错：只有 isConcurrencySafe(args) 严格返回 true 才 parallel，未声明/抛错/非 true 都按 exclusive。D 错：未启动的调用会补合成错误结果（ABORTED_BEFORE_DISPATCH），保证重放完整。"
+         data-review="sec-tool-calls">
+      <div class="prompt"><span class="qnum">Q9.</span> 关于一个 step 内多个工具调用的调度，正确的说法是？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="a"> A. 默认所有工具调用并行执行，除非工具显式声明独占</label>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="b"> B. exclusive 调用形成顺序屏障，parallel 调用进入有上限的滚动池</label>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="c"> C. 调度可以重叠，但结果与上下文按模型顺序提交</label>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="d"> D. abort 后未启动的调用不落任何事件</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-10" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— retry 动作让 step() 内部 continue，同一步内重发请求；失败尝试的 chunk 留在日志但不会成为 message。"
+         data-rationale="C 正确（以 agent.ts 代码与 llm-retry 的 transport-recovery 测试为准：重试后 step/start 仍只有 1 个）。A、B 描述的分层与默认行为方向反了：默认是保留原错误，返回 retry 才重发。D 错：不存在的机制。"
+         data-review="sec-cancel-error">
+      <div class="prompt"><span class="qnum">Q10.</span> <code>agent/request-error</code> waterfall 有监听器返回 <code>{kind:'retry'}</code> 时，循环的行为是？</div>
+      <label class="opt"><input type="radio" name="q-7-10" value="a"> A. 立刻抛出 LlmError 并结束会话</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="b"> B. 默认行为就是无限重试，无需监听器</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="c"> C. 在同一个 step 内重新发起模型请求；失败尝试的 chunk 留在日志但不会组成 message</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="d"> D. 打开一个新 session 重放整个对话</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-11" data-type="fill" data-accepted='["deriveMessages","session.deriveMessages","deriveMessages()"]'
+         data-answer="session.deriveMessages()。"
+         data-rationale="模型历史从日志投影而来；invariant.ts 还断言请求 messages 必须与它逐字节一致。填 readMessages/getHistory 之类都是编造。"
+         data-review="sec-driver">
+      <div class="prompt"><span class="qnum">Q11.</span> 填空：每个 step 组装请求时，模型历史通过 <code>______</code> 从会话日志推导出来。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-12" data-type="short"
+         data-key-points='["turn 由 turn/start 与 turn/end 框住，step 由 step/start 与 step/end 框住，turn/end 携带结束原因","agent/pre-step 决定模型看到什么：reject 或改写 enter 的消息","模型请求经 agent/request 与 llm/stream，流以 assistant/chunk 落日志、以 assistant/message 定稿","工具调用先落 tool/call 再执行管道，以 tool/result 收尾，结果欠一次回应则催生下一个 step","durable 与 live 两类事件；waterfall 必须调 next()，agent/turn-stopping 串行无 next()"]'
+         data-answer="一个 turn 从 turn/start 开门：认领 inbox 输入 → 装配 prompt 与工具 schema → agent/pre-step 决定 enter 或 reject（被拒/为空则无 step 关门）→ step/start → enter 消息落 user/message → deriveMessages 推历史 → agent/request/llm/stream 发起请求 → chunk 流落 assistant/chunk、定稿 assistant/message → 工具调用落 tool/call、过 tools 管道、落 tool/result → step/end → 有欠账则下一个 step → 无欠账时 agent/turn-stopping → turn/end。durable 事件（turn/*、step/*、user/message、assistant/*、tool/*）进日志；live 扩展点（agent/*、llm/stream、tools/*）在进程内，waterfall 必须调 next()，agent/turn-stopping 串行无 next()。"
+         data-rationale="对照 7.3 的流程图检查：边界事件、准入门、请求与流、工具段、欠账循环、两类事件的划分，五块都在就完整了。"
+         data-review="sec-turn-flow">
+      <div class="prompt"><span class="qnum">Q12.</span> 用自己的话完整描述一个 turn 从开门到关门的事件序列，并说明 durable 与 live 事件的划分。</div>
+      <textarea class="short" placeholder="写下你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你确实回答到的要点 —— 少勾伤害书的校准，多勾只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    下一章：<a href="08-tools-pipeline.html"><strong>第 8 章 · 工具系统：注册表与执行管道</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

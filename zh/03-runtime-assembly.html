@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 3 章 · 组装一个运行时 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 3 章 · 组装运行时</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="3">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 3 章 · 第一部分 · 全景与心智模型</div>
+    <h1>组装一个运行时：boot、profiles、bundles、补丁层</h1>
+    <p class="lede">
+      你敲下 <code>dsh web</code>、回车、浏览器打开——中间那几秒钟，一棵插件树从零长了出来。
+      本章追踪这棵树的生长过程：profile 决定叠哪些层，bundle 是每层的发行格式，
+      补丁按 id 一层层改写行。读完这章，你能解释你机器上任何一个 dsh 进程里跑着的每一行插件。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能把「一条 dsh 命令启动」拆成：选 profile → 按 dsh.profile 叠 bundle 层 → 套补丁层 → Loader 挂载</li>
+      <li>能说出 profile 目录（<code>$DSH_HOME/profiles/&lt;name&gt;/</code>）里每个文件的角色</li>
+      <li>能解释 bundle 是什么、<code>dsh-base</code> 为什么是每个 profile 的第一层</li>
+      <li>能按正确的层序（bundle → profile 补丁 → home 补丁 → <code>--patch</code>）预测一行的最终 config</li>
+      <li>能用 <code>--dump-config</code> 亲眼检查组合结果，并写出自己的第一条 <code>cordis.patch.yml</code></li>
+    </ul>
+  </div>
+
+  <h2 id="sec-boot-overview">3.1 启动即组装</h2>
+
+  <p>
+    先纠正一个容易带入的想象：dsh 不是「一个编译好的大程序，启动时把功能都加载进来」。
+    准确的说法来自架构文档的第一句：<strong>运行中的 dsh，是启动时从有序层组装出的一棵插件树</strong>。
+    树上每一行是一个插件——第 2 章讲的那种，带 <code>inject</code>、在 <code>ctx</code> 桌上占 key、
+    通过事件通话的插件。
+  </p>
+
+  <p>把 <code>dsh web</code> 拆成步骤：</p>
+
+  <ol>
+    <li><strong>选 profile</strong>：launcher（<code>apps/cli</code>）解析自己的标志，确定要启动 <code>web</code> 这个 profile；</li>
+    <li><strong>解析层列表</strong>：读 profile 的 <code>dsh.profile</code>，得到一份有序的 bundle 名单；</li>
+    <li><strong>组合 entry list</strong>：从<strong>空列表</strong>出发，每个 bundle 贡献一批插件行，再套上你的补丁层；</li>
+    <li><strong>挂载</strong>：Cordis Loader 依 <code>inject</code> 依赖关系挂载这些行（第 2 章的机制）；</li>
+    <li><strong>断言</strong>：启动 glue（<code>packages/boot/app-boot</code>）核对每个启用的行都真的激活了——谁没挂上，报错点名。</li>
+  </ol>
+
+  <p>
+    本章的主角是第 2、3 步：层从哪来、按什么顺序叠、谁覆盖谁。第 4、5 步在第 18 章（CLI 与 boot）展开。
+  </p>
+
+  <h2 id="sec-profiles">3.2 profile：Harness home 里的命名组合</h2>
+
+  <p>
+    <strong>profile 是一份命名组合，存在 Harness home 里。</strong>Harness home 由环境变量
+    <code>$DSH_HOME</code> 指定，默认是 <code>~/.dsh</code>。每个 profile 住一个目录：
+  </p>
+
+  <pre><code>~/.dsh/                       <span class="code-comment"># Harness home（$DSH_HOME，默认 ~/.dsh）</span>
+├── cordis.patch.yml         <span class="code-comment"># home 级补丁层（所有 profile 之上、你的机器全局）</span>
+└── profiles/
+    └── web/                 <span class="code-comment"># 一个 profile = 一个目录</span>
+        ├── package.json     <span class="code-comment"># dsh.profile（bundle 顺序表）+ out-of-tree 插件依赖</span>
+        └── cordis.patch.yml <span class="code-comment"># 这个 profile 自己的补丁层</span></code></pre>
+
+  <p>profile 目录里的 <code>package.json</code> 有两个作用：</p>
+
+  <ul>
+    <li><code>dsh.profile</code> 字段：一份<strong>有序</strong>的 bundle 名单，顺序就是层的顺序；</li>
+    <li><code>dependencies</code>：装你自己（out-of-tree）插件的地方，由 <code>dsh plugin</code> 命令帮你管理。</li>
+  </ul>
+
+  <p>
+    <code>web</code> 和 <code>headless</code> 这两个名字随产品发行模板，<strong>首次使用自动初始化</strong>；
+    其他名字不会凭空存在——必须先用 <code>dsh plugin --profile &lt;name&gt; &lt;pnpm 参数&gt;</code> 创建并装插件，
+    直接启动一个不存在的 profile 会当场报错（失败即大声，见 3.6 节）。
+  </p>
+
+  <div class="box note">
+    <div class="box-title">「一次性」与「常驻」都从这出发</div>
+    <p>
+      第 1 章的两种形态在这里对上了：<code>dsh web</code> 启动 web profile（常驻浏览器应用），
+      <code>dsh --profile headless "任务"</code> 启动 headless profile（一次性 runner，跑完即退）。
+      它们不是两个程序，是两份不同的层叠方案。
+    </p>
+  </div>
+
+  <h2 id="sec-bundles">3.3 bundle：可安装的层</h2>
+
+  <p>
+    <strong>bundle 是一种发行格式：一个 npm 包，里面装着一批 Cordis 配置行和这些行要挂的代码。</strong>
+    关键在于「发行格式」三个字——bundle 插入的行不是特权，它们和平常的行一样，
+    会被<strong>它上面的层</strong>按 id 改写。这正是架构文档强调的性质：
+    「bundle 插入的一切，保持可被上层补丁修改」。
+  </p>
+
+  <p>一个包如何声明自己是 bundle？在 <code>package.json</code> 的 <code>dsh</code> 字段里指向补丁文件：</p>
+
+  <pre><code><span class="code-comment">// packages/bundle/base/package.json（示意）</span>
+{
+  <span class="code-str">"name"</span>: <span class="code-str">"@deepseek-ai/dsh-base"</span>,
+  <span class="code-str">"dsh"</span>: {
+    <span class="code-str">"bundle"</span>: { <span class="code-str">"patch"</span>: <span class="code-str">"./cordis.patch.yml"</span> }
+  }
+}</code></pre>
+
+  <p>产品随发行三个 bundle，角色各异：</p>
+
+  <table>
+    <thead>
+      <tr><th>bundle</th><th>角色</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@deepseek-ai/dsh-base</code></td>
+        <td><strong>每个 profile 的第一层</strong>（78 行左右）：模型适配器（<code>llm-deepseek</code>）、默认模型选择（<code>agent-default-model</code>）、工具（含 <code>tool-bash</code>）、持久化（<code>session-persistence-jsonl</code>）、沙箱与审批策略（<code>bash-sandbox</code> 等）、settings、credentials、遥测。一个 profile 无论多定制，都从这层开始往上叠。</td>
+      </tr>
+      <tr>
+        <td><code>@deepseek-ai/dsh-web-app</code></td>
+        <td>在 base 之上加浏览器应用：Web 服务器、API gateway、workspace、浏览器插件全家桶、coding persona（system-prompt 的 persona 在这层设置，不在 base）。</td>
+      </tr>
+      <tr>
+        <td><code>@deepseek-ai/dsh-headless</code></td>
+        <td>在 base 之上加一次性 runner：禁用 HMR、挂 Code Mode worker，<strong>不挂</strong>任何 Host、HTTP 服务器或浏览器插件。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    为什么把 persona 放 web-app 而不放 base？因为 base 的行要被所有模式共用，而 persona 是「模式相关」的值——
+    dsh 的分层纪律：模式相关的值住在模式 bundle 里，base 保持中性。这条纪律马上会在补丁语义里看到代价与回报。
+  </p>
+
+  <h2 id="sec-layer-order">3.4 层序：从空列表到最终树</h2>
+
+  <p>
+    所有层都往<strong>同一个空 entry list</strong>上叠，顺序固定：
+  </p>
+
+  <ol>
+    <li>profile 列出的<strong>各 bundle</strong>，按 <code>dsh.profile.bundles</code> 的书写顺序（如 base → web-app）；</li>
+    <li>profile 自己的 <code>cordis.patch.yml</code>；</li>
+    <li>home 级的 <code>$DSH_HOME/cordis.patch.yml</code>；</li>
+    <li>命令行 <code>--patch</code> overlay（如果有）。</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="补丁层叠加顺序">
+      <rect x="90" y="300" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="310" y="319" text-anchor="middle" style="fill:var(--fg-dim)" font-size="12" font-weight="700">空 entry list</text>
+      <text x="310" y="336" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">一切从这里开始</text>
+
+      <rect x="90" y="240" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="310" y="259" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">bundle 层 1：dsh-base（78 行左右：模型适配器 · 工具 · 持久化 · 沙箱与审批 · settings/credentials · 遥测）</text>
+      <text x="310" y="276" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">每个 profile 的第一层</text>
+
+      <rect x="90" y="180" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="310" y="199" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">bundle 层 2：dsh-web-app（Web host · API gateway · 浏览器插件 · persona）</text>
+      <text x="310" y="216" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">按 dsh.profile.bundles 的书写顺序</text>
+
+      <rect x="90" y="120" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="310" y="139" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">profile 的 cordis.patch.yml（~/.dsh/profiles/web/）</text>
+      <text x="310" y="156" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">这一份 profile 专属的改写</text>
+
+      <rect x="90" y="60" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="310" y="79" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">home 级 cordis.patch.yml（$DSH_HOME/）</text>
+      <text x="310" y="96" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">你这台机器的全局改写</text>
+
+      <rect x="90" y="10" width="440" height="36" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="310" y="32" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">--patch overlay（命令行临时层）</text>
+
+      <line x1="560" y1="344" x2="560" y2="30" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="560,30 555,40 565,40" style="fill:var(--muted)"/>
+      <text x="578" y="200" style="fill:var(--fg-dim)" font-size="11">越晚应用越优先</text>
+      <text x="578" y="218" style="fill:var(--fg-dim)" font-size="11">（同一 id 后写者赢）</text>
+    </svg>
+    <figcaption>层序：空 entry list → 各 bundle（profile 列出的顺序）→ profile 补丁 → home 补丁 → --patch overlay。补丁按 id 定位行、整行替换或插入新行；同一行后写的层赢。</figcaption>
+  </figure>
+
+  <p>
+    「补丁」能做两件事，也只有这两件事：
+  </p>
+
+  <ul>
+    <li><strong>按 id 替换一行的整份 config</strong>——注意是<strong>整行替换，不做深合并</strong>。
+      你想保留的字段必须原样重述，漏掉的字段就没了。这不是偷懒，是刻意的：整行替换让每一行的最终样子
+      可以只看「最后一个碰它的层」就知道，不用在脑子里做多层合并算术。</li>
+    <li><strong>insert 插入新行</strong>——新插件（你自己写的或第三方装的）从这里进树。</li>
+  </ul>
+
+  <p>
+    真实例子（<code>packages/bundle/web-app/cordis.patch.yml</code>，节选）——web-app 作为后一层，
+    改写 base 里已有的行、并插入自己的新行：
+  </p>
+
+  <pre><code><span class="code-comment"># packages/bundle/web-app/cordis.patch.yml（节选）</span>
+- <span class="code-key">id</span>: <span class="code-str">system-prompt</span>          <span class="code-comment"># 替换 base 里这一行的整份 config</span>
+  <span class="code-key">config</span>:
+    <span class="code-key">persona</span>: <span class="code-str">&gt;-
+      You are a coding agent powered by the {{model}} model.
+      Your working directory is {{cwd}}.</span>
+
+- <span class="code-key">id</span>: <span class="code-str">hmr</span>                     <span class="code-comment"># 也可以只是禁用这一行</span>
+  <span class="code-key">disabled</span>: <span class="code-key">true</span>
+
+- <span class="code-key">insert</span>:                        <span class="code-comment"># 插入 web 才需要的新行</span>
+  - <span class="code-key">id</span>: <span class="code-str">storage</span>
+    <span class="code-key">name</span>: <span class="code-str">'@deepseek-ai/dsh-storage'</span>
+  …</code></pre>
+
+  <div class="demo" data-demo="patchLayers">
+    <div class="demo-title">试一试 —— 补丁层怎么叠加</div>
+    <p>dsh-base 已有 3 行插件；点击把 profile 的 cordis.patch.yml 叠上去：</p>
+    <button data-run>应用补丁层</button>
+    <div class="demo-output empty">点击查看最终插件树。</div>
+  </div>
+
+  <div class="box key">
+    <div class="box-title">预测一行最终 config 的方法</div>
+    <p>
+      从下往上扫层序，找到<strong>最后一个</strong>碰这个 id 的层：如果它替换了 config，最终 config 就是它写的
+      那份（它没重述的字段统统回落到插件代码里的默认值，而不是更低层写的值）；没人碰，就用 bundle 插入时的原始值。
+      「last write wins」按行生效，不同行可以来自不同层。
+    </p>
+  </div>
+
+  <h2 id="sec-dump-config">3.5 亲眼看：dump 出你的树</h2>
+
+  <p>不必靠脑内模拟。这个命令把组合结果原样打印出来，<strong>不启动任何东西</strong>：</p>
+
+  <pre><code>dsh --profile web --dump-config</code></pre>
+
+  <p>
+    它用与真正启动<strong>同一套</strong>解析与补丁算法离线组合（所以打印的和你启动的必然一致），
+    <code>!!js</code> 表达式按原样保留。架构文档接着的那句话是本章的钥匙：
+    「打印出来的任何一行，都能被你自己的补丁替换。」
+  </p>
+
+  <p>动手写你的第一条补丁。在 <code>~/.dsh/profiles/web/cordis.patch.yml</code> 里（示意）：</p>
+
+  <pre><code><span class="code-comment"># ~/.dsh/profiles/web/cordis.patch.yml（示意）</span>
+- <span class="code-key">id</span>: <span class="code-str">agent-default-model</span>     <span class="code-comment"># base 里这行原本是 deepseek-v4-flash</span>
+  <span class="code-key">config</span>:
+    <span class="code-key">provider</span>: <span class="code-str">deepseek-official</span>
+    <span class="code-key">model</span>: <span class="code-str">deepseek-v4-pro</span>       <span class="code-comment"># 整行替换：两个字段都重述了</span>
+
+- <span class="code-key">insert</span>:                        <span class="code-comment"># 再挂一个自己的插件</span>
+  - <span class="code-key">id</span>: <span class="code-str">my-weather</span>
+    <span class="code-key">name</span>: <span class="code-str">'@your-scope/dsh-my-weather'</span></code></pre>
+
+  <p>
+    保存后再跑一次 <code>--dump-config</code>，diff 前后输出：你会看到 <code>agent-default-model</code>
+    那行变了、<code>my-weather</code> 出现了。改运行中的产品，不需要 fork 任何代码——这就是第 2 章
+    「没有特权核心可打补丁」落在你手上的体验。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="补丁按 id 整行替换并插入新行">
+      <text x="110" y="30" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">叠补丁前（dsh-base）</text>
+      <rect x="30" y="46" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="69" text-anchor="middle" style="fill:var(--fg)" font-size="11">agent-default-model</text>
+      <rect x="30" y="90" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="113" text-anchor="middle" style="fill:var(--fg)" font-size="11">tool-bash</text>
+      <rect x="30" y="134" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="157" text-anchor="middle" style="fill:var(--fg)" font-size="11">session-persistence-jsonl</text>
+      <text x="110" y="200" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">model: deepseek-v4-flash</text>
+
+      <rect x="255" y="60" width="170" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="340" y="88" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">cordis.patch.yml</text>
+      <text x="340" y="112" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">- id: agent-default-model</text>
+      <text x="340" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">    config: model: deepseek-v4-pro</text>
+      <text x="340" y="144" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">- insert: my-weather</text>
+      <line x1="195" y1="115" x2="250" y2="115" style="stroke:var(--accent)" stroke-width="2"/>
+      <polygon points="250,115 241,110 241,120" style="fill:var(--accent)"/>
+      <line x1="425" y1="115" x2="480" y2="115" style="stroke:var(--accent)" stroke-width="2"/>
+      <polygon points="480,115 471,110 471,120" style="fill:var(--accent)"/>
+
+      <text x="570" y="30" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">叠补丁后（最终树）</text>
+      <rect x="490" y="46" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="570" y="63" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">agent-default-model</text>
+      <text x="570" y="77" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">← 整行被替换</text>
+      <rect x="490" y="90" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="570" y="113" text-anchor="middle" style="fill:var(--fg)" font-size="11">tool-bash</text>
+      <rect x="490" y="134" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="570" y="157" text-anchor="middle" style="fill:var(--fg)" font-size="11">session-persistence-jsonl</text>
+      <rect x="490" y="178" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="570" y="195" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">my-weather</text>
+      <text x="570" y="209" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">← 新插入</text>
+      <text x="570" y="240" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">model: deepseek-v4-pro</text>
+
+      <text x="340" y="280" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10" font-style="italic">补丁按 id 定位；替换的是整行 config（不深合并），insert 增加新行</text>
+    </svg>
+    <figcaption>一条补丁的两个动作：按 id 整行替换（agent-default-model）、插入新行（my-weather）。其余行原样通过。</figcaption>
+  </figure>
+
+  <h2 id="sec-fails-loud">3.6 失败即大声，改了即生效</h2>
+
+  <p>
+    组装机制这么灵活，出错怎么办？dsh 的立场是一条贯穿全仓库的原则：<strong>misconfiguration fails loud</strong>——
+    配置错误大声失败。加载期能自我证明的错误，在加载期就报出来；boot 的启动 glue 会把挂了一半的树
+    整个拆掉再拒绝启动，而不是带着残缺继续跑。落到本章机制上：
+  </p>
+
+  <ul>
+    <li>profile 名单里列了一个<strong>没有 bundle 声明</strong>的包 → 解析时失败点名；</li>
+    <li><code>cordis.patch.yml</code> 是<strong>空文件或只有注释</strong> → 直接抛错（它解析成「什么都不是」而不是空列表；
+      想禁用这一层，请写 <code>[]</code>）；</li>
+    <li>补丁指向一个<strong>树里不存在的 id</strong> → stderr 警告（提醒你可能拼错了 id）；</li>
+    <li>行声明了但没激活（依赖的服务一直缺席）→ 启动断言报出每个没挂上的插件名。</li>
+  </ul>
+
+  <p>
+    还有对开发体验至关重要的一条：每次 profile 启动都会<strong>盯着你补丁文件的变化</strong>（HMR watch）。
+    保存 <code>cordis.patch.yml</code>，树就地按同一套层序重组；如果新内容读不得、解析不了，
+    <strong>上一个好树继续运行</strong>，失败广播出来——不会因为一次手滑把正在跑的会话弄崩。
+  </p>
+
+  <p>
+    一个体现「大声」价值真实案例：base 的补丁用平台表达式门控两套 shell——
+    <code>tool-bash</code>/<code>bash-sandbox</code> 带
+    <code>disabled: !!js process.platform === 'win32'</code>（bash 没有 Windows 运行器），
+    它们的孪生行 <code>tool-pwsh</code>/<code>pwsh-sandbox</code> 反之。想在自己机器上恢复 bash，
+    你得<strong>补全整份配方</strong>（同时禁用 pwsh 两行、启用 bash 两行）；只做一半，
+    两个执行器族会注册同一个 <code>bash</code> 服务——加载当场失败并告诉你为什么。
+    静默成功一半、留下半残的树，才是这类系统最坏的结果。
+  </p>
+
+  <h2 id="sec-recap">3.7 本章回顾</h2>
+
+  <ul>
+    <li>运行中的 dsh = 启动时从有序层组装出的插件树：选 profile → 按 <code>dsh.profile</code> 叠 bundle → 套补丁 → Loader 按 <code>inject</code> 依赖挂载 → 启动断言。</li>
+    <li>profile 是 Harness home（<code>$DSH_HOME</code>，默认 <code>~/.dsh</code>）里的命名组合：<code>profiles/&lt;name&gt;/</code> 下 <code>package.json</code>（<code>dsh.profile</code> bundle 顺序表 + 插件依赖）和 <code>cordis.patch.yml</code>。<code>web</code>、<code>headless</code> 是随产品发行的模板，首次使用自动初始化；其他 profile 用 <code>dsh plugin</code> 创建。</li>
+    <li>bundle = Cordis 配置行 + 所挂代码的发行格式，<code>package.json</code> 的 <code>dsh.bundle</code> 字段指向补丁文件；它插入的行仍可被上层改写。</li>
+    <li><code>dsh-base</code> 是每个 profile 的第一层：模型适配器、默认模型、工具、持久化、沙箱与审批策略、settings、credentials、遥测。<code>dsh-web-app</code> 加浏览器应用；<code>dsh-headless</code> 加一次性 runner、无服务器。</li>
+    <li>层序：空 entry list → 各 bundle（profile 列出的顺序）→ profile 补丁 → home 级补丁 → <code>--patch</code> overlay。补丁按 id 定位，<strong>整行替换</strong>（不深合并，保留字段要重述）或 <code>insert</code> 新行；同一行后写的层赢。</li>
+    <li><code>dsh --profile web --dump-config</code> 用与启动同一套算法离线打印组合结果；打印出的任何一行都能被你的补丁替换。补丁文件有 HMR 盯着：改了即重组，坏了保留上一个好树。</li>
+    <li><strong>失败即大声</strong>：无 bundle 声明、空/纯注释补丁文件、半份 shell 恢复配方……都在加载期报错，不留静默残缺。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为补丁会深合并——id 补丁替换<strong>整行</strong> config，保留的字段必须原样重述。</li>
+      <li>改产品行为去编辑 <code>packages/bundle/base/cordis.patch.yml</code>——那是发行物；你的改写属于 profile / home 补丁层，用层序赢它。</li>
+      <li>直接启动一个没创建过的 profile 名字——只有 <code>web</code>、<code>headless</code> 自动初始化，其余要先 <code>dsh plugin</code>。</li>
+      <li>以为 <code>--dump-config</code> 会启动服务——它纯离线组合打印，一个进程都不起。</li>
+      <li>补丁 id 拼错后不看 stderr——命中不了任何行的补丁是警告不是报错，树照常启动，静默缺少你以为的改写。</li>
+      <li>想禁用一层补丁就把 <code>cordis.patch.yml</code> 清空——空文件/纯注释会抛错；写 <code>[]</code> 才是显式禁用。</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="3">
+    <h2>第 3 章 测验</h2>
+
+    <div class="q" data-id="3-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 一棵启动时从有序层组装出来的插件树。"
+         data-rationale="C 正确，这是架构文档的原话。A 错：没有预编译的功能容器，树是启动时组合的。B 错：第 2 章讲的是单个插件的形态与通话方式，本章讲树怎么长出来。D 错：进程只是树的宿主，比喻到此为止。"
+         data-review="sec-boot-overview">
+      <div class="prompt"><span class="qnum">Q1.</span> 敲下 <code>dsh web</code> 之后，「运行中的 dsh」本质上是什么？</div>
+      <label class="opt"><input type="radio" name="q-3-1" value="a"> A. 一个预编译好的大程序，启动时把所有功能加载进内存</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="b"> B. 一个单独的 Cordis 插件</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="c"> C. 一棵启动时从有序层组装出来的插件树</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="d"> D. 一组互相独立的操作系统进程</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-2" data-type="fill" data-accepted='["~/.dsh",".dsh","$DSH_HOME 默认 ~/.dsh"]'
+         data-answer="~/.dsh（由 $DSH_HOME 覆盖）。"
+         data-rationale="Harness home 由 $DSH_HOME 指定，默认落在 ~/.dsh；profiles/&lt;name&gt;/ 都在它下面。写 ~/.dsh 即可。"
+         data-review="sec-profiles">
+      <div class="prompt"><span class="qnum">Q2.</span> 填空：未设置 <code>$DSH_HOME</code> 时，Harness home 默认是 <code>______</code>。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— package.json（dsh.profile 的 bundles 顺序表 + out-of-tree 插件依赖）和 cordis.patch.yml。"
+         data-rationale="B 正确：这两件就是 profile 的全部。A 错：cordis.patch.yml 只是一半，顺序表在 package.json 的 dsh.profile 里。C 错：数据库由 session 持久化插件管理，与 profile 结构无关。D 错：node_modules 是 pnpm 装依赖的产物，不是 profile 的组成部分。"
+         data-review="sec-profiles">
+      <div class="prompt"><span class="qnum">Q3.</span> 一个 profile 目录里放什么？</div>
+      <label class="opt"><input type="radio" name="q-3-3" value="a"> A. 只有一个 cordis.patch.yml</label>
+      <label class="opt"><input type="radio" name="q-3-3" value="b"> B. 一个 <code>package.json</code>（<code>dsh.profile</code> 的 bundle 顺序表 + 插件依赖）和一个 <code>cordis.patch.yml</code></label>
+      <label class="opt"><input type="radio" name="q-3-3" value="c"> C. 数据库文件和会话日志</label>
+      <label class="opt"><input type="radio" name="q-3-3" value="d"> D. 只有 node_modules</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 浏览器应用（Web host、API gateway、浏览器插件、persona）。"
+         data-rationale="C 正确：那些属于 dsh-web-app 层。A、B、D 全在 dsh-base 里——它是每个 profile 的第一层，提供模型适配器、工具、持久化、沙箱与审批、settings/credentials/遥测。"
+         data-review="sec-bundles">
+      <div class="prompt"><span class="qnum">Q4.</span> 下列哪项<strong>不在</strong> <code>dsh-base</code> 里？</div>
+      <label class="opt"><input type="radio" name="q-3-4" value="a"> A. 模型适配器（如 llm-deepseek）</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="b"> B. 工具与持久化</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="c"> C. 浏览器应用（Web host、API gateway、浏览器插件）</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="d"> D. 沙箱与审批策略、settings、credentials、遥测</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-5" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 正确：bundle 按 dsh.profile 列出的顺序应用、profile 补丁先于 home 补丁、补丁按 id 定位行。C 反了：--patch overlay 是最后应用的最高优先级层。"
+         data-review="sec-layer-order">
+      <div class="prompt"><span class="qnum">Q5.</span> 关于层序，下列说法正确的有哪些？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="a"> A. bundle 按 <code>dsh.profile.bundles</code> 列出的顺序应用</label>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="b"> B. profile 的 <code>cordis.patch.yml</code> 先于 home 级的生效</label>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="c"> C. <code>--patch</code> overlay 最先应用</label>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="d"> D. 补丁按 id 定位行</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 整行替换：该 id 的整份 config 换成补丁写的这份，不做深合并。"
+         data-rationale="B 正确，也是最容易踩的坑：想保留的字段必须原样重述。A 错：没有深合并层。C 错：补丁可以替换也可以 insert 插入，两种动作。D 错：同 id 的行只有一份，谈不上并行。"
+         data-review="sec-layer-order">
+      <div class="prompt"><span class="qnum">Q6.</span> 一条 <code>- id: X</code> 的补丁命中树里已有的行时，效果是？</div>
+      <label class="opt"><input type="radio" name="q-3-6" value="a"> A. 与原 config 深合并，未提到的字段保留旧值</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="b"> B. 整行替换：config 换成补丁写的整份，未重述的字段回落到插件默认值</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="c"> C. 只能用于禁用行，不能改 config</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="d"> D. 同 id 出现两行，各自独立加载</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-7" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 写一个只含空数组的列表（[]）。"
+         data-rationale="C 正确：[] 是显式的空补丁列表。A、B 都错：空文件或纯注释解析成「什么都不是」而非空列表，直接抛错。D 错：改名只会让 dsh 忽略另一个文件，原文件还在层序里占位，而且这不是禁用语义。"
+         data-review="sec-fails-loud">
+      <div class="prompt"><span class="qnum">Q7.</span> 想临时禁用 profile 的 <code>cordis.patch.yml</code> 这一层，正确写法是？</div>
+      <label class="opt"><input type="radio" name="q-3-7" value="a"> A. 把文件清空</label>
+      <label class="opt"><input type="radio" name="q-3-7" value="b"> B. 只留注释</label>
+      <label class="opt"><input type="radio" name="q-3-7" value="c"> C. 文件内容写成 <code>[]</code></label>
+      <label class="opt"><input type="radio" name="q-3-7" value="d"> D. 把文件改名为 cordis.patch.yml.bak</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— 离线组合并打印最终插件树，不启动任何东西；打印的每一行都可被你的补丁替换。"
+         data-rationale="A 正确：dump 用与启动同一套解析与补丁算法。B 错：它一个进程、一个端口都不起。C 错：它不改任何状态。D 错：dump 是本机离线操作，与 API key 无关。"
+         data-review="sec-dump-config">
+      <div class="prompt"><span class="qnum">Q8.</span> <code>dsh --profile web --dump-config</code> 做什么？</div>
+      <label class="opt"><input type="radio" name="q-3-8" value="a"> A. 用与启动同一套算法离线组合，打印最终插件树，不启动任何东西</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="b"> B. 启动 Web 服务并输出启动日志</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="c"> C. 把当前树写回 cordis.patch.yml</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="d"> D. 调用 LLM API 检查模型连通性</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-9" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 一次性 runner：跑一个全新持久化会话、打印最终答案、退出；不挂 Host、HTTP 服务器或浏览器插件，并禁用 HMR。"
+         data-rationale="D 正确。A 错：无服务器是 headless 的定义特征。B 错：runner 会把任务作为普通用户消息提交，会话是持久化的。C 错：无浏览器插件。"
+         data-review="sec-bundles">
+      <div class="prompt"><span class="qnum">Q9.</span> <code>dsh-headless</code> bundle 的特征是？</div>
+      <label class="opt"><input type="radio" name="q-3-9" value="a"> A. 常驻 HTTP 服务，等任务上门</label>
+      <label class="opt"><input type="radio" name="q-3-9" value="b"> B. 会话不落盘，跑完即弃</label>
+      <label class="opt"><input type="radio" name="q-3-9" value="c"> C. 挂全套浏览器插件，只是不打印 URL</label>
+      <label class="opt"><input type="radio" name="q-3-9" value="d"> D. 一次性 runner：无 Host、无 HTTP、无浏览器插件，禁用 HMR，跑完即退</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-10" data-type="fill" data-accepted='["dsh.bundle","dsh","dsh.bundle.patch"]'
+         data-answer="dsh.bundle（其中的 patch 字段指向补丁文件，如 ./cordis.patch.yml）。"
+         data-rationale="bundle 在 package.json 的 dsh 字段下声明：dsh.bundle.patch 指向补丁文件；profile 侧对应的是 dsh.profile。答 dsh.bundle 或 dsh.bundle.patch 都算对。"
+         data-review="sec-bundles">
+      <div class="prompt"><span class="qnum">Q10.</span> 填空：一个 bundle 在 <code>package.json</code> 里用 <code>______</code> 字段声明自己的补丁文件。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— stderr 警告：提醒你可能有 id 拼错，树仍按其余补丁启动。"
+         data-rationale="B 正确，这是文档写明的行为（patch matching no row goes to warn）。A 错：不是完全静默，stderr 有警告，不看才会漏。C 错：它不构成加载失败。D 错：没有自动创建行的机制——insert 才是加行的方式。"
+         data-review="sec-fails-loud">
+      <div class="prompt"><span class="qnum">Q11.</span> 你的补丁指向一个树里不存在的 id，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-3-11" value="a"> A. 完全静默，什么也不发生</label>
+      <label class="opt"><input type="radio" name="q-3-11" value="b"> B. stderr 打一条警告，树照常按其余补丁启动</label>
+      <label class="opt"><input type="radio" name="q-3-11" value="c"> C. 拒绝启动，抛出加载错误</label>
+      <label class="opt"><input type="radio" name="q-3-11" value="d"> D. 自动创建这个 id 的空行</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-12" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— HMR 监视器按同一套层序就地重组；若新内容读不得或解析失败，上一个好树继续运行并广播失败。"
+         data-rationale="C 正确：每次 profile 启动都通过 watchUserPatches 盯着补丁文件，改文件即热重组，坏内容保留上一个好树。A 错：不用重启。B 错：不会带着崩掉的树继续跑。D 错：就地重组，不是重装依赖。"
+         data-review="sec-fails-loud">
+      <div class="prompt"><span class="qnum">Q12.</span> 正在运行的 dsh 会话里，你保存了 profile 的 <code>cordis.patch.yml</code>，接着会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-3-12" value="a"> A. 什么也不发生，要重启 dsh 才生效</label>
+      <label class="opt"><input type="radio" name="q-3-12" value="b"> B. 树立即按新补丁重组；解析失败也照样应用坏内容</label>
+      <label class="opt"><input type="radio" name="q-3-12" value="c"> C. 监视器按同一套层序就地重组；读不得或解析失败时，上一个好树继续运行并广播失败</label>
+      <label class="opt"><input type="radio" name="q-3-12" value="d"> D. 自动重装 profile 的全部依赖</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-13" data-type="short"
+         data-key-points='["launcher 选定 profile（web 等）并读它的 dsh.profile","从空 entry list 出发按顺序叠各 bundle 层（base → web-app）","再套 profile 的 cordis.patch.yml、home 级 cordis.patch.yml、--patch overlay","补丁按 id 整行替换或 insert 新行，同一行后写的层赢","Cordis Loader 按 inject 依赖挂载这棵树，启动断言核实每个启用的行都激活"]'
+         data-answer="五步：① launcher 解析标志、选定 profile；② 读 dsh.profile 的 bundle 名单，从空 entry list 出发按顺序叠各 bundle 层（base → web-app）；③ 继续套 profile 的 cordis.patch.yml、home 级 cordis.patch.yml、--patch overlay——补丁按 id 整行替换或插入新行，同一行后写的层赢；④ Cordis Loader 按 inject 声明的服务依赖把这棵树挂起来；⑤ 启动 glue 断言每个启用的行都真的激活，谁缺席就报错点名。"
+         data-rationale="五个要点：选 profile、bundle 顺序叠层、三种补丁层的顺序与按 id 语义、inject 驱动挂载、启动断言。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> 从你敲下 <code>dsh web</code> 到插件树就绪，完整描述五个步骤。</div>
+      <textarea class="short" placeholder="写下你的答案…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你真正答到的要点——少勾会损害校准，多勾只骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="04-session-log.html"><strong>第 4 章 · Session Log：事件溯源的真相源</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

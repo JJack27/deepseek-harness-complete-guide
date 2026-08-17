@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 8 章 · 工具系统：注册表与执行管道 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 8 章 · 工具系统</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="8">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 8 章 · 第二部分 · 核心脊柱</div>
+    <h1>工具系统：注册表与执行管道</h1>
+    <p class="lede">
+      上一章你看到 assistant 消息里的 <code>tool-call</code> 被丢进了「tools 管道」。
+      这一章就把这根管子铺开：工具怎么注册、一次调用从模型请求到
+      <code>tool/result</code> 事件要过哪几道闸门、哪里能拒绝、哪里能改写、
+      以及为什么一个被拒绝的调用也一定会留下日志记录。读完你会自己写一个工具插件，
+      并知道该把策略放进管道的哪一层。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>用 <code>ctx.tools.register()</code> 注册一个工具，并说出「注册即效应」的含义</li>
+      <li>复述 <code>ToolDefinition</code> 的组成：schema、<code>output</code> 声明、<code>execute</code>、可选回调</li>
+      <li>按顺序说出执行管道的阶段，以及每阶段能改写/拒绝什么</li>
+      <li>解释为什么拒绝也会产生 <code>tool/result</code> 事件（model-visible ⟺ logged）</li>
+      <li>区分 monotonic guard、<code>tools/execute</code> 包装器与 post-execute 插件各自的适用场景</li>
+      <li>说出工具 UI 渲染意图（render intent）为何是 args 的纯函数</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-registry">8.1 ctx.tools：scoped 工具注册表</h2>
+
+  <p>
+    <code>packages/core/tools/</code> 提供的 <code>ToolRuntime</code> 服务挂在 <code>ctx.tools</code> 上。
+    它同时是两样东西：一个<strong>带 scope 的注册表</strong>和一条<strong>守卫式执行管道</strong>。
+    先看注册表这一半。
+  </p>
+  <p>
+    注册一个工具就是一次效应（第 2 章的规矩在这里同样成立）：
+  </p>
+  <pre><code><span class="code-key">export const</span> name = <span class="code-str">'my-tool'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'tools'</span>]
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx) {
+  <span class="code-key">const</span> dispose = ctx.tools.<span class="code-fn">register</span>(<span class="code-fn">defineTool</span>({ <span class="code-comment">/* … */</span> }))
+  <span class="code-key">return</span> dispose  <span class="code-comment">// 或者交给插件 fiber：fiber 销毁时自动注销</span>
+}</code></pre>
+  <p>
+    <code>register()</code> 返回的 disposer 就是注销函数；注册进哪个 scope 由调用方的 ctx 决定 ——
+    普通插件上下文注册<strong>全局</strong>工具，而通过某个 agent 的 <code>agent.ctx</code> 注册则只对该 agent 可见，
+    并<strong>遮蔽</strong>同名全局工具（第 6 章的 shadowing 在这里的第一现场）。同一层内重名直接抛错，
+    错误信息还会提示你：想要 per-agent 变体，就该用 <code>agent.ctx</code> 注册。
+    注册/注销/范围变化会广播 <code>tools/change</code>（不过滤的通知 —— 全局变化关乎每个 agent 的下一次装配）。
+  </p>
+  <p>
+    scope 上还有两个配套操作：<code class="small">ctx.tools.restrict({allow?, deny?})</code>
+    给某个 agent 的<strong>继承面</strong>套一层 allow/deny 掩码（多个掩码相交；本层自己注册的不受影响）；
+    <code class="small">ctx.tools.presentAs('code')</code> 让一个 agent 单独选择 Code Mode 呈现
+    （部署级默认是 tools 插件的 <code>mode</code> 配置：native / code / both）。这两个方法都只能从
+    scoped context 调用 —— 在普通上下文调用会直接抛错，因为「全局掩码」和「全局呈现」该走配置，
+    不该藏在某个插件的副作用里。
+  </p>
+
+  <h2 id="sec-definition">8.2 ToolDefinition：一个工具的全部声明</h2>
+
+  <p>
+    一个 <code>ToolDefinition</code>（用 <code class="small">defineTool()</code> 包装可获得类型推导）由四块组成，
+    <code>docs/cookbook/adding-a-tool.md</code> 的最小示例是最快的记忆锚点：
+  </p>
+  <ul>
+    <li>
+      <strong>模型可见的 schema</strong>：<code>name</code>、<code>description</code>、<code>parameters</code>。
+      这是模型唯一看到的三个字段 —— 其他一切（超时、并发分类、呈现回调）都不会发给模型。
+    </li>
+    <li>
+      <strong>必选的 <code>output</code> 声明</strong>：<code>{schema, render, presentationMeta?}</code>。
+      工具体只返回一个符合 <code>output.schema</code> 的<strong>规范 JSON 值</strong>；
+      <code>render(args, value)</code> 把它投影成模型可见的 content blocks；
+      <code>presentationMeta</code> 把它投影成可回放的 UI 卡片数据（落 <code>tool/result</code> 的
+      <code>meta</code> 字段）。缺 <code>output</code> 的注册直接 TypeError。
+    </li>
+    <li>
+      <strong><code>execute(args, exec)</code></strong>：真正干活。约定：参数已被校验冻结（<code>defineTool</code>
+      会先验，违规变 <code>INVALID_ARGS</code> 错误结果）；必须观察 <code>exec.signal</code> 做协作取消；
+      抛异常或返回不合声明的值都会被规范化成 <code>isError</code> 结果 —— 工具失败是正常结果路径，不是崩溃。
+      <code>exec</code> 上还有 <code>deferContext(msg)</code>（把上下文推迟到结果落地后注入）与
+      <code>concludeTurn()</code>（标记成功结果终结本 turn）。
+    </li>
+    <li>
+      <strong>可选元数据</strong>：<code>timeoutMs</code>（协作超时预算，策略元数据、不发模型）、
+      <code>isConcurrencySafe(args)</code>（只有严格 <code>true</code> 才可并行，见第 7 章）、
+      <code>finalizeContent</code>（最后一步内容改写，必须同步且全面）、
+      <code>presentCall</code> / <code>presentResult</code>（8.6）。
+    </li>
+  </ul>
+
+  <h2 id="sec-pipeline">8.3 执行管道：五段闸门 + 两条短路</h2>
+
+  <p>
+    当 agent loop 的调度器启动一个调用，它首先把 <code>tool/call</code> <strong>先记进日志</strong>（先记再执行），
+    然后进入 <code>docs/tool-execution-pipeline.md</code> 描述的管道。逐段看：
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="工具执行管道">
+      <rect x="20" y="30" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="49" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">tool/call 落日志</text>
+      <text x="95" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">（先记再执行）</text>
+      <line x1="170" y1="53" x2="205" y2="53" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="205,53 198,49 198,57" style="fill:var(--muted)"/>
+
+      <rect x="205" y="30" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="280" y="49" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">① pre-execute</text>
+      <text x="280" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">waterfall：allow/deny/ask</text>
+      <line x1="355" y1="53" x2="390" y2="53" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="390,53 383,49 383,57" style="fill:var(--muted)"/>
+
+      <rect x="390" y="30" width="140" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="460" y="49" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">② guards</text>
+      <text x="460" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">单调守卫：只许 deny</text>
+      <line x1="530" y1="53" x2="565" y2="53" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="565,53 558,49 558,57" style="fill:var(--muted)"/>
+
+      <rect x="565" y="30" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="640" y="49" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">③ execute（around）</text>
+      <text x="640" y="66" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">超时/重试/指标包装</text>
+      <line x1="640" y1="76" x2="640" y2="110" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="640,110 636,103 644,103" style="fill:var(--muted)"/>
+
+      <rect x="545" y="110" width="190" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="640" y="129" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">工具 execute() 本体</text>
+      <text x="640" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">fs 闸门 / 工具自有事件在这里</text>
+      <line x1="545" y1="133" x2="510" y2="133" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="510,133 517,129 517,137" style="fill:var(--muted)"/>
+
+      <rect x="360" y="110" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="435" y="129" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">④ post-execute</text>
+      <text x="435" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">accept/block/replace/context</text>
+      <line x1="360" y1="133" x2="325" y2="133" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="325,133 332,129 332,137" style="fill:var(--muted)"/>
+
+      <rect x="175" y="110" width="150" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="250" y="129" text-anchor="middle" style="fill:var(--fg)" font-size="12">规范化 + finalizeContent</text>
+      <text x="250" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">快照失败 → isError</text>
+      <line x1="175" y1="133" x2="140" y2="133" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="140,133 147,129 147,137" style="fill:var(--muted)"/>
+
+      <rect x="20" y="110" width="120" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="80" y="129" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">⑤ tools/result</text>
+      <text x="80" y="146" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">只读观测（emit）</text>
+      <line x1="80" y1="156" x2="80" y2="190" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="80,190 76,183 84,183" style="fill:var(--muted)"/>
+
+      <rect x="20" y="190" width="150" height="42" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="95" y="209" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">tool/result 事件</text>
+      <text x="95" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">唯一的模型可见结局</text>
+
+      <path d="M 280 76 C 280 260, 95 240, 95 232" style="fill:none;stroke:var(--fail)" stroke-width="2" stroke-dasharray="6,4"/>
+      <polygon points="95,232 91,240 99,240" style="fill:var(--fail)"/>
+      <text x="240" y="272" style="fill:var(--fail)" font-size="11">拒绝/未审批：跳过本体，但仍以 tool/result 收尾</text>
+
+      <path d="M 640 156 C 640 200, 250 190, 250 156" style="fill:none;stroke:var(--warn)" stroke-width="2" stroke-dasharray="6,4"/>
+      <text x="420" y="196" style="fill:var(--warn)" font-size="11">管道任何阶段抛错 → 规范化为 isError（同一条收尾路径）</text>
+
+      <rect x="20" y="290" width="695" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="367" y="309" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">ask 决定 → ctx.approval 一次性询问：allowed-once 回到 ②；被拒/无审批服务 → 走拒绝短路</text>
+    </svg>
+    <figcaption>
+      工具执行管道（依 docs/tool-execution-pipeline.md）。①–④ 是可改写的 live waterfall/守卫阶段；
+      蓝框（var(--accent)）是 durable 事件；红色虚线是拒绝短路，黄色虚线是异常规范化 —— 所有路径殊途同归于
+      <code>tool/result</code>。
+    </figcaption>
+  </figure>
+
+  <ol>
+    <li>
+      <strong><code>tools/pre-execute</code>（waterfall）</strong>：可扩展的 allow / deny / ask 闸门，
+      hooks、权限策略、沙箱包装都挂这里。监听器必须调 <code>next()</code>；返回 <code>ask</code> 时，
+      若部署挂了 <code>ctx.approval</code> 服务则弹一次性审批（通过则继续，否则按拒绝），没有审批服务就
+      <strong>降级为 deny</strong>。注意 pre-execute <em>故意不提供参数改写</em> —— 参数此刻已经落日志并被呈现过了。
+    </li>
+    <li>
+      <strong>已注册的 monotonic guards</strong>：用 <code class="small">ctx.tools.guard(g)</code> 注册的同步守卫，
+      在 pre-execute 之后、本体之前运行。它只有两个返回值：给出 reason（终局拒绝）或 <code>undefined</code>（弃权）。
+      <strong>没有 allow</strong> —— 所以无论监听器怎么排序，谁都无权把一个已被守卫拒绝的调用改回允许。
+      这就是「单调」的含义：只紧不松。
+    </li>
+    <li>
+      <strong><code>tools/execute</code>（around-dispatch waterfall）</strong>：包住真正的 dispatch。
+      超时、重试、指标这类「围绕执行」的关注点在这里。包装器只能临时替换 <code>exec.signal</code>
+      （比如套一个更紧的截止时间），不能改调用身份；注册表会在本体前把调用方的原信号重新接回。
+    </li>
+    <li>
+      <strong><code>tools/post-execute</code>（waterfall）</strong>：对<strong>已规范化</strong>的结果做后处理 ——
+      接受（可改写内容或规范值、附加 <code>additionalContexts</code> 上下文）或 block（把纠正性反馈变成错误结果）。
+      被拒绝/超时的调用也会到达这里（失败也是结果）。
+    </li>
+    <li>
+      <strong><code>tools/result</code>（emit，只读）</strong>：观测冻结的最终结局。随后由 agent loop
+      落 <code>tool/result</code> durable 事件，附 UI 卡片用的 <code>meta</code>。
+    </li>
+  </ol>
+  <p>
+    管道里还有一个容易漏掉的守门人：注册表在 post 之后做<strong>外层规范化</strong>（任何阶段抛的错、
+    快照失败都统一成 isError），再给工具定义的 <code>finalizeContent</code> 一次最后的内容改写机会，
+    然后才物化、冻结、广播。<strong>无论走哪条路 —— 正常、拒绝、超时、异常 —— 终点都是一条
+    <code>tool/result</code> 事件</strong>。这正是第 4 章不变量在工具侧的形状：模型可见 ⟺ 已记录。
+    一个被策略拒绝的调用，模型会看到拒绝原因，并据此改道；而不是调用凭空消失、让模型对着悬空的
+    call 猜测。
+  </p>
+
+  <div class="demo" data-demo="toolPipeline">
+    <div class="demo-title">试一试 —— 工具调用走一遍执行管道</div>
+    <p>选择一种情形，看管道各阶段发生什么：</p>
+    <label><input type="radio" name="d8" value="ok"> 正常通过</label>
+    <label><input type="radio" name="d8" value="reject"> 前置策略拒绝</label>
+    <label><input type="radio" name="d8" value="timeout"> 守卫超时</label>
+    <div class="demo-output empty">先选一种情形。</div>
+  </div>
+
+  <h2 id="sec-guards">8.4 策略插件实例：guard 组的两个插件</h2>
+  <p>
+    <code>packages/guard/</code> 组里有两个循环卫生/超时插件，它们是「策略放管道、不放进工具」的范本。
+    注意一个容易望文生义的细节：<strong>这个组的两个插件并不都挂在第②段的 guard 位置</strong> ——
+    它们分别演示了管道的不同层：
+  </p>
+  <ul>
+    <li>
+      <strong><code>dsh-repeat-tool-reminder</code>（循环卫生，观测在 ④）</strong>：数每个 agent
+      连续用同样参数调同一工具的次数，到阈值（默认 3/5/8）就注入一条递进的提醒，让模型换个方法或收尾。
+      它<strong>从不否决、从不改写</strong>调用 —— 检测挂在 <code>tools/post-execute</code>
+      （被 deny 的调用也计数：反复撞一个被拒的调用正是值得打断的循环），提醒以
+      <code>additionalContexts</code> 的形式随步骤注入，成为可从日志重建的 user/message。
+      决定权完全留给模型，所以它是 advisory（建议性）插件。
+    </li>
+    <li>
+      <strong><code>dsh-tool-call-timeout-policy</code>（超时，包装在 ③）</strong>：一个
+      <code>tools/execute</code> around-dispatch 监听器。对声明了 <code>timeoutMs</code> 的工具，
+      它给 <code>exec.signal</code> 套上截止时间；超时赢面时把结果替换为结构化的
+      <code>TOOL_TIMEOUT</code> 错误。预算来自工具自己的声明，所以这个插件<strong>零配置</strong>。
+      注意它是协作的：只有真正转发 <code>exec.signal</code> 的工具才会被「超时」 ——
+      忽略信号的工具不会被硬杀。
+    </li>
+  </ul>
+  <p>
+    那么第②段留给谁？留给部署所有者<strong>不可被重排</strong>的最终否决 ——
+    <code class="small">ctx.tools.guard(reason | undefined)</code> 注册的单调守卫。
+    管道文档把它总结为：可重排的扩展策略放 pre-execute，所有者策略放 guard，
+    around 关注点（超时/重试/指标）包 execute，结果观察与改写放 post-execute / tools/result。
+  </p>
+
+  <h2 id="sec-parallel">8.5 并行与顺序：注册表视角</h2>
+  <p>
+    第 7 章讲了调度器怎么用 <code>executionMode</code> 分组；这里补注册表这一侧的事实：
+    <code class="small">ctx.tools.executionMode(exec)</code> 查的是<strong>该 scope 可见的定义</strong>，
+    只有其 <code>isConcurrencySafe(args)</code> 恰好返回 <code>true</code> 才是 parallel ——
+    未知工具、被遮蔽、未声明、分类器抛异常，全部按 exclusive 处理（fail closed）。
+    多个并行调用组成有上限的滚动池（默认 10），exclusive 调用形成屏障；
+    调度可以重叠，但 pre-execute、结果提交、结果上下文都保持模型顺序。
+    取消时已启动的调用照常排空，未启动的补合成错误结果 —— 日志里 call 与 result 永远成对。
+  </p>
+
+  <h2 id="sec-render-intent">8.6 工具的 UI 渲染意图：设计的一部分</h2>
+  <p>
+    一条仓库级约定：工具的 UI 呈现意图（render intent）是工具设计的<strong>一部分，事前决定</strong>，
+    不是 UI 事后猜测。工具通过两个<strong>纯函数</strong>声明卡片：
+  </p>
+  <ul>
+    <li>
+      <code>presentCall(args)</code> → <strong>pending 卡</strong>：在调用开始、还没结果时显示。
+      卡片词汇表是 <code>generic</code>（默认；可带 <code>locations</code> 让编辑器跟随文件位置）、
+      <code>terminal</code>（这条调用就是一条 shell 命令 —— tool-bash）、
+      <code>diff</code>（这条调用创建/修改文件，带 inline diff —— tool-fs 的 write/edit）。
+    </li>
+    <li>
+      <code>presentResult(args, {content, isError, meta})</code> → <strong>完成卡</strong>：
+      除三种基础卡外还有 <code>search</code>（grep/glob 的命中结构）与 <code>web</code>
+      （web_search/web_fetch 的结构化来源）等结果视图，数据来自持久化的 <code>result.meta</code>。
+    </li>
+  </ul>
+  <p>
+    为什么必须是 <strong>args 的纯函数</strong>？因为这些方法<strong>既在实时流中跑，也在会话日志回放时跑</strong>：
+    回放时没有活的会话状态、没有时钟、没有文件系统。所以规则写得很硬：不许 I/O、不许读会话状态、
+    不许用时间/随机 —— 需要结果期事实（比如实际套用的 diff hunk）就把它通过
+    <code>output.presentationMeta</code> 存进 durable 的 <code>meta</code>，回放时从那里取。
+    同时，模型可见的 content 与 UI 可见的卡片是两条轨道：给 UI 的格式（console 围栏、路径相对化）
+    <strong>不许</strong>混进模型结果里。
+  </p>
+
+  <h2 id="sec-schema-bridge">8.7 与 prompt 装配的接口</h2>
+  <p>
+    最后一块拼图：注册的工具 schema 如何变成模型看到的东西？<code>ToolRuntime</code> 构造函数里有一行
+    <code class="small">ctx.systemPrompt.tools(context =&gt; this.wireSchemas(context.scope))</code> ——
+    注册表把自己挂成 system-prompt 的一个<strong>工具 schema 提供者</strong>，按 scope 解析可见工具、
+    投影出 <code>name/description/parameters</code> 三个字段。于是「模型这轮能看到哪些工具」
+    与「这个 scope 能解析哪些工具」永远是同一个答案。装配的完整故事（section 顺序、
+    <code>toolOrder</code> 校验、Code Mode 的 SDK section）是下一章的主题。
+  </p>
+
+  <h2 id="sec-recap">8.8 本章回顾</h2>
+  <ul>
+    <li><code>ctx.tools</code> = scoped 注册表 + 守卫式执行管道；<code>register()</code> 是效应，返回 disposer；scoped 注册遮蔽同名全局工具。</li>
+    <li><code>ToolDefinition</code> = 模型可见 schema + 必选 <code>output</code>（schema/render/presentationMeta）+ <code>execute</code> + 可选元数据；工具体只返回规范 JSON 值。</li>
+    <li>管道顺序：tool/call 落日志 → ① pre-execute（allow/deny/ask + 审批降级）→ ② monotonic guards（只许 deny）→ ③ execute around（超时/重试/指标）→ 工具本体 → ④ post-execute（accept/block/replace/context）→ 规范化 + finalizeContent → ⑤ tools/result（只读）→ tool/result 事件。</li>
+    <li>任何阶段可改写或拒绝；拒绝/超时/异常都会产出 <code>tool/result</code> —— 模型可见 ⟺ 已记录。</li>
+    <li>repeat-tool-reminder 挂 post-execute 做建议性循环卫生；timeout-policy 包 execute 执行工具声明的 <code>timeoutMs</code>；所有者终局否决用 <code>ctx.tools.guard()</code>。</li>
+    <li>并行判定 fail closed：只有 <code>isConcurrencySafe(args)</code> 严格 true 才 parallel；exclusive 成屏障；结果按模型顺序提交。</li>
+    <li>UI 渲染意图（generic/terminal/diff/…）事前决定，<code>presentCall</code>/<code>presentResult</code> 是 args 的纯函数，必须在日志回放时可用。</li>
+    <li>注册表通过 <code>ctx.systemPrompt.tools()</code> 把 schema 汇入 prompt 装配 —— 模型可见工具集与 scope 可见工具集同源。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为拒绝的调用「什么都不发生」—— 管道短路的是<strong>执行</strong>，不是<strong>记录</strong>；<code>tool/result</code> 照落。</li>
+      <li>把部署策略写进工具本体 —— 该上管道：pre-execute 做可扩展策略，guard 做终局否决，execute 做超时/重试，post-execute 做结果处理。</li>
+      <li>期待 pre-execute 改参数 —— 故意不支持：参数已落日志并被呈现，改写会造成日志与执行不一致。</li>
+      <li>以为 <code>timeoutMs</code> 是硬杀 —— 它是协作预算，前提是工具转发 <code>exec.signal</code>。</li>
+      <li>在 <code>presentCall</code> 里读会话状态或文件系统 —— 回放时这些都不存在，卡片必须只依赖 args（+ durable meta）。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="8">
+    <h2>第 8 章 测验</h2>
+
+    <div class="q" data-id="8-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 返回注销函数（disposer）；注册是一次效应，随调用方 fiber 的销毁而撤销。"
+         data-rationale="B 正确。A 错：没有任何『全局锁』。C 错：注册后 schema 自动汇入装配，无需手动推。D 错：恰恰相反，普通 ctx 注册的是全局工具，scoped（agent.ctx）注册才是 per-agent。"
+         data-review="sec-registry">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>ctx.tools.register(definition)</code> 的返回值与语义是？</div>
+      <label class="opt"><input type="radio" name="q-8-1" value="a"> A. 返回一个全局锁句柄，防止其他插件覆盖</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="b"> B. 返回注销函数；注册是效应，随调用方 fiber 销毁自动撤销</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="c"> C. 返回模型 schema，需要手动推送给 systemPrompt</label>
+      <label class="opt"><input type="radio" name="q-8-1" value="d"> D. 返回一个 per-agent 句柄，只能在该 agent 内生效</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-2" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A、C、D 是 ToolDefinition 的正确组成部分。B 错：output 是必选声明，缺了注册直接 TypeError —— 这正是让工具返回值可验证、可投影、可进 Code Mode 的机制。"
+         data-review="sec-definition">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于 <code>ToolDefinition</code> 的组成，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="a"> A. 模型可见的 name / description / parameters 三个字段</label>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="b"> B. <code>output</code> 声明是可选的，只有要 UI 卡片时才需要</label>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="c"> C. <code>execute(args, exec)</code> 只返回规范 JSON 值，渲染由 output.render 负责</label>
+      <label class="opt"><input type="checkbox" name="q-8-2" value="d"> D. <code>isConcurrencySafe</code> 与 <code>timeoutMs</code> 是策略元数据，不会发给模型</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— tool/call 先落日志，然后 pre-execute → guards → execute（around 本体）→ post-execute → 规范化/finalizeContent → tools/result → tool/result。"
+         data-rationale="C 正确。A 把本体放到 post 之后，顺序反了。B 漏掉了 guards 这个不可重排的终局否决层。D 把 emit 型的 tools/result 说成 waterfall，且漏了 post-execute。"
+         data-review="sec-pipeline">
+      <div class="prompt"><span class="qnum">Q3.</span> 执行管道的正确顺序是？</div>
+      <label class="opt"><input type="radio" name="q-8-3" value="a"> A. tool/call → execute 本体 → pre-execute → guards → post-execute → tool/result</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="b"> B. tool/call → pre-execute → execute → post-execute → guards → tool/result</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="c"> C. tool/call → pre-execute → guards → execute（around 本体）→ post-execute → 规范化+finalizeContent → tools/result → tool/result</label>
+      <label class="opt"><input type="radio" name="q-8-3" value="d"> D. tool/call → guards → tools/result waterfall → tool/result</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— guard 是单调的：只能给出终局拒绝理由或弃权，没有 allow，因此顺序无法把拒绝翻回允许。"
+         data-rationale="A 正确。B 描述的是 waterfall（pre-execute）的能力，guard 正是为了封死它。C 错：guard 在工具本体之前。D 错：guard 可以全局注册也可以经 agent.ctx 注册到单个 agent。"
+         data-review="sec-pipeline">
+      <div class="prompt"><span class="qnum">Q4.</span> 「monotonic guard」的单调性体现在？</div>
+      <label class="opt"><input type="radio" name="q-8-4" value="a"> A. 守卫只能拒绝或弃权，没有允许返回值，任何排序都无法把拒绝变回允许</label>
+      <label class="opt"><input type="radio" name="q-8-4" value="b"> B. 守卫按注册顺序单调执行，后面的可以覆盖前面的决定</label>
+      <label class="opt"><input type="radio" name="q-8-4" value="c"> C. 守卫在工具本体之后运行，只能观察结果</label>
+      <label class="opt"><input type="radio" name="q-8-4" value="d"> D. 守卫只能注册在全局层，不能按 agent 生效</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 拒绝仍产出 tool/result 事件：模型可见 ⟺ 已记录，模型能看到被拒原因并改道。"
+         data-rationale="D 正确。A、B 描述的『静默消失/抛异常』都会让模型面对悬空的 tool-call。C 说对了记 call 但漏了关键的 result —— 结果事件才是模型看到的结局。"
+         data-review="sec-pipeline">
+      <div class="prompt"><span class="qnum">Q5.</span> 一个调用在 <code>tools/pre-execute</code> 被策略拒绝后，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-8-5" value="a"> A. 调用静默消失，模型不知道它发生过</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="b"> B. 整个 turn 以 error 原因终止</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="c"> C. 只记 tool/call，不记任何结果</label>
+      <label class="opt"><input type="radio" name="q-8-5" value="d"> D. 管道短路跳过本体，但仍以一条 isError 的 tool/result 收尾，模型可见拒绝原因</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-6" data-type="fill" data-accepted='["tools/execute","tools execute","execute waterfall"]'
+         data-answer="tools/execute（around-dispatch waterfall）。"
+         data-rationale="超时/重试/指标是『围绕 dispatch』的关注点，包在 tools/execute 上；pre-execute 是准入、post-execute 是结果处理、guard 是终局否决。timeout-policy 就是这么挂的。"
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q6.</span> 填空：要给工具调用套截止时间、重试或指标收集，应包装 ______ waterfall。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— repeat-tool-reminder 挂在 tools/post-execute，从否决不拦截，以 additionalContexts 注入建议性提醒。"
+         data-rationale="B 正确。A 错：它不阻止任何调用（advisory）。C 错：它不是 guard 阶段的守卫，检测在 post-execute。D 错：没有这样的强制升级机制 —— 决定权在模型。"
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q7.</span> <code>dsh-repeat-tool-reminder</code> 的行为是？</div>
+      <label class="opt"><input type="radio" name="q-8-7" value="a"> A. 在 guard 阶段阻止重复的工具调用</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="b"> B. 在 tools/post-execute 观测重复（被拒调用也计数），经 additionalContexts 注入递进提醒，决定权留给模型</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="c"> C. 重写工具结果，把重复调用的输出替换为空</label>
+      <label class="opt"><input type="radio" name="q-8-7" value="d"> D. 到阈值后自动熔断该工具并强制换路</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 预算来自工具定义自己的 timeoutMs，插件零配置；超时是协作的，只有转发 exec.signal 的工具会真正停下。"
+         data-rationale="C 正确。A 错：没有插件级超时配置（零配置）。B 错：它是协作通知，不硬杀进程。D 错：代码里根本没有这个字段名。"
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q8.</span> <code>dsh-tool-call-timeout-policy</code> 的超时预算从哪来、如何生效？</div>
+      <label class="opt"><input type="radio" name="q-8-8" value="a"> A. 插件自己的配置项，按工具名逐个设置</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="b"> B. 全局默认 30 秒，硬杀超时进程树</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="c"> C. 读取工具定义声明的 timeoutMs（零配置），在 tools/execute 里给 exec.signal 套截止，超时替换为结构化 TOOL_TIMEOUT 结果</label>
+      <label class="opt"><input type="radio" name="q-8-8" value="d"> D. 读取 <code>ToolDefinition.timeout</code> 字段并杀死子进程</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-9" data-type="mcq" data-multiselect="true" data-correct='["a","d"]'
+         data-answer="A 和 D。"
+         data-rationale="A、D 正确。B 错：presentCall 的返回值是 pending 卡视图（ToolCallView），不是完成卡。C 错：卡片词汇表是 generic / terminal / diff（结果视图另有 search/web），『list』不存在。"
+         data-review="sec-render-intent">
+      <div class="prompt"><span class="qnum">Q9.</span> 关于工具的 UI 渲染意图，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="a"> A. presentCall / presentResult 必须是纯函数，因为它们既在实时流也在日志回放时运行</label>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="b"> B. presentCall 返回完成卡的最终内容</label>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="c"> C. 卡片种类有 generic / terminal / diff / list 四种</label>
+      <label class="opt"><input type="checkbox" name="q-8-9" value="d"> D. 结果期事实（如实际应用的 diff）应经 presentationMeta 存进 durable 的 result.meta，回放时取用</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-10" data-type="fill" data-accepted='["ctx.systemPrompt.tools","systemPrompt.tools","ctx.systemPrompt.tools()"]'
+         data-answer="ctx.systemPrompt.tools(...) —— 注册表把自己挂成工具 schema 提供者。"
+         data-rationale="ToolRuntime 构造函数里注册 ctx.systemPrompt.tools(provider)，按 scope 解析可见工具并投影 name/description/parameters。『模型可见工具集』与『scope 可见工具集』同源。"
+         data-review="sec-schema-bridge">
+      <div class="prompt"><span class="qnum">Q10.</span> 填空：注册表通过 <code>______</code> 把工具 schema 汇入 system prompt 装配。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="8-11" data-type="short"
+         data-key-points='["部署策略不写进工具本体：pre-execute 做可扩展 allow/deny/ask 准入","ctx.tools.guard() 提供不可重排的终局否决（单调：只许拒绝）","tools/execute 包装 dispatch，服务超时/重试/指标这类 around 关注点","tools/post-execute 改写结果或附加 additionalContexts；tools/result 只读观测","所有路径（含拒绝/超时/异常）都收尾于 tool/result 事件，满足 model-visible ⟺ logged"]'
+         data-answer="策略放在管道：可扩展的准入策略挂 tools/pre-execute（allow/deny/ask，ask 经 ctx.approval 一次性审批、无审批服务则降级为 deny）；部署所有者的终局否决用 ctx.tools.guard() 注册单调守卫（只能拒绝或弃权，排序无法翻案）；超时/重试/指标包装 tools/execute（around dispatch）；结果改写/拦截/附加上下文用 tools/post-execute，tools/result 只读观测。任何结局都产出 tool/result 事件，模型可见 ⟺ 已记录。"
+         data-rationale="对照 8.3/8.4 检查：准入、终局否决、around、结果处理、观测五层各就各位，且没有把策略塞进 execute 本体，就完整了。"
+         data-review="sec-guards">
+      <div class="prompt"><span class="qnum">Q11.</span> 假设你要给部署加一条「所有写入工作区外的调用一律拒绝，且不许任何插件翻案」的策略，再加上「bash 调用 60 秒超时」。分别应该挂在哪里？为什么不能写进工具本体？</div>
+      <textarea class="short" placeholder="写下你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你确实回答到的要点 —— 少勾伤害书的校准，多勾只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    下一章：<a href="09-system-prompt.html"><strong>第 9 章 · System Prompt 装配</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

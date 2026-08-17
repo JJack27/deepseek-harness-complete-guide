@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 10 章 · LLM 能力层：adapter seam 与流式词汇 — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 10 章 · LLM 能力层</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="10">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 10 章 · 第二部分 · 核心脊柱</div>
+    <h1>LLM 能力层：adapter seam 与流式词汇</h1>
+    <p class="lede">
+      前两章的尽头都是同一个调用：<code class="small">ctx.llm.stream(request)</code>。
+      这一章讲它背后的世界 —— <code>packages/llm/</code> 如何定义一套与供应商无关的
+      消息和流式词汇、adapter 如何像插头一样换进换出、流式的 chunk 怎么变成日志里的
+      <code>assistant/message</code>，以及换一家模型供应商到底要动多少代码（答案：一个新 adapter 插件）。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>说出 <code>ctx.llm</code> 的双重身份：adapter 注册表 + 统一的流式调用 API</li>
+      <li>复述消息词汇：<code>Message</code>、content blocks、<code>StreamChunk</code> 协议与 <code>BlockAssembler</code></li>
+      <li>描述一次流式回复如何经 <code>llm/stream</code> → <code>assistant/chunk</code>* → <code>assistant/message</code> 进日志</li>
+      <li>说出 llm 组五个包的分工：llm / llm-deepseek / llm-pi-ai / llm-retry / token-meter</li>
+      <li>解释 <code>ctx.agentDefaultModel</code> 与 <code>prepareCall()</code> / <code>request/header</code> 的关系</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-adapter-seam">10.1 ctx.llm：一个 adapter seam</h2>
+
+  <p>
+    <code>packages/llm/llm</code> 提供的 <code>LlmRuntime</code> 服务挂在 <code>ctx.llm</code> 上。
+    它是第 11 章要正式命名的 capability seam 在 LLM 领域的实例：
+    一个<strong>供应商中立的消息与流式词汇</strong>（所有包共说的语言），加上一个
+    <strong>adapter 注册表</strong>（可替换的实现）。
+  </p>
+  <p>
+    核心注册 API 只有一个：
+  </p>
+  <pre><code><span class="code-key">const</span> handle = ctx.llm.<span class="code-fn">registerAdapter</span>([<span class="code-str">'deepseek-official'</span>], adapter)
+<span class="code-comment">// all-or-nothing：一个 provider 路由同时只能有一个 adapter（重名抛 DUPLICATE_ADAPTER）</span>
+<span class="code-comment">// handle.dispose() 注销；handle.replace(providers) 原子换路由，无空窗</span></code></pre>
+  <p>
+    请求通过 <code>GenerateOptions.provider</code> 选择 adapter；<code>model</code> 由 adapter 自己解释
+    （目录是建议性的，未列出的模型 id 也原样通过）。配套的查询面：
+    <code class="small">listProviders()</code> / <code class="small">listModels(provider)</code> /
+    <code class="small">resolveModelInfo(provider, model)</code>（拿精确模型的上下文窗口、输出默认、
+    reasoning 档位）—— 它们是给选择器 UI 用的发现面，不是路由白名单。
+  </p>
+  <p>
+    <strong>换模型供应商 = 写一个新 adapter 插件</strong>（继承 <code>LlmAdapter</code>，实现
+    <code>stream()</code>，可选实现元数据方法），注册几条 provider 路由，完毕。
+    loop、session、工具、UI 一行不改 —— 这正是第 3 章组装与第 11 章 seam 的兑现处。
+  </p>
+
+  <h2 id="sec-streaming">10.2 消息与流式词汇</h2>
+
+  <p>
+    <code>docs/subsystems/llm-streaming.md</code> 是这层的字典。三层词汇从粗到细：
+  </p>
+  <ul>
+    <li>
+      <strong><code>Message</code></strong>：带稳定 <code>MessageId</code>、角色（system/user/assistant）、
+      内容块数组的不可变值。模型产出的 assistant 消息在 source 里携带
+      <code>provider</code>、<code>model</code> 与可选的 adapter 私有 <code>replayState</code>。
+      构造函数（<code class="small">createUserMessage / createAssistantMessage / createToolResultMessage</code>）
+      产出深冻结的值 —— 消息从诞生起就是不可变的。
+    </li>
+    <li>
+      <strong>content blocks</strong>：消息内容是类型化块的数组 —— <code>text</code>、
+      <code>reasoning</code>（思考，区别于可见文本）、<code>tool-call</code>（带 <code>CallId</code>、
+      名字、原始 JSON 参数串）、<code>tool-result</code>（嵌套内容 + <code>isError</code>）。
+      块联合来自可合并扩展的 <code>ContentBlockMap</code> —— 新模态（图像等）只有在
+      adapter/UI/压缩/回放路径都支持时才进核心表。
+    </li>
+    <li>
+      <strong><code>StreamChunk</code> 原始流协议</strong>：adapter 吐的不是消息，是
+      <code>block-start</code> / <code>text-delta</code> / <code>reasoning-delta</code> /
+      <code>tool-call-delta</code> / <code>block-end</code> / <code>usage</code> / <code>finish</code>
+      七种原始块（usage 先于 finish）。每个流只有一个终结 <code>finish</code>；
+      操作性失败以 <code>{kind:'error'|'aborted', failure}</code> 的 finish 收场，
+      <strong>不跨流 API 抛异常</strong> —— 这是服务边界的一贯约定。
+    </li>
+  </ul>
+  <p>
+    把 chunk 拼回消息的是 <code>BlockAssembler</code> —— 全仓库唯一一份拼装实现，
+    agent loop 和它共享。这个「原始 chunk 协议 + 共享拼装器」的设计意味着：
+    任何新 adapter 只要会说 chunk 语言，UI 的逐字渲染、日志的 chunk 保真、
+    消息的定稿就全部自动工作。
+  </p>
+
+  <h2 id="sec-stream-to-log">10.3 流式如何进日志</h2>
+
+  <p>
+    把第 7 章的调用链放大到 LLM 层（<code>agent.ts</code> 的 <code>step()</code>）：
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="流式回复进入日志的路径">
+      <rect x="30" y="30" width="200" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="130" y="52" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">agent loop（step 内）</text>
+      <text x="130" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">冻结的请求（provider/model/messages/tools）</text>
+      <line x1="230" y1="58" x2="290" y2="58" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="290,58 283,54 283,62" style="fill:var(--muted)"/>
+
+      <rect x="290" y="30" width="180" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="380" y="52" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">llm/stream waterfall</text>
+      <text x="380" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">缓存/日志/路由可在此拦截</text>
+      <line x1="470" y1="58" x2="530" y2="58" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="530,58 523,54 523,62" style="fill:var(--muted)"/>
+
+      <rect x="530" y="30" width="240" height="56" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="650" y="52" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">adapter（选中的注册）</text>
+      <text x="650" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">llm-deepseek 或 llm-pi-ai …</text>
+
+      <line x1="650" y1="86" x2="650" y2="130" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="650,130 646,123 654,123" style="fill:var(--muted)"/>
+      <rect x="500" y="130" width="300" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="650" y="152" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">StreamChunk 流</text>
+      <text x="650" y="170" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">block-start · text-delta · … · usage · finish</text>
+
+      <line x1="500" y1="160" x2="330" y2="160" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="330,160 337,156 337,164" style="fill:var(--muted)"/>
+      <rect x="90" y="128" width="240" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="210" y="150" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">每个 chunk 落 assistant/chunk</text>
+      <text x="210" y="168" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">同时喂给 BlockAssembler（双轨）</text>
+      <text x="210" y="183" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">流失败 → agent/request-error → 保留/重试</text>
+
+      <line x1="210" y1="192" x2="210" y2="240" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="210,240 206,233 214,233" style="fill:var(--muted)"/>
+      <rect x="60" y="240" width="300" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2.5"/>
+      <text x="210" y="263" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">流正常结束：assistant/message</text>
+      <text x="210" y="281" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">携带 usage、source（provider/model）、</text>
+      <text x="210" y="296" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">sourceEventSeqs = 引用的全部 chunk seq</text>
+
+      <line x1="360" y1="275" x2="440" y2="275" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="440,275 433,271 433,279" style="fill:var(--muted)"/>
+      <rect x="440" y="240" width="320" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="600" y="263" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">deriveMessages() 只取 message 事件</text>
+      <text x="600" y="281" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">chunk 只服务 UI 逐字渲染与忠实回放</text>
+      <text x="600" y="296" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">第 4 章的 chunk/message 分工在这里落地</text>
+
+      <text x="400" y="345" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">下一 step：deriveMessages 从日志推导历史 → 请求前缀与日志永远一致（invariant 断言）</text>
+    </svg>
+    <figcaption>
+      一次流式回复的完整路径：冻结请求 → llm/stream waterfall → adapter → StreamChunk 流；
+      每个 chunk 落 <code>assistant/chunk</code>（var(--accent) 框），流终结时一条
+      <code>assistant/message</code> 定稿并引用全部 chunk。
+    </figcaption>
+  </figure>
+
+  <p>
+    三个要点：
+  </p>
+  <ul>
+    <li>
+      <strong>双轨消费</strong>：loop 一边把每个 chunk 以 <code>assistant/chunk</code> 落日志
+      （保住流式与 UI 回放的保真度），一边喂给 <code>BlockAssembler</code> 攒块。
+      只有流正常走到 <code>finish</code>，才组装出一条 <code>assistant/message</code> 事件
+      —— 它是<strong>唯一</strong>参与 <code>deriveMessages()</code> 的 assistant 表面。
+    </li>
+    <li>
+      <strong>失败不产生 message</strong>：终结 finish 是 error/aborted 时，先经
+      <code>agent/request-error</code> waterfall（第 7 章：默认保留原错误，返回
+      <code>{kind:'retry'}</code> 则同一步内重发）。失败尝试的 chunk 留在日志里，
+      但永远不会被组装成 message，模型历史不受污染。哪怕一次 max-tokens 截断的空内容回复，
+      也会有一条 message 事件（记录 usage 和空的 chunk 引用列表）。
+    </li>
+    <li>
+      <strong><code>llm/stream</code> 是 waterfall</strong>：缓存、日志、路由类插件包在这里；
+      监听器必须调 <code>next()</code>。请求对象由 loop 深冻结并打上
+      <code>sessionId</code> 标记（<code class="small">markAgentLoopRequest()</code>），
+      第 7 章的 invariant 就是在这个口上校验「请求 ⟺ 日志推导」一致的。
+    </li>
+  </ul>
+
+  <div class="demo" data-demo="streamChunks">
+    <div class="demo-title">试一试 —— chunk 流与 message 事件</div>
+    <p>逐步播放一次流式回复：</p>
+    <button data-run>再来一个 chunk</button>
+    <div class="demo-output empty">点击开始。</div>
+  </div>
+
+  <h2 id="sec-adapters">10.4 llm 组的五个包</h2>
+
+  <table>
+    <thead>
+      <tr><th>包</th><th>角色</th><th>要点</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>dsh-llm</code></td>
+        <td>词汇 + 服务</td>
+        <td>Message / StreamChunk / BlockAssembler / HarnessError 家族；<code>ctx.llm</code> 注册表与流式 API</td>
+      </tr>
+      <tr>
+        <td><code>dsh-llm-deepseek</code></td>
+        <td>DeepSeek 官方 adapter</td>
+        <td>独占 <code>deepseek-official</code> 路由；直连 fetch + SSE（eventsource-parser 解帧）；
+        凭据经 <code>ctx.credentials</code> 读 <code>apiKeyEnv</code>（默认 <code>DEEPSEEK_API_KEY</code>），
+        <code>baseURL</code> 默认读 <code>DEEPSEEK_BASE_URL</code> 再退公网地址；
+        thinking/reasoningEffort、maxTokens（默认 256000）、空闲读超时等都是配置</td>
+      </tr>
+      <tr>
+        <td><code>dsh-llm-pi-ai</code></td>
+        <td>多供应商 adapter</td>
+        <td>经 <code>@earendil-works/pi-ai</code> 把任意 provider/profile（含 OpenAI 兼容网关、自建端点）
+        变成配置声明 —— 路由名刻意与官方区分（如 pi-ai 的 <code>deepseek</code>），可与官方 adapter 并存</td>
+      </tr>
+      <tr>
+        <td><code>dsh-llm-retry</code></td>
+        <td>重试执行器</td>
+        <td>不包 <code>ctx.llm.stream()</code>；挂 <code>agent/request-error</code> 按各 provider 的
+        retryPolicy 退避重试，等待前后落 <code>llm/retry</code> / <code>llm/retry-started</code> durable 事件</td>
+      </tr>
+      <tr>
+        <td><code>dsh-token-meter</code></td>
+        <td>token 计量</td>
+        <td><code>ctx.tokenMeter</code> 从日志逐会话折叠用量（4 字符/token 的固定启发式），
+        供压缩等压力敏感插件共享；可选挂出 tokenUsage / contextPressure / contextBreakdown 投影</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    「重试不包 stream、计量从日志折叠」这两处设计都体现同一条原则：
+    <strong>所有跨边界的可观测事实都以日志为准</strong>，进程内的包装只做策略。
+    另外注意配对关系：llm-retry 消费 adapter 注册时携带的 retryPolicy；
+    token-meter 复用 provider 上报的 usage（assistant/message 里的 usage 字段），
+    只在无法对齐时退回启发式估算。
+  </p>
+
+  <h2 id="sec-default-model">10.5 请求配置：从默认模型到 request/header</h2>
+
+  <p>
+    一个 agent 的 provider/model 从哪来？入口点位（如 <code class="small">dsh --profile headless</code>、
+    Host 侧的 ApiProxy）在创建没有会话本地选择的 Agent 时，读
+    <code>packages/core/agent-default-model</code> 提供的 <code>ctx.agentDefaultModel</code>：
+    插件配置要求 <code>{provider, model}</code>，
+    <code class="small">currentSelection()</code> 返回当前选择（设置提供方可在其上分层用户选择），
+    <code class="small">saveSelection()</code> 保存完整用户选择。它不校验目录成员 ——
+    「这个模型可用吗」由真正开请求的一方诊断。
+  </p>
+  <p>
+    选定后，配置怎么变成一次请求？第 7 章已经见过 <code>buildRequest()</code> 的骨架，这里补 LLM 侧细节：
+  </p>
+  <ol>
+    <li>
+      <code>agent/request</code> waterfall 提议 <code>LlmCallConfig</code>
+      （provider/model/reasoningEffort/temperature/maxTokens/stop —— 会话级状态，不是随手改的旋钮）。
+    </li>
+    <li>
+      <code class="small">ctx.llm.prepareCall(config)</code> 做一次精确模型查询：校验显式 effort、
+      物化 adapter 默认值（哪些字段是默认给的会记在 <code>adapterDefaults</code> 标记里），
+      并把当次的 adapter 注册与不可变 retryPolicy 绑成一个一次性 <code>PreparedLlmCall</code>
+      —— 之后 HMR 换 adapter 也不会把 A 家的能力查询和 B 家的请求拼在一起。
+    </li>
+    <li>
+      loop 把生效配置以 <code>request/header</code> 事件落日志（首条 reason 为
+      <code>initial</code>/<code>resume</code>，之后仅在实际变化时落 <code>change</code>），
+      供应商/模型/上下文窗口变化再落一条 <code>request/context</code>。
+      下一轮提议会略去被标记为 adapter 默认的字段 —— 换路由后各字段重新解析，不会被旧默认值污染。
+    </li>
+  </ol>
+  <p>
+    于是「模型当时被怎样调用」与「模型当时看到什么」一样，全部可从日志重建。
+    顺带一提测试通道：真实 API 的 e2e 测试读 <code>DEEPSEEK_API_KEY</code>
+    （可选 <code>DEEPSEEK_BASE_URL</code>），没有 key 时自动跳过 —— 凭据永远不进配置文件，
+    走 <code>ctx.credentials</code> 的引用式解析。
+  </p>
+
+  <div class="box key">
+    <div class="box-title">本章的关键直觉</div>
+    <p style="margin:.4rem 0 0;">
+      LLM 层把「供应商差异」压进 adapter 一个点，把「流式事实」压进 chunk/message 两种事件，
+      把「调用配置」压进 request/header 一条日志。三样都做完，剩下的系统就可以对
+      「哪个模型、哪家供应商」完全无感。
+    </p>
+  </div>
+
+  <h2 id="sec-recap">10.6 本章回顾</h2>
+  <ul>
+    <li><code>ctx.llm</code> = 供应商中立词汇 + adapter 注册表；<code>registerAdapter(providers, adapter)</code> 一个 provider 路由一个 adapter，换供应商就是换插件。</li>
+    <li>词汇三层：Message（不可变、带 id/角色/source）→ content blocks（text/reasoning/tool-call/tool-result，可合并扩展）→ StreamChunk 原始流协议（七种块，唯一 finish 终结，失败也走 finish 不抛异常）。</li>
+    <li><code>BlockAssembler</code> 是唯一拼装器；chunk 双轨消费：落 <code>assistant/chunk</code> 保真 + 攒块；流终结才落一条 <code>assistant/message</code>，deriveMessages 只认 message。</li>
+    <li>llm 组分工：llm（词汇/服务）、llm-deepseek（deepseek-official 路由）、llm-pi-ai（多供应商）、llm-retry（挂 agent/request-error，落 llm/retry 事件）、token-meter（从日志折叠用量）。</li>
+    <li><code>ctx.agentDefaultModel</code> 供入口点位读部署默认；<code>prepareCall()</code> 绑定精确模型默认与 retryPolicy；生效配置以 <code>request/header</code> 落日志，adapter 默认字段带标记、换路由重新解析。</li>
+    <li>e2e 测试读 <code>DEEPSEEK_API_KEY</code> / <code>DEEPSEEK_BASE_URL</code>，无 key 自跳过；凭据走 <code>ctx.credentials</code> 引用。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见误区</div>
+    <ul style="margin:0;">
+      <li>以为 adapter 失败会抛异常穿透 —— 不会：一切失败规范化为流的终结 finish（error/aborted），消费者丢弃未完成的块。</li>
+      <li>把 <code>listModels()</code> 当路由白名单 —— 目录是建议性的发现面，未列出的模型 id 原样通过。</li>
+      <li>在 <code>llm/stream</code> 监听器里改请求或忘调 <code>next()</code> —— 请求是深冻结的（loop 请求还被 invariant 校验），忘调 next() 短路整条链。</li>
+      <li>以为重试是包在 stream 外面的重发循环 —— llm-retry 挂 <code>agent/request-error</code>，每个 adapter 调用始终是一次供应商尝试。</li>
+      <li>以为 <code>request/header</code> 每个 step 都落一条 —— 只在首条（initial/resume）与实际变化（change）时落；采样配置是会话级状态，不是每步旋钮。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="10">
+    <h2>第 10 章 测验</h2>
+
+    <div class="q" data-id="10-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 新写一个 LlmAdapter 子类并 registerAdapter 注册 provider 路由；loop/session/UI 不用改。"
+         data-rationale="C 正确。A 错：llm 层恰恰把供应商差异隔离在 adapter，一处不改是常态。B 错：那是 llm-pi-ai 已经提供的通用路径，但不是唯一做法。D 错：模型发现面是建议性的，不承担接入职责。"
+         data-review="sec-adapter-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> 想接入一家新模型供应商，正确做法是？</div>
+      <label class="opt"><input type="radio" name="q-10-1" value="a"> A. 修改 agent-loop 与 session 包以适配新 API</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="b"> B. 必须使用 llm-pi-ai 并为它写 provider 配置</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="c"> C. 写一个实现 stream() 的 LlmAdapter 子类，registerAdapter 注册其 provider 路由</label>
+      <label class="opt"><input type="radio" name="q-10-1" value="d"> D. 在 listModels 目录里登记新模型即可</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 正确。C 错：消息内容是类型化块数组，不是单个字符串；『整段纯文本』只是 text 块的一种取值。"
+         data-review="sec-streaming">
+      <div class="prompt"><span class="qnum">Q2.</span> 关于消息与流式词汇，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="a"> A. Message 从构造起就带稳定 id 且深冻结不可变</label>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="b"> B. assistant 消息的 source 携带 provider/model 与可选 replayState</label>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="c"> C. 消息内容是整段纯文本字符串，流式时按行拆块</label>
+      <label class="opt"><input type="checkbox" name="q-10-2" value="d"> D. StreamChunk 协议含 block-start/text-delta/…/usage/finish，usage 先于 finish</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-3" data-type="fill" data-accepted='["assistant/message","assistant message","message"]'
+         data-answer="assistant/message。"
+         data-rationale="chunk 只服务 UI 渲染与忠实回放；deriveMessages 只取 message 事件 —— 第 4 章的分工在流式路径上的落地。"
+         data-review="sec-stream-to-log">
+      <div class="prompt"><span class="qnum">Q3.</span> 填空：<code>deriveMessages()</code> 推导模型历史时，assistant 侧只认 ______ 事件。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 失败的 chunk 留在日志，但不会被组装成 message，模型历史不受污染。"
+         data-rationale="B 正确。A 错在『回滚/删除』—— 日志 append-only，失败痕迹保留。C 错：不存在这样的合成重放。D 错：失败的流恰恰不产生 message 事件。"
+         data-review="sec-stream-to-log">
+      <div class="prompt"><span class="qnum">Q4.</span> 一次模型请求中途失败（finish 为 error）后，已落的 <code>assistant/chunk</code> 事件会怎样？</div>
+      <label class="opt"><input type="radio" name="q-10-4" value="a"> A. 被回滚删除，日志恢复到请求前</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="b"> B. 保留在日志里，但永远不会被组装成 assistant/message，不进入模型历史</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="c"> C. 被合成为一条半截的 assistant/message 以便 UI 回放</label>
+      <label class="opt"><input type="radio" name="q-10-4" value="d"> D. 自动替换为等长的占位文本</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-5" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— deepseek-official；与 pi-ai 的路由名刻意区分，二者可并存。"
+         data-rationale="A 正确。B 是 llm-pi-ai 侧的目录路由名。C、D 均非真实路由名。重名注册同一路由会抛 DUPLICATE_ADAPTER。"
+         data-review="sec-adapters">
+      <div class="prompt"><span class="qnum">Q5.</span> <code>dsh-llm-deepseek</code> 独占的 provider 路由名是？</div>
+      <label class="opt"><input type="radio" name="q-10-5" value="a"> A. deepseek-official</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="b"> B. deepseek</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="c"> C. dsk</label>
+      <label class="opt"><input type="radio" name="q-10-5" value="d"> D. official-deepseek</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— llm-retry 挂 agent/request-error waterfall，按 provider 的 retryPolicy 退避重试，每次 adapter 调用仍是一次尝试。"
+         data-rationale="C 正确。A 正是它不做的（README 明说不包 ctx.llm.stream）。B 错：dsh 供应商中立，重试与品牌无关。D 错：等待与启动都落 durable 事件。"
+         data-review="sec-adapters">
+      <div class="prompt"><span class="qnum">Q6.</span> <code>dsh-llm-retry</code> 实现重试的方式是？</div>
+      <label class="opt"><input type="radio" name="q-10-6" value="a"> A. 包装 ctx.llm.stream()，在流内部重发</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="b"> B. 只为 DeepSeek 供应商工作</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="c"> C. 监听 agent/request-error，按各 provider 注册时携带的 retryPolicy 退避，等待前后落 llm/retry 与 llm/retry-started 事件</label>
+      <label class="opt"><input type="radio" name="q-10-6" value="d"> D. 静默重试，不产生任何日志事件</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-7" data-type="mcq" data-multiselect="true" data-correct='["a","d"]'
+         data-answer="A 和 D。"
+         data-rationale="A、D 正确：prepareCall 物化 adapter 默认并标记来源，绑定的注册让 HMR 不能拼错家。B 错：prepareCall 拒绝的是自身的重用或字段变更（INVALID_PREPARED_CALL），与 loop 请求是否冻结无关。C 错：显式请求值优先，默认只在请求缺省时物化。"
+         data-review="sec-default-model">
+      <div class="prompt"><span class="qnum">Q7.</span> 关于 <code>prepareCall()</code> 与请求配置，正确的有？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="a"> A. 它做精确模型查询，物化 adapter 默认值并标记哪些字段来自默认</label>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="b"> B. 它会拒绝一切被冻结的请求</label>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="c"> C. adapter 默认的 maxTokens 会覆盖用户显式请求的值</label>
+      <label class="opt"><input type="checkbox" name="q-10-7" value="d"> D. 它把当次的 adapter 注册与 retryPolicy 绑成一次性 PreparedLlmCall，防 HMR 拼接两家的结果</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 首条 initial/resume，之后仅在实际变化时落 change。"
+         data-rationale="B 正确。A 会淹没日志且没必要（配置是会话级状态）。C、D 混淆了 durable 事件与 live 事件（request/header 是 durable 的）。"
+         data-review="sec-default-model">
+      <div class="prompt"><span class="qnum">Q8.</span> <code>request/header</code> 事件的落盘节奏是？</div>
+      <label class="opt"><input type="radio" name="q-10-8" value="a"> A. 每个 step 都落一条</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="b"> B. 首条带 initial/resume，之后仅在实际变化时落 change</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="c"> C. 只在进程启动时落一条，之后不再落</label>
+      <label class="opt"><input type="radio" name="q-10-8" value="d"> D. 是 live 事件，不进日志</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-9" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— token-meter 从日志逐会话折叠用量，优先复用 provider 上报的 usage，对不上才退回启发式。"
+         data-rationale="D 正确。A 错：token-meter 不在流路径上拦截。B 错：没有配置项，启发式是刻意固定的。C 错：调用 provider 计数 API 的说法是编造。"
+         data-review="sec-adapters">
+      <div class="prompt"><span class="qnum">Q9.</span> <code>dsh-token-meter</code> 的计量方式是？</div>
+      <label class="opt"><input type="radio" name="q-10-9" value="a"> A. 在 llm/stream waterfall 里拦截每个请求现场计数</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="b"> B. 调用各 provider 的官方计数 API，参数可配置</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="c"> C. 每个 adapter 自己上报，token-meter 只做聚合展示</label>
+      <label class="opt"><input type="radio" name="q-10-9" value="d"> D. 从 durable 日志做逐会话折叠：请求包络对得上就复用 assistant/message 里的 provider usage，否则退回 4 字符/token 启发式</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-10" data-type="fill" data-accepted='["DEEPSEEK_API_KEY","deepseek_api_key"]'
+         data-answer="DEEPSEEK_API_KEY（可选 DEEPSEEK_BASE_URL；无 key 时 e2e 自跳过）。"
+         data-rationale="真实 API 的 e2e 通道读这两个环境变量；凭据不进配置文件，经 ctx.credentials 引用式解析。"
+         data-review="sec-default-model">
+      <div class="prompt"><span class="qnum">Q10.</span> 填空：真实 API 的 e2e 测试读取环境变量 <code>______</code>（缺失时自动跳过）。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-11" data-type="short"
+         data-key-points='["llm/stream 是 waterfall：缓存/日志/路由类插件包在这里，必须调 next()，请求深冻结且带 sessionId 标记","每个 chunk 落 assistant/chunk 事件并同时喂 BlockAssembler（双轨）","流正常终结才落 assistant/message（usage/source/sourceEventSeqs）；deriveMessages 只认 message","失败流走 agent/request-error：默认保留错误，retry 动作在同一步内重发；失败 chunk 不成 message","调用配置经 agent/request 提议、prepareCall 绑定 adapter 默认与 retryPolicy、request/header 落日志可重建"]'
+         data-answer="loop 构建冻结请求并打上 sessionId 标记，进入 llm/stream waterfall（缓存/日志/路由插件在此，必须调 next()），到达当次 prepareCall 绑定的 adapter，adapter 吐 StreamChunk 流。loop 双轨消费：每个 chunk 落 assistant/chunk 事件并喂 BlockAssembler；流正常终结才组装出一条 assistant/message（携带 usage、provider/model source、引用全部 chunk 的 sourceEventSeqs），deriveMessages 只认 message 事件，下一 step 的请求前缀与日志推导保持一致。失败流以 error/aborted finish 终结并走 agent/request-error（默认保留错误，retry 同步内重发），失败 chunk 留日志但不成 message。调用配置由 agent/request 提议、prepareCall 绑定，生效值以 request/header 落日志 —— 调用侧同样可从日志重建。"
+         data-rationale="对照 10.3 的图检查：waterfall、双轨 chunk、message 定稿与推导、失败路径、配置落日志五块都在就完整。"
+         data-review="sec-stream-to-log">
+      <div class="prompt"><span class="qnum">Q11.</span> 用自己的话描述一次流式回复从 agent loop 发起到进入会话日志的完整路径，并说明失败流的处理。联想：为什么说调用配置也可从日志重建？</div>
+      <textarea class="short" placeholder="写下你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只勾选你确实回答到的要点 —— 少勾伤害书的校准，多勾只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    下一章：<a href="11-capability-seams.html"><strong>第 11 章 · Capability Seam 模式</strong></a>。
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

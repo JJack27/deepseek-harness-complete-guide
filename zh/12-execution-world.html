@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 12 章 · 执行世界：shell、subprocess、terminal、sandbox — dsh 专家之路</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ dsh 专家之路</a>
+  <span class="crumb">第 12 章 · 执行世界</span>
+  <span class="spacer"></span>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="12">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "zh", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">第 12 章 · 第三部分 · Capability Seams 专题</div>
+    <h1>执行世界：shell、subprocess、terminal、sandbox</h1>
+    <p class="lede">
+      上一章你学会了 seam 方法论；本章进入它最重的应用现场。<strong>执行世界</strong>（execution world）
+      指模型命令实际发生的地方——进程、文件系统、终端共同构成的一个连贯环境。
+      dsh 用一组互相咬合的 seam 把它组织起来：<code>ctx.shell</code> 执行命令、<code>ctx.subprocess</code>
+      生成进程树、<code>ctx.terminals</code> 持久 PTY、<code>ctx.sandbox</code> 约束进程、
+      <code>ctx.e2b</code> 把整个世界搬到云端。读完本章，三种部署路线（本机直跑 / 本机沙箱 / E2B 云沙箱）
+      在你眼里会是同一张图的三种 provider 选择。
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">学习目标</div>
+    <ul>
+      <li>能画出执行世界的分层：模型工具 → shell / terminals seam → provider → subprocess / sandbox 底座</li>
+      <li>能讲清 <code>ShellExecutor</code> 的词汇与 request/spec split，以及为什么默认值解析必须是显式的 <code>resolve()</code> 步骤</li>
+      <li>能描述 <code>ctx.subprocess</code> 的进程树语义（tree-scoped 终止、stdio 三种处置、环境擦洗）与 PTY 原语</li>
+      <li>能解释 <code>ctx.sandbox.confine(argv, policy)</code> 的包装模型、三种模式只管文件效果、fail-closed 语义，以及 <code>sandbox-policy</code> 为什么是共享 home</li>
+      <li>能区分一次性 bash 与持久 terminal 会话，并说出 E2B 与 pwsh 家族在图中的位置</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-execution-world">12.1 全景：一个执行世界，三条路线</h2>
+
+  <p>
+    先看整张图，再逐层拆解。模型可见的工具在最上层——它们全都是第 11 章定义的 Consumer。
+    中间是 seam 层：一次性命令走 <code>ctx.shell</code>，持久会话走 <code>ctx.terminals</code>，
+    两者脚下是同一个 <code>ctx.subprocess</code> 进程底座；沙箱不是第四个平行世界，
+    而是 provider 在 spawn 之前插入的一道包装（<code>ctx.sandbox</code> + <code>ctx.sandboxPolicy</code>）。
+    最下层是三条可切换的路线。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="执行世界全景图">
+      <rect x="20" y="15" width="660" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="350" y="38" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">模型可见工具（Consumer）</text>
+      <text x="350" y="56" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool-bash · tool-pwsh · tool-terminal · tool-bash-persistent · tool-fs-search · tool-lsp</text>
+
+      <line x1="350" y1="67" x2="350" y2="88" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="350,91 346,83 354,83" style="fill:var(--muted)"/>
+
+      <rect x="20" y="93" width="320" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="180" y="116" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.shell（一次性命令 seam）</text>
+      <text x="180" y="134" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">run(spec) / start(spec) / sandboxMode</text>
+
+      <rect x="360" y="93" width="320" height="52" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="520" y="116" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.terminals（持久 PTY seam）</text>
+      <text x="520" y="134" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">owner-scoped 会话注册表 · 命名 backend</text>
+
+      <rect x="20" y="170" width="660" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="350" y="190" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.subprocess（进程底座 seam）</text>
+      <text x="350" y="207" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">spawn / spawnTerminal / resolveExecutable / scrubbedParentEnv</text>
+
+      <rect x="20" y="228" width="660" height="46" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="350" y="248" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">ctx.sandbox + ctx.sandboxPolicy（spawn 前的约束包装）</text>
+      <text x="350" y="265" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">confine(argv, policy) 返回应改跑的 argv · mode + workspaceRoot 每次调用随行</text>
+
+      <line x1="180" y1="145" x2="180" y2="167" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="180,170 176,162 184,162" style="fill:var(--muted)"/>
+      <line x1="520" y1="145" x2="520" y2="167" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="520,170 516,162 524,162" style="fill:var(--muted)"/>
+
+      <line x1="120" y1="276" x2="120" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="120,303 116,295 124,295" style="fill:var(--muted)"/>
+      <line x1="350" y1="276" x2="350" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="350,303 346,295 354,295" style="fill:var(--muted)"/>
+      <line x1="580" y1="276" x2="580" y2="300" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="580,303 576,295 584,295" style="fill:var(--muted)"/>
+
+      <rect x="20" y="305" width="200" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="120" y="328" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">路线 1：本机直跑</text>
+      <text x="120" y="347" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">bash-local / pwsh-local + subprocess-local</text>
+
+      <rect x="250" y="305" width="200" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="350" y="328" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">路线 2：本机沙箱</text>
+      <text x="350" y="347" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">bash-sandbox + sandbox-local（bwrap/Landlock/Seatbelt/ACL）</text>
+
+      <rect x="480" y="305" width="200" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="580" y="328" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">路线 3：E2B 云沙箱</text>
+      <text x="580" y="347" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">fs-e2b + subprocess-e2b ← ctx.e2b</text>
+    </svg>
+    <figcaption>执行世界全景：工具 → shell/terminals seam → subprocess 底座；三条 provider 路线在底部切换，工具层不动。</figcaption>
+  </figure>
+
+  <div class="demo" data-demo="execWorld">
+    <div class="demo-title">试一试 —— 三种执行环境对照</div>
+    <label><input type="radio" name="d12" value="local" checked> 本机直跑</label>
+    <label><input type="radio" name="d12" value="sandbox"> 本机沙箱</label>
+    <label><input type="radio" name="d12" value="e2b"> E2B 云沙箱</label>
+    <div class="demo-output empty">选择执行环境。</div>
+  </div>
+
+  <div class="box note">
+    <div class="box-title">沙箱不是执行世界的替代品</div>
+    <p>
+      <code>dsh-sandbox</code> README 有一条容易被误读的边界：<strong>same-world confinement only</strong>。
+      bwrap/Landlock/Seatbelt/ACL 后端与宿主共享文件系统和内核，它们只是把 spawn 的 argv 包一层约束；
+      容器、微虚拟机、远端执行器<strong>不是</strong>这个 seam 的 backend——它们替换的是整个
+      <code>ctx.shell</code> / <code>ctx.fs</code> 的 provider（环境一致的组）。记住这条，后面的 confine 模型就不会想偏。
+    </p>
+  </div>
+
+  <h2 id="sec-shell-seam">12.2 ctx.shell：执行 seam 与 request/spec split</h2>
+
+  <p>
+    <code>ShellExecutor</code>（<code>ctx.shell</code>）定义了「一个 bash 后端做什么」——跑前台命令、启动后台进程
+    ——而不说怎么做。它的 API 很小：
+  </p>
+  <table>
+    <thead><tr><th>成员</th><th>语义</th></tr></thead>
+    <tbody>
+      <tr><td><code>run(spec)</code></td><td>前台执行，命令结束时 resolve。<strong>只有基础设施失败才 reject</strong>（不可用的工作目录、缺 shell、预中止信号）；非零退出、超时击杀、中止击杀都以带说明的 <code>ShellRunResult</code> resolve。</td></tr>
+      <tr><td><code>start(spec)</code></td><td>后台执行，立即返回无 Task 的 <code>ShellProcess</code> 句柄，<strong>不设超时</strong>；调用方可把它适配进 <code>ctx.jobs</code>。</td></tr>
+      <tr><td><code>sandboxMode</code></td><td>能力事实：SANDBOXING 执行器报告其约束默认模式；基类为 <code>undefined</code>（「不沙箱化」）。</td></tr>
+      <tr><td><code>ShellProcess.readOutput()</code></td><td>增量读取——连续读取不会重复投递；因缓冲上限丢数据的读取标记 <code>lossy</code> 并指向完整 spill 文件。</td></tr>
+      <tr><td><code>ShellProcess.kill()</code></td><td>杀整个进程组；已结束返回 <code>false</code>。</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    「非零退出不是错误」这一条值得停下来体会：模型写了一条会失败的命令，这是<strong>结果</strong>而不是<strong>事故</strong>。
+    <code>tool-bash</code> 因此只在 spawn 错误与中止时产生 <code>isError</code>，退出码留给模型自己解释
+    （工具的 <code>tool:bash</code> prompt section 正是提醒模型检查 <code>[exit code: N]</code> 标记）。
+  </p>
+
+  <p>
+    词汇上，<code>ShellExecRequest</code>（command、workdir?、timeoutMs?、stdoutMaxBytes?、signal?、stdin?、env?、dshEnv?、sandboxPolicy?）
+    在执行前被解析成 <code>ShellExecSpec</code>（全部必填或显式可空）。这就是 AGENTS.md 点名的
+    <strong>request/spec split 模板</strong>：
+  </p>
+  <div class="box key">
+    <div class="box-title">request/spec split</div>
+    <p>
+      <strong>显式 > 隐式 at package boundaries</strong>：默认值解析是 owning 实现里一个显式的
+      <code>resolve(request): Spec</code> 步骤，绝不能藏在 <code>run()</code> 里的 <code>?? default</code>。
+      dsh-shell 是这个约定的范本：<code>sandboxPolicy</code> 在 request 上可选、在 spec 上必填可空——
+      解析完成后，执行器拿到的 spec 是完全显式的，没有「没传就偷偷用某个默认」的暗道。
+      部署差异化的选择（超时、输出上限）由 provider 的 <code>Config</code> 供给，从 cordis.yml 校验进来。
+    </p>
+  </div>
+
+  <p>
+    本机 provider <code>dsh-bash-local</code> 的行为轮廓（细节在第 8 章工具管道之外，这里看执行器侧）：
+  </p>
+  <ul>
+    <li>每次调用 spawn 一个<strong>全新的非登录 <code>bash -c</code></strong>，无 rc 文件、无 shell 状态——需要目录就传 <code>workdir</code>，别指望 <code>cd</code> 留存。</li>
+    <li>配置预算：默认前台超时 <code>timeoutMs: 120000</code>、上限 <code>maxTimeoutMs: 600000</code>、每流内存上限 <code>maxOutputBytes: 64000</code>（溢出 spill 到磁盘）、<code>graceMs: 3000</code> 击杀宽限。</li>
+    <li>超时/取消分类：只有执行器自己的超时报 <code>timedOut</code>，上游取消报 <code>aborted</code>，命令自己收信号则两者皆非。</li>
+    <li>模型友好的终端环境：<code>NO_COLOR=1 TERM=dumb PAGER=cat GIT_PAGER=cat</code>，防分页器与 ANSI 颜色弄脏结果。</li>
+  </ul>
+
+  <h2 id="sec-subprocess">12.3 ctx.subprocess：进程树底座</h2>
+
+  <p>
+    <code>dsh-subprocess</code> README 的第一句就是定位：<strong>subprocess seam 是「一个执行世界的进程那一半」</strong>。
+    抽象 <code>SubprocessRuntime</code> 暴露可执行文件查找、普通受管 <code>spawn</code>、以及唯一的终端原语
+    <code>spawnTerminal</code>。它的直接 consumer 名单解释了「底座」二字：bash 执行器两家、PTY 后端
+    <code>terminal-bash</code>、LSP 宿主 <code>lsp-stdio</code>，还有三个进程外子代理后端（acp、codex、claude-code）
+    ——所有要起进程的能力都从这一条缝走。
+  </p>
+
+  <p>契约要点（<code>packages/subprocess/subprocess/README.md</code>）：</p>
+  <ul>
+    <li>
+      <strong>spec 完全显式</strong>——argv、cwd、每流 stdio 处置、grace 全部由调用方给出；
+      <code>argv</code> 永不被 shell 解释，想要 shell 的消费者自己传 <code>['bash', '-c', command]</code>。
+      工作目录与可执行路径属于 provider 的执行世界：<code>resolveExecutable</code> 在那个世界里解析 PATH。
+    </li>
+    <li>
+      <strong>stdio 三种处置</strong>：<code>'pipe'</code> 把原始流交给调用者自己做协议框架
+      （LSP 的 JSON-RPC、ACP 的 ndjson）；<code>'inherit'</code> 直通父进程描述符；collect 模式
+      <code>{ maxBytes, spill? }</code> 保留有界尾部、可选全量 spill 文件。collect 读取以全流字节偏移为准、
+      永不消费——多个独立读者不会互相抢增量；偏移滑出内存尾部的读取标记 <code>lossy</code> 并指向 spill。
+    </li>
+    <li>
+      <strong>终止是树作用域的</strong>（所有平台）：POSIX <code>detached</code> 进程组 + 直接子进程回退；
+      Windows 走 <code>taskkill /T</code>。唯一的终止动词 <code>terminate()</code> 按
+      SIGTERM → grace → SIGKILL 升级；<code>waitForExit()</code> 观察整棵树的存活，
+      让消费方的拆除阶梯在真正的静默上收尾。管理者只反应，不分类原因——期限、阶梯、原因归类都归调用方。
+    </li>
+    <li>
+      <strong>环境擦洗单源</strong>：<code>scrubbedParentEnv()</code> / <code>SENSITIVE_ENV_PATTERN</code>
+      是唯一共享的擦洗定义——环境里的凭据形名称与 <code>DSH_*</code> 名被丢弃，显式 <code>env</code> 在擦洗后合并。
+      服务 dispose 时终止所有仍在运行的受管进程并等待退出。
+    </li>
+  </ul>
+
+  <p>
+    本地实现 <code>dsh-subprocess-local</code>（<code>LocalSubprocessRuntime</code>）有一个反直觉的特点：
+    <strong>它没有任何 config</strong>。每种处置、上限、终端尺寸、grace、目录都来自调用它的能力 seam
+    （bash-local、lsp-stdio、terminal-bash）。PTY 由 <code>node-pty</code> 分配，配合平台进程检查；
+    spill 文件是 <code>0600</code> 权限、藏在 <code>0700</code> 的每进程私有目录里。这也是 request/spec
+    哲学的延续：部署差异归上层能力的 Config，底座只做机制。
+  </p>
+
+  <h2 id="sec-sandbox">12.4 ctx.sandbox：spawn 前的约束包装</h2>
+
+  <p>
+    沙箱 seam 的契约可以压成一行：<strong><code>ctx.sandbox.confine(argv, policy)</code> 返回「改跑这个」的
+    argv</strong>——消费者把自己正要 spawn 的确切 argv 交给 provider，拿回一个包装后的 argv 直接去 spawn，
+    外加后端的执行完备度（<code>enforcement</code>）、拒绝方言签名（<code>denialSignatures</code>）
+    与结构化 runner 失败证据。没有可用后端时它<strong>抛异常</strong>而不是放行未约束的执行——fail closed。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="confine argv 包装模型">
+      <rect x="20" y="20" width="240" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="140" y="45" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Consumer（bash-sandbox）</text>
+      <text x="140" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">备好 argv: [bash, -c, make test]</text>
+
+      <rect x="20" y="150" width="240" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="140" y="173" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">policy 随调用走</text>
+      <text x="140" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">mode + workspaceRoot（sandboxPolicy.resolve）</text>
+
+      <rect x="310" y="80" width="170" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="395" y="108" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">ctx.sandbox</text>
+      <text x="395" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">confine(argv, policy)</text>
+
+      <rect x="520" y="20" width="140" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="590" y="45" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">包装后 argv</text>
+      <text x="590" y="68" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">runner 前缀 + 原 argv</text>
+
+      <rect x="520" y="150" width="140" height="60" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="590" y="173" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">ctx.subprocess</text>
+      <text x="590" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">spawn 包装后 argv</text>
+
+      <line x1="262" y1="45" x2="307" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="310,93 302,88 307,84" style="fill:var(--muted)"/>
+      <line x1="262" y1="180" x2="307" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="310,137 302,142 307,146" style="fill:var(--muted)"/>
+      <line x1="482" y1="95" x2="517" y2="60" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="520,57 512,62 517,66" style="fill:var(--muted)"/>
+      <line x1="590" y1="92" x2="590" y2="147" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="590,150 586,142 594,142" style="fill:var(--muted)"/>
+
+      <text x="395" y="228" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">消费者从不自己实现约束，也不解析 runner——它只交出 argv、拿回 argv</text>
+    </svg>
+    <figcaption>confine 模型：策略随每次调用走，同一瞬间两个消费者可以各用不同策略约束各自的子进程。</figcaption>
+  </figure>
+
+  <p>三条硬事实：</p>
+  <ul>
+    <li>
+      <strong>模式词汇只覆盖文件效果</strong>：<code>read-only</code>（默认，禁止一切写入，仅 <code>/dev/null</code> 例外）、
+      <code>workspace-write</code>（只许写 workspaceRoot 与临时区）、<code>danger-full-access</code>（不约束，不询问 provider）。
+      网络与进程可见性<strong>刻意不在词汇里</strong>——模式不假装覆盖后端不强制的东西。
+    </li>
+    <li>
+      <strong>平台后端在 sandbox-local 里选型</strong>：Linux 优先探测可用的 <code>bwrap</code>，否则 Landlock 启动器；
+      macOS 用 Seatbelt（<code>sandbox-exec</code>，allow-default + <code>(deny file-write*)</code> 加写白名单）；
+      Windows 用 ACL restricted-token runner 链（<code>dsh-sandbox-windows-acl</code>，<code>WRITE_RESTRICTED</code> 令牌 + 按 workspace 派生的 SID）。
+      老内核 ABI 只覆盖部分访问类时如实上报 <code>enforcement: 'partial'</code>。
+      Landlock 启动器的源码记录处在 <code>native/landlock-run/</code>——npm 包
+      <code>@deepseek-ai/node-addon-landlock-run</code>（self-restrict-then-exec 启动器 + 功能探针 + CLI 参数词汇），
+      harness 与它同仓同锁文件，契约变更和消费方更新一起落地。
+    </li>
+    <li>
+      <strong><code>sandbox-policy</code> 是唯一的策略 home</strong>。部署默认 <code>mode</code>（默认 <code>read-only</code>）
+      与回退 <code>workspaceRoot</code>（默认 <code>process.cwd()</code>）都在这里；
+      <code>ctx.sandboxPolicy.resolve({ session, mode })</code> 为每次调用解析出完整策略——
+      显式批准 &gt; 会话最后一次 <code>sandbox/mode</code> 事件（<code>effectiveSandboxMode</code> fold）&gt; 部署默认；
+      会话不可变的 <code>SessionHeader.cwd</code> 经文件系统语义规范化后成为 workspaceRoot。
+      bash、fs、terminal 三个强制家族都读这同一份解析，<strong>谁也不能把 bash 和 fs 围到不同的根</strong>。
+      切换本身就是一个 log-only 的 <code>sandbox/mode</code> 事件——重启后靠重放恢复，两个会话互不可见对方状态。
+    </li>
+  </ul>
+
+  <p>
+    沙箱拒绝的呈现路径也值得走一遍：受限命令失败时，stderr 带的是所选后端自己的拒绝方言
+    （bwrap 的 EROFS、Landlock 的 EACCES、Seatbelt 的 EPERM），执行器对照签名保守分类为
+    <code>ShellRunResult.sandbox.denied: true</code>——<strong>拒绝是结果事实，不是异常</strong>。
+    工具层把它渲染成 <code>[sandbox: file access denied under &lt;mode&gt; mode]</code>，
+    并在组合支持升级时附上提示：同一 turn 内可以用 <code>sandbox_permissions</code>（严格更宽的模式）
+    + <code>justification</code> 重试一次，批准问题走 <code>ctx.approval</code> 询问用户。
+    后端完全不可用时抛 <code>SANDBOX_UNAVAILABLE</code>（附平台安装指引），绝不静默降级。
+  </p>
+
+  <h2 id="sec-terminal">12.5 ctx.terminals：持久 PTY 会话</h2>
+
+  <p>
+    一次性 bash 每次都是全新的 <code>bash -c</code>，但有些工作需要<strong>持久的终端状态</strong>：
+    导出的环境变量、激活的 virtualenv、跑在前台的服务。<code>ctx.terminals</code>（<code>dsh-terminal</code>）
+    是 owner-scoped 的持久 PTY seam：铸造不透明 session id、经命名 backend 创建会话、
+    把每个操作围栏到确切的存活 <code>Agent</code>。<code>dsh-terminal-bash</code> 是本地 backend，
+    建在 <code>ctx.subprocess.spawnTerminal</code> 上——PTY 分配、环境擦洗、前台进程组、信号、
+    完整终端会话清理都归 subprocess provider，所以<strong>同一个 PTY backend 既配本机也配远端执行世界</strong>。
+  </p>
+
+  <p>与一次性 bash 的对照：</p>
+  <table>
+    <thead><tr><th></th><th>tool-bash（一次性）</th><th>tool-terminal（持久会话）</th></tr></thead>
+    <tbody>
+      <tr><td>状态</td><td>每次全新 <code>bash -c</code>，无留存</td><td>cwd、导出变量、前台进程跨调用留存</td></tr>
+      <tr><td>进程形态</td><td>受管进程树，普通管道</td><td>真 PTY（<code>spawnTerminal</code> 原语），UTF-8 文本 I/O</td></tr>
+      <tr><td>工具面</td><td><code>bash</code>（+ 后台 job 适配）</td><td><code>terminal_open / send / read / signal / close / list</code> 六个工具</td></tr>
+      <tr><td>归属</td><td>后台进程注册进 <code>ctx.jobs</code>，按 job 控制</td><td>每个操作要求确切的发起 <code>Agent</code>——模型学到了别人的 id 也不能操作</td></tr>
+      <tr><td>就绪</td><td>无需就绪概念</td><td>私有 PS1 标记 + 前台 stdin-wait 事实 + 静默回退 + 绝对超时</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    家族里还有一个变体 <code>dsh-tool-bash-persistent</code>：模型可见的 <code>bash(command)</code> 工具，
+    但背后是<strong>每个 Agent 一条 owner-scoped 的 <code>ctx.terminals</code> shell</strong>——命令共享同一个 shell，
+    cwd、导出变量、激活环境、函数、后台 job 都跨调用留存。它演示了「工具契约」与「执行面」的解耦：
+    同名 bash 工具，可以站在一次性 seam 上，也可以站在持久会话上。
+  </p>
+
+  <h2 id="sec-e2b-pwsh-env">12.6 E2B、pwsh 家族与 shell-env</h2>
+
+  <p>
+    <strong>E2B 是第三条路线</strong>（POC 定位）。<code>dsh-e2b</code> 拥有 <code>ctx.e2b</code>——
+    一个 E2B 沙箱的共享生命周期 owner：构造即开沙箱（pin <code>e2b@2.29.1</code>），建好 <code>cwd</code>
+    （默认 <code>/home/user/workspace</code>，必须绝对 POSIX 路径）与私有的 <code>cwd/.dsh-e2b</code> 状态目录，
+    <code>timeoutMs</code>（默认五分钟）控制沙箱寿命、到期即删。<code>fs-e2b</code> 与 <code>subprocess-e2b</code>
+    注入它、await 同一个 SDK 句柄，于是文件工具与 bash/PTY/LSP 消费者落进同一个远端 Linux 世界——
+    这是第 11 章「换 provider 搬走执行世界」的实例化。注意它的边界（README 明言）：Cordis 服务、
+    会话状态、session 日志、LLM 请求都留在宿主进程；沙箱状态是易失的，不做宿主同步。
+  </p>
+
+  <p>
+    <strong>pwsh 家族是 Windows 的对称设计</strong>。<code>dsh-pwsh-local</code> 逐条镜像 bash-local：
+    每次全新 <code>pwsh -NoLogo -NoProfile -NonInteractive -Command &lt;command&gt;</code>，命令串作为
+    <strong>单个 argv 元素</strong>传给 <code>-Command</code>（由 PowerShell 自己解析，没有中间 shell，也就没有转义层）；
+    UTF-8 输出编码先行 pin 住；Windows 树终止走 <code>taskkill</code>，强杀结算为 exit 1 无信号。
+    <code>dsh-pwsh-sandbox</code> 镜像 bash-sandbox，约束实质是平台中立的：Windows 上解析到 ACL runner 链，
+    Linux/macOS 上照旧 bwrap/Landlock/Seatbelt。<code>dsh-tool-pwsh</code> 则与 tool-bash 逐调用对齐
+    （前台/后台、<code>DSH_*</code> 环境、拒绝渲染与升级面）。
+  </p>
+
+  <p>
+    <strong><code>shell-env</code> 补上受管环境的最后一块</strong>：它拥有 <code>ctx.shellEnv</code> 注册表——
+    每次模型 shell 调用都会新采集一份可信的 <code>DSH_*</code> 快照（内建事实
+    <code>DSH_HOME</code>、<code>DSH_SHELL=1</code>、<code>DSH_SESSION_ID</code>，以及持久层定位到
+    JSONL 时的 <code>DSH_SESSION_JSONL</code>）。快照走专用通道 <code>ShellExecRequest.dshEnv</code>，
+    本地执行器先<strong>抹掉继承的全部 <code>DSH_*</code></strong> 再合并快照——嵌套 harness、
+    并发的父子 agent 都无法把过期身份漏进子进程；<code>process.env</code> 永不被修改。
+    其他插件用 effect 作用域注册自己的受管事实，重名或未声明的运行时键都 fail loud。
+  </p>
+
+  <h2 id="sec-recap">12.7 本章回顾</h2>
+  <ul>
+    <li>执行世界 = 进程 + 文件系统 + 终端构成的连贯环境；三条路线（本机 / 本机沙箱 / E2B）只是 provider 选择。</li>
+    <li><code>ctx.shell</code>：run/start/sandboxMode；只有基础设施失败才 reject；request → 显式 <code>resolve()</code> → spec 是全仓模板。</li>
+    <li><code>ctx.subprocess</code>：argv 永不被 shell 解释；stdio pipe/inherit/collect；树作用域终止（SIGTERM→grace→SIGKILL、<code>taskkill /T</code>）；<code>scrubbedParentEnv</code> 单源擦洗；本地实现零 config。</li>
+    <li><code>ctx.sandbox.confine(argv, policy)</code> 返回改跑的 argv；三模式只管文件效果；fail closed 抛 <code>SANDBOX_UNAVAILABLE</code>；Landlock 启动器源码在 <code>native/landlock-run/</code>。</li>
+    <li><code>ctx.sandboxPolicy</code> 是唯一策略 home：<code>sandbox/mode</code> 事件 + 会话不可变 cwd，三个强制家族共享同一份解析。</li>
+    <li><code>ctx.terminals</code> 持久 PTY：owner 围栏、六工具、就绪推断；terminal-bash 站在 <code>spawnTerminal</code> 上，随执行世界一起搬迁。</li>
+    <li>E2B（<code>ctx.e2b</code> + fs-e2b + subprocess-e2b）是云端执行世界的 POC；pwsh 家族是 bash 的逐调用镜像；shell-env 管住 <code>DSH_*</code> 受管环境。</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">常见坑</div>
+    <ul style="margin:0;">
+      <li>把非零退出码当 <code>isError</code>——只有基础设施失败（spawn 错误、中止）才是错误；退出码是模型要解释的结果。</li>
+      <li>期待 <code>cd</code> 或导出变量在一次 bash 调用后留存——每次都是全新 <code>bash -c</code>；要状态就用 <code>workdir</code>、env 或持久 terminal。</li>
+      <li>在 <code>run()</code> 里藏 <code>?? default</code>——默认值解析必须走 owning 实现的显式 <code>resolve(request): Spec</code>。</li>
+      <li>以为沙箱模式管网络/进程——词汇只覆盖文件效果；容器与微虚拟机不是 sandbox backend，是整组 provider 替换。</li>
+      <li>绕过 <code>ctx.subprocess</code> 自己 spawn——进程树终止、环境擦洗、spill、dispose 清理全都随之丢失。</li>
+      <li>期望 E2B 同步宿主工作区——远端 cwd 只是一个空目录，上传/回写都不在 POC 范围内。</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="12">
+    <h2>第 12 章测验</h2>
+
+    <div class="q" data-id="12-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— 只有基础设施失败（不可用 workdir、缺 shell、预中止）才 reject；非零退出、超时击杀、中止击杀都以 ShellRunResult resolve。"
+         data-rationale="C 正确。A 把模型可见的错误分类（isError）与执行器契约混为一谈，且非零退出在工具层也不是 isError。B 错——超时击杀是描述性结果。D 错——后台 start 从不设超时，超时只属于前台 run。"
+         data-review="sec-shell-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> <code>ctx.shell.run(spec)</code> 在什么情况下 reject？</div>
+      <label class="opt"><input type="radio" name="q-12-1" value="a"> A. 命令以非零退出码结束时</label>
+      <label class="opt"><input type="radio" name="q-12-1" value="b"> B. 命令超时被击杀时</label>
+      <label class="opt"><input type="radio" name="q-12-1" value="c"> C. 基础设施失败：不可用的工作目录、缺 shell、预中止信号等</label>
+      <label class="opt"><input type="radio" name="q-12-1" value="d"> D. start() 的后台进程超时</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— resolve 是 owning 实现里显式的解析步骤，spec 里没有隐藏默认；这是 AGENTS.md 以 dsh-shell 为模板的约定。"
+         data-rationale="B 正确。A 把默认塞回 run() 内部，正是被禁止的形态。C 颠倒了：模型面参数经工具层解析，但 provider 的 Config 也要参与（超时上限、输出预算）。D 无此机制——配置在加载时校验，不靠运行时兜底。"
+         data-review="sec-shell-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> request/spec split 的核心要求是什么？</div>
+      <label class="opt"><input type="radio" name="q-12-2" value="a"> A. request 与 spec 必须字段完全相同</label>
+      <label class="opt"><input type="radio" name="q-12-2" value="b"> B. 默认值解析是显式的 resolve(request): Spec 步骤，run() 里不藏 ?? 默认</label>
+      <label class="opt"><input type="radio" name="q-12-2" value="c"> C. 默认值只能来自模型可见的工具参数</label>
+      <label class="opt"><input type="radio" name="q-12-2" value="d"> D. spec 字段缺省时由 Cordis 加载器自动补 Config</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A、C、D。"
+         data-rationale="A、C、D 都出自契约：argv 不经 shell 解释、collect 按全流偏移非消费式读取、终止树作用域且唯一动词是 terminate()。B 错——原因分类（超时 vs 取消 vs 自杀）归调用方，管理者只反应不分类。"
+         data-review="sec-subprocess">
+      <div class="prompt"><span class="qnum">Q3.</span> 关于 ctx.subprocess 契约，下列哪些说法成立？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="a"> A. argv 永不被 shell 解释；要 shell 的消费者自己传 [bash, -c, command]</label>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="b"> B. terminate() 会告诉你进程为什么死：超时、取消还是自杀</label>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="c"> C. collect 读取用全流字节偏移，多个独立读者不会互相抢增量</label>
+      <label class="opt"><input type="checkbox" name="q-12-3" value="d"> D. 终止是树作用域的：POSIX 进程组信号，Windows 走 taskkill /T</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 消费者交出确切 argv，拿回应改跑的包装后 argv，直接 spawn 它。"
+         data-rationale="B 正确：confine 的返回值就是替代品。A 错——没有沙箱专用 spawn 动词，spawn 仍走 subprocess。C 错——这是策略 home 的职责（sandboxPolicy），且策略是随调用走的。D 方向反了——消费方不实现约束，只消费结果事实。"
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q4.</span> <code>ctx.sandbox.confine(argv, policy)</code> 的返回值是什么？</div>
+      <label class="opt"><input type="radio" name="q-12-4" value="a"> A. 一个沙箱专用的 spawn 句柄</label>
+      <label class="opt"><input type="radio" name="q-12-4" value="b"> B. 包装后的 argv——消费者用它代替自己的 argv 去 spawn</label>
+      <label class="opt"><input type="radio" name="q-12-4" value="c"> C. 解析好的 mode + workspaceRoot 策略</label>
+      <label class="opt"><input type="radio" name="q-12-4" value="d"> D. 一个布尔值：是否允许该命令</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-5" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A、B、D。"
+         data-rationale="A、B、D 正确：模式只覆盖文件效果、Landlock 启动器源码记录在 native/（@deepseek-ai/node-addon-landlock-run）、不可用时抛 SANDBOX_UNAVAILABLE。C 错——容器/微虚拟机/远端执行器不是这个 seam 的 backend，它们替换整个能力 seam 的 provider 组。"
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q5.</span> 关于沙箱 seam，哪些说法是对的？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="a"> A. read-only / workspace-write / danger-full-access 只约束文件效果</label>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="b"> B. Landlock 启动器由 @deepseek-ai/node-addon-landlock-run 提供，源码记录在 native/</label>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="c"> C. E2B 微虚拟机可以注册为 ctx.sandbox 的一个 backend</label>
+      <label class="opt"><input type="checkbox" name="q-12-5" value="d"> D. 没有可用后端时抛 SANDBOX_UNAVAILABLE，绝不放行未约束的执行</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C —— sandbox-policy 是唯一 home：resolve() 每次调用产出 mode + workspaceRoot，bash/fs/terminal 三个强制家族读同一份。"
+         data-rationale="C 正确。A 错——策略恰恰要单源，各自解析会 drift 成分裂世界。B 错——模式解析顺序是显式批准 &gt; 会话 sandbox/mode 事件 fold &gt; 部署默认。D 无此事件：workspace 身份来自创建会话时记录的不可变 SessionHeader.cwd。"
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q6.</span> 为什么 bash、fs、terminal 不会把命令和文件围到不同的根？</div>
+      <label class="opt"><input type="radio" name="q-12-6" value="a"> A. 每个家族解析自己的策略，但读同一个配置文件</label>
+      <label class="opt"><input type="radio" name="q-12-6" value="b"> B. 会话模式切换后立即广播一个全局事件给所有家族</label>
+      <label class="opt"><input type="radio" name="q-12-6" value="c"> C. ctx.sandboxPolicy 是唯一策略 home，所有强制家族消费它 resolve 出的每调用策略</label>
+      <label class="opt"><input type="radio" name="q-12-6" value="d"> D. workspaceRoot 写在每个工具调用的 SessionEvent 里</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-7" data-type="fill"
+         data-accepted='["spawnTerminal","spawnterminal","ctx.subprocess.spawnTerminal"]'
+         data-answer="spawnTerminal（ctx.subprocess 上唯一的非管道原语）。"
+         data-rationale="spawnTerminal 分配真 PTY、桥接 UTF-8 文本 I/O、支持前台进程组检查与信号，是 terminal-bash backend 的脚下原语；普通 spawn 只有管道，无法分配控制终端。"
+         data-review="sec-terminal">
+      <div class="prompt"><span class="qnum">Q7.</span> 填空：dsh-terminal-bash 这个 PTY backend 站在 ctx.subprocess 的 ______ 原语上。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D —— 每个操作要求确切的发起 Agent；模型即使学到别人的 id 也无法寻址其他 agent 的终端。"
+         data-rationale="D 正确：owner-scoped 围栏是 seam 的核心契约。A 与事实相反（跨 agent 共享被刻意排除）。B 错——会话是进程本地的，harness 重启不恢复。C 错——readOutput 是 bash 后台句柄的方法；terminal 家族有独立的 read 工具与缓冲策略。"
+         data-review="sec-terminal">
+      <div class="prompt"><span class="qnum">Q8.</span> 模型拿到了另一个 agent 的 terminal session id，会发生什么？</div>
+      <label class="opt"><input type="radio" name="q-12-8" value="a"> A. 可以读但不能写，因为共享只读策略</label>
+      <label class="opt"><input type="radio" name="q-12-8" value="b"> B. 可以操作——terminal 会话跨 agent 共享</label>
+      <label class="opt"><input type="radio" name="q-12-8" value="c"> C. harness 重启后自动恢复该会话再继续</label>
+      <label class="opt"><input type="radio" name="q-12-8" value="d"> D. 操作被拒绝：每个操作都围栏到确切的发起 Agent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A —— fs-e2b 与 subprocess-e2b 注入 ctx.e2b、共享同一 SDK 句柄与远端 cwd；bash/PTY/LSP 消费者随之进入远端，无需 E2B 专用能力包。"
+         data-rationale="A 正确。B 错——E2B 不做宿主同步，远端 cwd 初始是空的。C 错——会话日志、LLM 请求、Cordis 服务都在宿主进程。D 方向反了——sandbox-local 是本机约束（same-world only），E2B 是整组 provider 替换。"
+         data-review="sec-e2b-pwsh-env">
+      <div class="prompt"><span class="qnum">Q9.</span> 组装 E2B 执行世界（dsh-e2b + fs-e2b + subprocess-e2b）之后，下列哪项描述是对的？</div>
+      <label class="opt"><input type="radio" name="q-12-9" value="a"> A. bash、terminal、LSP、文件工具在同一个远端 Linux 世界执行，工具包不变</label>
+      <label class="opt"><input type="radio" name="q-12-9" value="b"> B. 宿主工作区自动双向同步到远端</label>
+      <label class="opt"><input type="radio" name="q-12-9" value="c"> C. 会话日志与 LLM 请求也搬进了远端沙箱</label>
+      <label class="opt"><input type="radio" name="q-12-9" value="d"> D. E2B 注册为 sandbox-local 的第四种平台 backend</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-10" data-type="fill"
+         data-accepted='["dshEnv","dshenv","ShellExecRequest.dshEnv"]'
+         data-answer="dshEnv（ShellExecRequest 上的专用受管通道）。"
+         data-rationale="DSH_* 快照走 dshEnv 通道；执行器先移除继承的全部 DSH_* 再合并快照，因此嵌套 harness 与并发父子 agent 漏不进过期身份，process.env 也永不被修改。普通 env 是插件喂 stdin/CLAUDE_* 用的，不承担该职责。"
+         data-review="sec-e2b-pwsh-env">
+      <div class="prompt"><span class="qnum">Q10.</span> 填空：shell-env 采集的 DSH_* 受管环境快照，经 ShellExecRequest 的 ______ 通道传入执行器。</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— 命令串是单个 argv 元素，由 PowerShell 自己解析，没有中间 shell 也就没有引号转义层。"
+         data-rationale="B 正确（pwsh-local README 原文）。A 错——本地执行器每次全新 spawn。C 错——Windows 强杀结算为 exit 1 且无信号标记，这是 pwsh 工具指南里明确教给模型的。D 错——命名空间恰好共享（都叫 bash），所以 settings.yaml 跨平台仍可解析。"
+         data-review="sec-e2b-pwsh-env">
+      <div class="prompt"><span class="qnum">Q11.</span> pwsh 家族与 bash 家族的一个关键差异是？</div>
+      <label class="opt"><input type="radio" name="q-12-11" value="a"> A. pwsh 保持一个常驻 shell 进程跨调用复用</label>
+      <label class="opt"><input type="radio" name="q-12-11" value="b"> B. 命令串作为单个 argv 元素传给 -Command，没有 shell 引号转义层</label>
+      <label class="opt"><input type="radio" name="q-12-11" value="c"> C. pwsh 工具的 settings 命名空间与 bash 完全不同，避免冲突</label>
+      <label class="opt"><input type="radio" name="q-12-11" value="d"> D. Windows 上被强杀的进程带 [killed by signal: …] 标记</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-12" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B、C。"
+         data-rationale="B、C 正确：拒绝是 ShellRunResult.sandbox.denied 结果事实（由 stderr 方言签名推断），升级走 ctx.approval 且必须严格更宽。A 错——deny-only：升级协商在工具层，executor 不谈权限。D 错——升级要求与 justification 成对出现且同 turn 内重试一次，不是自动放宽。"
+         data-review="sec-sandbox">
+      <div class="prompt"><span class="qnum">Q12.</span> 沙箱拒绝之后的路径，哪些说法成立？<em>多选。</em></div>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="a"> A. bash-sandbox 自己弹审批问用户要权限</label>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="b"> B. 拒绝以结果事实呈现：result.sandbox.denied = true，渲染为 [sandbox: file access denied under … mode]</label>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="c"> C. 模型可用 sandbox_permissions + justification 在同一 turn 重试一次，批准走 ctx.approval</label>
+      <label class="opt"><input type="checkbox" name="q-12-12" value="d"> D. 被拒两次后执行器自动切到 danger-full-access</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="12-13" data-type="short"
+         data-key-points='["分层：模型工具 → ctx.shell/ctx.terminals → provider → ctx.subprocess 底座，sandbox 在 spawn 前包装 argv","三条 provider 路线（本机 / 本机沙箱 / E2B）切换执行世界而工具层不动","request/spec split：显式 resolve(request): Spec，不藏 ?? 默认","sandboxPolicy 单源解析 mode + workspaceRoot，三个强制家族共享","沙箱 fail closed（SANDBOX_UNAVAILABLE）且只管文件效果"]'
+         data-answer="按分层画：工具（tool-bash/tool-terminal 等）消费 ctx.shell 与 ctx.terminals；本地 provider 经 ctx.subprocess spawn 进程树；沙箱路线的 provider 在 spawn 前把 argv 经 ctx.sandbox.confine 包装，策略由 ctx.sandboxPolicy 每调用解析（mode + workspaceRoot），三个强制家族共享同一份；E2B 路线把 fs 与 subprocess 两个 provider 换成远端实现（共享 ctx.e2b）。三条路线切换时工具层零改动。"
+         data-rationale="能把这张图徒手画出来，你就掌握了执行世界的全部结构；后续章节（fs、子代理）都挂在这张图的节点上。"
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> 用自己的话画出（或写出）执行世界的分层结构，并说明三条路线在哪里切换、策略为什么单源。</div>
+      <textarea class="short" placeholder="你的回答…"></textarea>
+      <div class="key-points">
+        <div class="hint">只有真正覆盖了某个要点才勾选它——少选伤害校准，多选只是骗自己。</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">提交测验</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>重做测验</button>
+  </form>
+
+  <p style="margin-top:2rem;">下一章：<a href="13-fs-capability.html"><strong>第 13 章 · 文件系统能力</strong></a>。</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>
