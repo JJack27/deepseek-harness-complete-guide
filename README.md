@@ -2,7 +2,7 @@
 
 An interactive, bilingual learning book that takes you from *"what is an agent harness?"* to expert-level mastery of the [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) repository (dsh) — **25 chapters, 17 runnable in-browser demos, and a self-test at the end of every chapter**.
 
-**Read now:** [English](https://jjack27.github.io/deepseek-harness-complete-guide/en/) · [中文](https://jjack27.github.io/deepseek-harness-complete-guide/zh/) · [offline instructions](#read-offline)
+**Read now:** [all editions](https://jjack27.github.io/deepseek-harness-complete-guide/) · [English](https://jjack27.github.io/deepseek-harness-complete-guide/en/) · [中文](https://jjack27.github.io/deepseek-harness-complete-guide/zh/) · [offline instructions](#read-offline)
 
 ## What this is
 
@@ -71,12 +71,14 @@ Every title below links straight to that chapter in the online English edition.
 
 ```sh
 git clone https://github.com/JJack27/deepseek-harness-complete-guide.git
-open en/index.html   # or zh/index.html — double-clicking the file works too
+open index.html      # landing page listing every edition — or jump straight
+                     # to en/index.html / zh/index.html; double-clicking works too
 ```
 
 ## Repository layout
 
 ```
+index.html              Landing page linking every edition — start here
 en/                     English edition
 zh/                     中文版 (primary edition)
   index.html            Dashboard — start here
