@@ -30,7 +30,7 @@
       other is the hard <strong>conventions</strong> written in AGENTS.md — each one answering
       why writing it this way keeps the code from rotting. This chapter spreads both layers out:
       first the command map and the local philosophy of choosing checks by evidence surface, then
-      the twenty conventions one by one. By the end you will have internalized standards for
+      the twenty-one conventions one by one. By the end you will have internalized standards for
       judging whether a given approach is acceptable in this repository.
     </p>
   </div>
@@ -41,7 +41,7 @@
       <li>Reproduce the common command map from memory: clean / test / test:coverage / test:e2e / test:snapshot[:record] / typecheck / lint / duplication / build / hygiene / doc-sync / website:build, and <code>dsh --profile headless</code>.</li>
       <li>Pick the minimal check set for a change by evidence surface → check, rather than defaulting to the full suite.</li>
       <li>State what each of the three lefthook hooks checks, what they deliberately do not, and run-gates.ts's CI lane division.</li>
-      <li>Recite AGENTS.md's twenty hard conventions item by item and give the why for each.</li>
+      <li>Recite AGENTS.md's twenty-one hard conventions item by item and give the why for each.</li>
       <li>Distinguish <code>test</code> from <code>test:coverage</code>: only the latter is the CI coverage gate.</li>
     </ul>
   </div>
@@ -210,7 +210,7 @@
 
   <p><strong>5) Waterfall listeners MUST call <code>next()</code>.</strong> Returning without calling <code>next()</code> short-circuits the whole chain. Why: waterfall semantics are delegation layer by layer (like chained approval of permissions); a listener that forgets to delegate silently hides every downstream listener — the hardest-to-debug kind of suddenly everything is denied.</p>
 
-  <h2 id="sec-contracts-visible">23.5 Model visibility and extension points: three structural conventions</h2>
+  <h2 id="sec-contracts-visible">23.5 Model visibility and extension points: four structural conventions</h2>
 
   <p><strong>6) Model-visible ⟺ logged.</strong> Anything that reaches a model request must be reconstructable from the session log; a new model-visible input requires a new session event. Why: the session log is the single source of truth for replay, auditing, and snapshot golden fixtures (Chapter 4); from <code>llm-replay</code> to ACP snapshots, the entire testing system stands on this equivalence. Content smuggled into a request while bypassing the log vanishes on replay and drifts the snapshots.</p>
 
@@ -218,37 +218,39 @@
 
   <p><strong>8) A capability seam comprises all three roles.</strong> A capability surface consists of the Service Definition / Service Provider / Consumer roles; it is a seam only when complete, and splits only when the roles genuinely evolve at different tempos. Why: a capability missing its Provider cannot swap implementations, one missing its Consumer has no user, and one missing its Definition leaves both ends with their own understanding of the protocol — the three roles are the minimal complete set behind Chapter 11's replaceability.</p>
 
+  <p><strong>9) Both SDKs project the loop.</strong> Any change to the <code>agent-loop</code>, the session lifecycle, or the <code>SessionEventMap</code> updates the TypeScript and Python SDK expected outputs in the same PR; <code>pnpm run test</code> covers neither. Why: the two SDKs are two projection surfaces of one loop (Chapter 21) — update one side only and the other side's golden fixtures rot silently, and the unit-test lane cannot see that drift, so only the convention forces the sync at the moment of the change.</p>
+
   <h2 id="sec-contracts-boundary">23.6 Package boundaries and configuration: six engineering conventions</h2>
 
-  <p><strong>9) Prefer maintained dependencies over hand-rolling.</strong> Use a dependency when it genuinely deletes owned code and tests — this carries a policy note (<code>.agents/notes/implemented/process/2026-07-26-dependencies-over-hand-rolling.md</code>). Why: the intuition that writing it ourselves is faster usually ignores the long-term bill of maintenance and tests; but conversely, pulling in a dependency to save three lines is also a loss, so the criterion is genuinely deleting owned code and tests.</p>
+  <p><strong>10) Prefer maintained dependencies over hand-rolling.</strong> Use a dependency when it genuinely deletes owned code and tests — this carries a policy note (<code>.agents/notes/implemented/process/2026-07-26-dependencies-over-hand-rolling.md</code>). Why: the intuition that writing it ourselves is faster usually ignores the long-term bill of maintenance and tests; but conversely, pulling in a dependency to save three lines is also a loss, so the criterion is genuinely deleting owned code and tests.</p>
 
-  <p><strong>10) Explicit over implicit at package boundaries.</strong> Defaulting is an explicit <code>resolve(request): Spec</code> step in the owning implementation, never a hidden <code>?? default</code> inside <code>run()</code> — the <code>dsh-shell</code> request/spec split is the template. Why: a default hidden in the execution path is invisible to both review and configuration surfaces, and policy drifts silently; an explicit resolve makes who owns the default answerable in one place.</p>
+  <p><strong>11) Explicit over implicit at package boundaries.</strong> Defaulting is an explicit <code>resolve(request): Spec</code> step in the owning implementation, never a hidden <code>?? default</code> inside <code>run()</code> — the <code>dsh-shell</code> request/spec split is the template. Why: a default hidden in the execution path is invisible to both review and configuration surfaces, and policy drifts silently; an explicit resolve makes who owns the default answerable in one place.</p>
 
-  <p><strong>11) No hardcoded tunables in plugins.</strong> Deployment-varying options are validated <code>Config</code> fields changeable from cordis.yml; a <code>DEFAULT_*</code> constant or test hook is not configurability. Protocol constants, external specs, and security invariants stay fixed. Why: a hardcoded timeout is an outage in some other deployment; and a security invariant made configurable is no longer an invariant.</p>
+  <p><strong>12) No hardcoded tunables in plugins.</strong> Deployment-varying options are validated <code>Config</code> fields changeable from cordis.yml; a <code>DEFAULT_*</code> constant or test hook is not configurability. Protocol constants, external specs, and security invariants stay fixed. Why: a hardcoded timeout is an outage in some other deployment; and a security invariant made configurable is no longer an invariant.</p>
 
-  <p><strong>12) Misconfiguration fails loud.</strong> Fail at load when self-contained, otherwise at the earliest resolvable point; never silently skip a missing referent. Why: silently skipping defers the error to the most expensive moment of runtime while disguised as normal; fail loud makes bad configuration explode at <code>--dump-config</code> or startup.</p>
+  <p><strong>13) Misconfiguration fails loud.</strong> Fail at load when self-contained, otherwise at the earliest resolvable point; never silently skip a missing referent. Why: silently skipping defers the error to the most expensive moment of runtime while disguised as normal; fail loud makes bad configuration explode at <code>--dump-config</code> or startup.</p>
 
-  <p><strong>15) The source plane and the artifact plane never mix.</strong> Static gates and tests resolve workspace imports to <code>src</code> through tsconfig <code>paths</code> and pass on a clean tree; gates that consume the built <code>lib/</code> declare that dependency explicitly. Why: mixing installs a second module singleton and lets stale artifacts seep into source verification, at which point neither side can trust what it proves (Section 22.7).</p>
+  <p><strong>16) The source plane and the artifact plane never mix.</strong> Static gates and tests resolve workspace imports to <code>src</code> through tsconfig <code>paths</code> and pass on a clean tree; gates that consume the built <code>lib/</code> declare that dependency explicitly. Why: mixing installs a second module singleton and lets stale artifacts seep into source verification, at which point neither side can trust what it proves (Section 22.7).</p>
 
-  <p><strong>16) One aggregate compiler face per package.</strong> The sole exception is <code>api/remotes</code> (Host and Client tsconfigs, split because the Host Typert graph and the Client <code>/remote</code> declarations depend on each other in that order). Repo-wide programs seed from <code>tsconfig.host.json</code> or <code>tsconfig.client.json</code>, never the root solution. Why: the two sides declaration-merge different <code>Context</code>s under the same keys, and crushing them into one <code>ts.Program</code> collides in merge conflicts — the compilation-side reflection of the two-aggregate architecture (Chapter 3).</p>
+  <p><strong>17) One aggregate compiler face per package.</strong> The sole exception is <code>api/remotes</code> (Host and Client tsconfigs, split because the Host Typert graph and the Client <code>/remote</code> declarations depend on each other in that order). Repo-wide programs seed from <code>tsconfig.host.json</code> or <code>tsconfig.client.json</code>, never the root solution. Why: the two sides declaration-merge different <code>Context</code>s under the same keys, and crushing them into one <code>ts.Program</code> collides in merge conflicts — the compilation-side reflection of the two-aggregate architecture (Chapter 3).</p>
 
   <h2 id="sec-constraints-discipline">23.7 Type and code discipline: six small hard rules</h2>
 
-  <p><strong>13) Opaque cross-boundary ids are branded.</strong> <code>Branded&lt;B&gt;</code> (from <code>dsh-brand</code>), never a bare <code>string</code>. Why: session ids, turn ids, and goal ids are all strings at runtime, but passing them interchangeably is a real bug class; branded types move that error from runtime to compile time with zero runtime overhead.</p>
+  <p><strong>14) Opaque cross-boundary ids are branded.</strong> <code>Branded&lt;B&gt;</code> (from <code>dsh-brand</code>), never a bare <code>string</code>. Why: session ids, turn ids, and goal ids are all strings at runtime, but passing them interchangeably is a real bug class; branded types move that error from runtime to compile time with zero runtime overhead.</p>
 
-  <p><strong>14) Trust TypeScript at typed same-process boundaries.</strong> Do not add runtime validation, fallback behavior, or hostile-input tests for values the static interface already requires; validation happens only at parser/config, queued, model/tool JSON, durable/file, worker, process, and wire boundaries. Why: writing defensive code for what types already guarantee amounts to declaring your own type system untrustworthy — such code cannot be meaningfully triggered by tests and only rots. The boundary list is exactly where distrust begins.</p>
+  <p><strong>15) Trust TypeScript at typed same-process boundaries.</strong> Do not add runtime validation, fallback behavior, or hostile-input tests for values the static interface already requires; validation happens only at parser/config, queued, model/tool JSON, durable/file, worker, process, and wire boundaries. Why: writing defensive code for what types already guarantee amounts to declaring your own type system untrustworthy — such code cannot be meaningfully triggered by tests and only rots. The boundary list is exactly where distrust begins.</p>
 
-  <p><strong>17) An empty <code>catch</code> names what it swallows and why nothing else can reach it; the <code>try</code> wraps one statement.</strong> Why: an empty catch is a fossil of something once went wrong here and someone smothered it — left unexplained, the next reader cannot tell whether it swallowed an expected branch or a new failure; narrowing <code>try</code> to a single statement leaves what was swallowed no syntactic place to hide.</p>
+  <p><strong>18) An empty <code>catch</code> names what it swallows and why nothing else can reach it; the <code>try</code> wraps one statement.</strong> Why: an empty catch is a fossil of something once went wrong here and someone smothered it — left unexplained, the next reader cannot tell whether it swallowed an expected branch or a new failure; narrowing <code>try</code> to a single statement leaves what was swallowed no syntactic place to hide.</p>
 
-  <p><strong>18) Keep parallel values symmetric.</strong> Unexplained asymmetry usually signals a missed extraction. Why: when paired values (two providers, two directions, request and response) go asymmetric, it is either a bug or an undocumented design decision; the convention forces the choice: restore symmetry or write the reason down.</p>
+  <p><strong>19) Keep parallel values symmetric.</strong> Unexplained asymmetry usually signals a missed extraction. Why: when paired values (two providers, two directions, request and response) go asymmetric, it is either a bug or an undocumented design decision; the convention forces the choice: restore symmetry or write the reason down.</p>
 
-  <p><strong>19) Tests describe behavior, not correctness.</strong> When behavior becomes obsolete, change it together with its tests and explain why in the PR. Why: treating tests as correctness headstones locks implementation improvements behind stale assertions; a test's lifetime should equal the lifetime of the behavior it describes.</p>
+  <p><strong>20) Tests describe behavior, not correctness.</strong> When behavior becomes obsolete, change it together with its tests and explain why in the PR. Why: treating tests as correctness headstones locks implementation improvements behind stale assertions; a test's lifetime should equal the lifetime of the behavior it describes.</p>
 
-  <p><strong>20) TODO markers by urgency: <code>FIXME</code> (should block a new release) &lt; <code>TODO</code> (fix soon) &lt; <code>XXX</code> (maybe someday). Files end with exactly one trailing newline</strong>, gated by <code>git diff --cached
+  <p><strong>21) TODO markers by urgency: <code>FIXME</code> (should block a new release) &lt; <code>TODO</code> (fix soon) &lt; <code>XXX</code> (maybe someday). Files end with exactly one trailing newline</strong>, gated by <code>git diff --cached
   --check</code> in pre-commit. Why: someone scanning the code must tell release-blocking from someday-maybe at a glance; and the newline convention gives diffs and tooling a definite end of file.</p>
 
   <div class="box key">
-    <div class="box-title">Reading the twenty conventions as one sentence</div>
+    <div class="box-title">Reading the twenty-one conventions as one sentence</div>
     <p>
       Cordis layer: registrations are revocable, invariants assert relationships, events are
       mergeable, unions are exhaustible, waterfalls must delegate. Visibility layer:

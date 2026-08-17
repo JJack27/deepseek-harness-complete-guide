@@ -248,6 +248,9 @@
     读值按「schema 默认 → 注册方组合的 base → 用户文档小节」分层解析；没有挂 provider 时
     消费方照常只解析 entry config，所以每个组合有没有 settings 都能工作。
     <code>dsh-settings-file</code> 把文档存在本地文件并观察外部编辑。
+    设置面是<strong>插件自有的</strong>（2026-08 起）：settings 服务每个已注册的命名空间，
+    插件把自己的键渲染成设置页上的卡片，新增一个带配置的插件不需要任何人改设置 UI
+    （配套 cookbook：<code>docs/cookbook/adding-a-settings-card.md</code>，见第 24 章）。
     credentials 家族的教义是三句话：<strong>配置携带引用、绝不携带值</strong>（<code>CredentialRef</code>
     是 branded 的，<code>resolve(ref)</code> 在每个操作开头解析、从不跨操作缓存——换密钥下一个
     请求就生效）；<strong>describe 不返回值</strong>（配置 UI 安全）；<strong>空值即缺席</strong>。
@@ -275,7 +278,9 @@
     code-runtime 家族是 Code Mode 的地基：<code>ctx.codeRuntime</code> 定义「执行一个模型写的程序、
     对 host 提供的 async 绑定求值、捕获打印与返回值」的运行时，<code>dsh-code-runtime-worker-thread</code>
     是 worker 线程后端；Consumer 是工具注册表自己的 Code Mode（<code>tools: { mode: code }</code>）
-    ——<code>run_code</code> 工具与按加载运行时语言生成的 SDK。第 15 章你已见过它的一个侧面：
+    ——<code>run_code</code> 工具与按加载运行时语言生成的 SDK。配套的 agent preset
+    在英文界面显示为 <strong>PTC Mode</strong>（2026-08 由 code 改名，功能不变）。
+    第 15 章你已见过它的一个侧面：
     子调用结果的持久日志副本经 <code>tools/code-dispatch-log</code> 接受 spill 上限。
   </p>
   <table>

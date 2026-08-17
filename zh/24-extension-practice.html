@@ -49,7 +49,10 @@
     都映射到某个文档化扩展点上的一条监听器——这是微内核主张的可检验形态，<strong>没有任何一行
     改 loop</strong>。动手前先在这张表里找到你的位置：想加模型工具就走 <code>ctx.tools</code>，
     想改提示词就走 <code>ctx.systemPrompt.section()</code>，想接新供应商就走
-    <code>ctx.llm.registerAdapter</code>。选错扩展点，后面所有代码都在还债。
+    <code>ctx.llm.registerAdapter</code>，想让插件自带一张设置卡就走 <code>ctx.settings</code>
+    的命名空间 schema（设置面是插件自有的，2026-08 起配套指南
+    <code>docs/cookbook/adding-a-settings-card.md</code>，第 17 章 17.9 节）。选错扩展点，
+    后面所有代码都在还债。
   </p>
 
   <figure class="diagram">
