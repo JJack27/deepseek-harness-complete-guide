@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The DeepSeek Harness Complete Guide — all editions</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="en/assets/style.css">
+<style>
+  /* Hub-only additions; everything else flows from the shared book stylesheet. */
+  .edition-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1.4rem; max-width: 820px; margin: 2.5rem auto;
+  }
+  .edition-card {
+    display: flex; flex-direction: column; padding: 1.8rem 1.9rem;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; color: var(--fg); box-shadow: var(--shadow);
+    transition: transform .15s, border-color .15s;
+  }
+  .edition-card:hover { transform: translateY(-3px); border-color: var(--accent); text-decoration: none; }
+  .edition-card .ed-lang {
+    font-size: .78rem; letter-spacing: .14em; text-transform: uppercase;
+    font-weight: 700; color: var(--accent);
+  }
+  .edition-card .ed-title { font-size: 1.45rem; font-weight: 700; margin: .45rem 0 .2rem; color: var(--strong-fg); }
+  .edition-card .ed-sub { font-size: .95rem; color: var(--fg-dim); line-height: 1.6; margin: .4rem 0 .9rem; }
+  .edition-card .ed-meta {
+    font-size: .85rem; color: var(--muted); margin-bottom: 1.1rem;
+    display: flex; flex-wrap: wrap; gap: .4rem .9rem;
+  }
+  .edition-card .ed-enter {
+    margin-top: auto; font-weight: 700; color: var(--accent); font-size: 1rem;
+  }
+  .hub-note {
+    max-width: 820px; margin: 0 auto; text-align: center;
+    color: var(--fg-dim); font-size: .92rem;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">◆ The dsh Expert Path</span>
+  <span class="crumb">DeepSeek Harness 仓库专家养成书 · All editions</span>
+  <span class="spacer"></span>
+  <button class="theme-toggle" type="button" id="hub-theme-toggle" aria-label="Toggle light/dark theme">☀</button>
+</div>
+
+<main class="toc">
+  <div class="toc-header">
+    <div class="logo">◆</div>
+    <h1>The DeepSeek Harness Complete Guide</h1>
+    <p class="subtitle">
+      An interactive, bilingual learning book on the
+      <a href="https://github.com/deepseek-ai/deepseek-harness">deepseek-harness</a>
+      repository (dsh): 25 chapters, 17 runnable in-browser demos, and a self-test
+      at the end of every chapter. Pick your edition below.
+    </p>
+    <p class="subtitle" lang="zh">
+      一本关于 deepseek-harness（dsh）仓库的双语交互式学习书：
+      25 章、17 个可在浏览器中直接运行的演示、每章末尾配有自测。请选择你的语言版本。
+    </p>
+  </div>
+
+  <div class="edition-grid">
+    <a class="edition-card" href="en/index.html" lang="en">
+      <span class="ed-lang">English Edition</span>
+      <span class="ed-title">The DeepSeek Harness Expert Path</span>
+      <span class="ed-sub">
+        From "what is an agent harness?" to expert-level mastery of the dsh
+        repository: the Cordis plugin model, the event-sourced session log, the
+        tool pipeline, capability seams, the Web UI, and the contribution process.
+      </span>
+      <span class="ed-meta">
+        <span>25 chapters</span>
+        <span>17 demos</span>
+        <span>Chapter-end self-tests</span>
+      </span>
+      <span class="ed-enter">Start reading →</span>
+    </a>
+
+    <a class="edition-card" href="zh/index.html" lang="zh">
+      <span class="ed-lang">中文版</span>
+      <span class="ed-title">DeepSeek Harness 专家之路</span>
+      <span class="ed-sub">
+        从「agent harness 是什么」一路读到 dsh 仓库专家：Cordis 插件模型、
+        事件溯源会话日志、工具执行管道、capability seams、Web UI 与贡献流程。
+      </span>
+      <span class="ed-meta">
+        <span>25 章</span>
+        <span>17 个演示</span>
+        <span>每章末尾自测</span>
+      </span>
+      <span class="ed-enter">开始阅读 →</span>
+    </a>
+  </div>
+
+  <p class="hub-note">
+    The two editions are parallel, chapter for chapter, and cross-linked from every page.
+    Reading progress is tracked per language in your browser.
+  </p>
+  <p class="hub-note" lang="zh">
+    两个版本逐章对应，每个页面均可互相跳转；阅读进度按语言分别保存在你的浏览器中。
+  </p>
+
+  <div class="toc-footer">
+    Fully static: no server, no build step, no external requests. Every page works offline.
+  </div>
+</main>
+
+<script>
+(function () {
+  var btn = document.getElementById("hub-theme-toggle");
+  function currentTheme() {
+    return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  }
+  function render() {
+    var light = currentTheme() === "light";
+    btn.textContent = light ? "☾" : "☀";
+    btn.title = light ? "Switch to dark theme" : "Switch to light theme";
+  }
+  btn.addEventListener("click", function () {
+    var next = currentTheme() === "light" ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("pbf:theme", next); } catch (e) { /* private mode */ }
+    render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>
