@@ -214,7 +214,106 @@
     <div class="demo-output empty">Click to start.</div>
   </div>
 
-  <h2 id="sec-adapters">10.4 The llm group's five packages</h2>
+  <h2 id="sec-replay-state">10.4 ReplayEnvelope: adapter-private replay state</h2>
+
+  <p>
+    A practical problem: when a historical assistant message again faces
+    <em>the adapter that originally produced it</em>, that adapter holds private
+    facts it could reuse — native response ids, the native stop reason,
+    per-block provider-side metadata. The harness cannot read those fields,
+    and should not. dsh's answer
+    (<code>docs/subsystems/llm-streaming.md</code>) is:
+    <strong>replay state is adapter-private; only its split is shared
+    vocabulary</strong>:
+  </p>
+  <ul>
+    <li>
+      A successful terminal <code>finish</code> chunk may carry a
+      <code>replayState</code> (a <code>ReplayEnvelope</code>): response-level
+      private metadata plus an optional array of per-block entries, aligned
+      one-to-one with the emitted blocks in first-seen order. Both halves stay
+      opaque to the harness.
+    </li>
+    <li>
+      What is shared is only the split itself: when <code>BlockAssembler</code>
+      drops a block, the per-block entry at the same position is dropped too;
+      if the entry count does not match the emitted block count, the whole
+      envelope is discarded; an adapter whose metadata is independent of block
+      structure may simply omit the <code>blocks</code> field. The result:
+      <strong>stored metadata always describes stored content</strong>. The
+      loop stores the pruned envelope alongside the assembled
+      <code>assistant/message</code> in the log.
+    </li>
+    <li>
+      On a later request, <code>LlmRuntime</code> passes the state back only
+      when the historical provider and the target provider are currently
+      registered to <strong>the same adapter instance</strong>; that adapter
+      validates it and owns any cross-model or cross-provider conversion.
+      Other adapters receive the provider-neutral content plus
+      provider/model fields, without the private state.
+    </li>
+    <li>
+      Durable content stays authoritative: an adapter that cannot use the
+      state stored under its name degrades that one message to
+      provider-neutral conversion with a diagnostic — the request itself
+      does not fail.
+    </li>
+  </ul>
+
+  <p>
+    The most instructive rule here is that <strong>one keep/drop decision
+    covers content and metadata together</strong>: a max-tokens finish drops
+    every tool call (a truncated call is unsafe to execute), and the same
+    decision prunes the replay envelope's per-block entry at each dropped
+    position — <code>blocks()</code> and <code>replayState</code> can never
+    disagree, whatever assembly removes.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReplayEnvelope lifecycle">
+      <rect x="30" y="24" width="210" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="135" y="46" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">successful finish chunk</text>
+      <text x="135" y="64" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">carries replayState (ReplayEnvelope)</text>
+      <line x1="240" y1="56" x2="300" y2="56" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,56 293,52 293,60" style="fill:var(--muted)"/>
+
+      <rect x="300" y="24" width="240" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="420" y="46" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">assembly prunes</text>
+      <text x="420" y="63" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">drop a block → its entry drops too</text>
+      <text x="420" y="78" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">count mismatch → whole envelope discarded</text>
+      <line x1="540" y1="56" x2="600" y2="56" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="600,56 593,52 593,60" style="fill:var(--muted)"/>
+
+      <rect x="600" y="24" width="170" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="685" y="46" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">stored with message</text>
+      <text x="685" y="64" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">metadata describes stored content</text>
+
+      <line x1="685" y1="88" x2="685" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="685,140 681,133 689,133" style="fill:var(--muted)"/>
+
+      <rect x="380" y="140" width="390" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="575" y="162" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">later request: LlmRuntime decides whether to pass it back</text>
+      <text x="575" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">only when historical and target provider share one adapter instance</text>
+      <text x="575" y="195" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">otherwise provider-neutral content, no private state</text>
+
+      <line x1="380" y1="172" x2="320" y2="172" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="320,172 327,168 327,176" style="fill:var(--muted)"/>
+
+      <rect x="60" y="140" width="260" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="190" y="162" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">unreadable ≠ failure</text>
+      <text x="190" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">that message degrades to provider-neutral conversion</text>
+      <text x="190" y="195" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">with a diagnostic; the request still goes out</text>
+
+      <text x="400" y="240" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">max-tokens finish: drop every tool call + prune the per-block entries — one decision for content and metadata</text>
+    </svg>
+    <figcaption>
+      The ReplayEnvelope lifecycle: adapter-private replay state enters the log
+      with the assembled message, revives only in front of the same adapter
+      instance, and degrades — never fails — when unreadable.
+    </figcaption>
+  </figure>
+
+  <h2 id="sec-adapters">10.5 The llm group's five packages</h2>
 
   <table>
     <thead>
@@ -266,7 +365,7 @@
     estimation only when they cannot be aligned.
   </p>
 
-  <h2 id="sec-default-model">10.5 Request configuration: from default model to request/header</h2>
+  <h2 id="sec-default-model">10.6 Request configuration: from default model to request/header</h2>
 
   <p>
     Where does an agent's provider/model come from? Entry points (such as
@@ -325,11 +424,12 @@
     </p>
   </div>
 
-  <h2 id="sec-recap">10.6 Chapter recap</h2>
+  <h2 id="sec-recap">10.7 Chapter recap</h2>
   <ul>
     <li><code>ctx.llm</code> = vendor-neutral vocabulary + adapter registry; <code>registerAdapter(providers, adapter)</code> allows one adapter per provider route — switching vendors is switching plugins.</li>
     <li>Three vocabulary levels: Message (immutable, with id/role/source) → content blocks (text/reasoning/tool-call/tool-result, merge-extensible) → the StreamChunk raw stream protocol (seven block kinds, exactly one terminal finish; failures also go through finish instead of throwing).</li>
     <li><code>BlockAssembler</code> is the single assembler; chunks are consumed on two tracks: landing <code>assistant/chunk</code> for fidelity + accumulating blocks; only on stream termination does one <code>assistant/message</code> land, and deriveMessages recognizes only message.</li>
+    <li>A successful finish may carry a <code>ReplayEnvelope</code> (adapter-private replay state): assembly prunes per-block entries as it drops blocks; only the same adapter instance gets it back, and an unreadable state degrades to provider-neutral conversion instead of failing.</li>
     <li>llm group division of labor: llm (vocabulary/service), llm-deepseek (the deepseek-official route), llm-pi-ai (multi-provider), llm-retry (hangs on agent/request-error, lands llm/retry events), token-meter (folds usage from the log).</li>
     <li><code>ctx.agentDefaultModel</code> gives entry points the deployment default; <code>prepareCall()</code> binds exact-model defaults and the retryPolicy; effective configuration lands in the log as <code>request/header</code>, with adapter-default fields marked and re-resolved on route switches.</li>
     <li>e2e tests read <code>DEEPSEEK_API_KEY</code> / <code>DEEPSEEK_BASE_URL</code> and self-skip without a key; credentials resolve by reference via <code>ctx.credentials</code>.</li>
@@ -473,6 +573,18 @@
       <div class="key-points">
         <div class="hint">Only check a point you actually covered — under-checking hurts the book's calibration of you; over-checking only fools yourself.</div>
       </div>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-12" data-type="mcq" data-correct='["b"]'
+         data-answer="B — when assembly drops a block it drops the per-block entry at the same position, so stored metadata always describes stored content."
+         data-rationale="B is correct: keep/drop is one decision, so blocks() and replayState can never disagree. A is wrong: both halves of the envelope are opaque to the harness; only the split is shared. C is wrong: LlmRuntime passes the state back only when the historical and target providers are registered to the same adapter instance, and validation and conversion belong to that adapter alone. D is wrong: an unreadable state degrades that one message to provider-neutral conversion with a diagnostic; the request does not fail."
+         data-review="sec-replay-state">
+      <div class="prompt"><span class="qnum">Q12.</span> Which statement about the <code>ReplayEnvelope</code> (<code>replayState</code>) is correct?</div>
+      <label class="opt"><input type="radio" name="q-10-12" value="a"> A. The envelope's contents are readable by the harness, and the loop uses it to validate provider metadata</label>
+      <label class="opt"><input type="radio" name="q-10-12" value="b"> B. When assembly drops a block it drops the per-block entry at the same position, so stored metadata always describes stored content</label>
+      <label class="opt"><input type="radio" name="q-10-12" value="c"> C. Any adapter can read the replayState in historical messages and optimize its requests with it</label>
+      <label class="opt"><input type="radio" name="q-10-12" value="d"> D. When an adapter cannot read the replayState, that request fails outright</label>
       <div class="feedback"></div>
     </div>
 

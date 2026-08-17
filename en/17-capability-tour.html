@@ -277,7 +277,11 @@
     assembled base → the user document section”; with no provider mounted, consumers keep
     resolving entry config only, so every assembly works with or without settings.
     <code>dsh-settings-file</code> stores the document in a local file and observes external
-    edits. The credentials family's doctrine is three sentences: <strong>configuration carries
+    edits. The settings surface is <strong>plugin-owned</strong> (as of 2026-08): settings serves
+    every registered namespace, and plugins render their own keys as cards on the settings page —
+    adding a configurable plugin requires no one to touch the settings UI (companion cookbook:
+    <code>docs/cookbook/adding-a-settings-card.md</code>, see Chapter 24).
+    The credentials family's doctrine is three sentences: <strong>configuration carries
     references, never values</strong> (<code>CredentialRef</code> is branded, and
     <code>resolve(ref)</code> runs at the start of every operation with no caching across
     operations — swap a key and the next request already uses it); <strong>describe returns no
@@ -310,7 +314,9 @@
     evaluates host-provided async bindings, and captures prints and return values”, and
     <code>dsh-code-runtime-worker-thread</code> is the worker-thread backend; the Consumer is the
     tool registry's own Code Mode (<code>tools: { mode: code }</code>) — the <code>run_code</code>
-    tool plus an SDK generated for the loaded runtime's language. You already saw one facet of it
+    tool plus an SDK generated for the loaded runtime's language. Its companion agent preset is
+    shown in the English UI as <strong>PTC Mode</strong> (renamed from “code” in 2026-08; the
+    capability is unchanged). You already saw one facet of it
     in Chapter 15: the durable log copy of sub-call results accepts a spill ceiling through
     <code>tools/code-dispatch-log</code>.
   </p>

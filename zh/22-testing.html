@@ -399,6 +399,13 @@
     </p>
   </div>
 
+  <p>
+    还有一块快照面不在 vitest 任何通道里：TypeScript 与 Python SDK 的期望输出。它们是
+    agent-loop / 会话生命周期 / <code>SessionEventMap</code> 的两个投影（第 21 章），这些面
+    变化时必须在同一个 PR 里手动同步两个 SDK 的金标准——<code>pnpm run test</code> 对它们
+    都不覆盖（AGENTS.md 2026-08 新增的约定，详见第 23 章第 9 条）。
+  </p>
+
   <h2 id="sec-recap">22.8 本章回顾</h2>
   <ul>
     <li>五条通道按证据面分工：unit（包级行为）、e2e（真实 provider）、snapshot（组装后转录）、web（Chromium 渲染）、stress/perf（负载）。</li>

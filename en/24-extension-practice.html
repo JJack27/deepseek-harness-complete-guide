@@ -54,7 +54,10 @@
     loop</strong>. Before writing anything, find your place in that table: to add a model tool go
     through <code>ctx.tools</code>, to change the prompt go through
     <code>ctx.systemPrompt.section()</code>, to connect a new vendor go through
-    <code>ctx.llm.registerAdapter</code>. Pick the wrong extension point and every line after it
+    <code>ctx.llm.registerAdapter</code>, and to give your plugin its own settings card go through
+    the namespace schema on <code>ctx.settings</code> (the settings surface is plugin-owned; its
+    companion guide <code>docs/cookbook/adding-a-settings-card.md</code> shipped in 2026-08, see
+    Section 17.9 in Chapter 17). Pick the wrong extension point and every line after it
     pays interest.
   </p>
 

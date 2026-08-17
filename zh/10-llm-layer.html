@@ -197,7 +197,91 @@
     <div class="demo-output empty">点击开始。</div>
   </div>
 
-  <h2 id="sec-adapters">10.4 llm 组的五个包</h2>
+  <h2 id="sec-replay-state">10.4 ReplayEnvelope：adapter 私有的回放状态</h2>
+
+  <p>
+    一个现实问题：一条历史 assistant 消息再次走到「当初生成它的 adapter」面前时，
+    adapter 自己手里有些私有事实可以复用 —— 原生响应 id、原生 stop reason、逐 block 的
+    供应商侧元数据。这些字段 harness 看不懂，也不该看懂。dsh 的答案
+    （<code>docs/subsystems/llm-streaming.md</code>）是
+    <strong>回放状态归 adapter 私有，拆分方式归共享词汇</strong>：
+  </p>
+  <ul>
+    <li>
+      成功的终结 <code>finish</code> chunk 可以携带一个 <code>replayState</code>
+      （<code>ReplayEnvelope</code>）：response 级的私有元数据，加一个可选的逐 block
+      条目数组，按发出顺序与 block 一一对应。两半对 harness 都不透明。
+    </li>
+    <li>
+      共享的只有「拆分」这一件事：<code>BlockAssembler</code> 丢弃一个 block 时，
+      同位置的逐 block 条目跟着丢弃；条目数对不上就把整个 envelope 作废；
+      元数据与 block 结构无关的 adapter 可以干脆省略 <code>blocks</code> 字段。
+      于是<strong>存储的元数据永远描述存储的内容</strong>。loop 把修剪后的 envelope
+      随组装好的 <code>assistant/message</code> 一起存进日志。
+    </li>
+    <li>
+      下一次请求时，<code>LlmRuntime</code> 只在「历史 provider 与目标 provider
+      当前注册到<strong>同一个 adapter 实例</strong>」时才回传该状态；adapter 校验它，
+      并独占一切跨模型/跨供应商的转换。别的 adapter 收到的是 provider 中立内容
+      加 provider/model 字段，没有私有状态。
+    </li>
+    <li>
+      持久内容始终是权威：adapter 读不懂自己名下的状态时，就把那一条 message
+      降级为 provider 中立转换并给出 diagnostic，请求本身不会失败。
+    </li>
+  </ul>
+
+  <p>
+    这个设计里最值得学的一条是<strong>一个 keep/drop 决定同时覆盖内容与元数据</strong>：
+    max-tokens 截断的 finish 会丢弃所有工具调用（截断的调用不安全），
+    同一个决定也在对应位置修剪 replay envelope 的逐 block 条目 ——
+    <code>blocks()</code> 与 <code>replayState</code> 无论 assembly 丢掉什么都不会打架。
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ReplayEnvelope 的生命周期">
+      <rect x="30" y="24" width="210" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="135" y="46" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">成功的 finish chunk</text>
+      <text x="135" y="64" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">携带 replayState（ReplayEnvelope）</text>
+      <line x1="240" y1="56" x2="300" y2="56" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,56 293,52 293,60" style="fill:var(--muted)"/>
+
+      <rect x="300" y="24" width="240" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="420" y="46" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">assembly 修剪</text>
+      <text x="420" y="63" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">丢一个 block → 同位置条目一起丢</text>
+      <text x="420" y="78" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">条目数不匹配 → 整个 envelope 作废</text>
+      <line x1="540" y1="56" x2="600" y2="56" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="600,56 593,52 593,60" style="fill:var(--muted)"/>
+
+      <rect x="600" y="24" width="170" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="685" y="46" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">随 message 入日志</text>
+      <text x="685" y="64" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">元数据永远描述存储的内容</text>
+
+      <line x1="685" y1="88" x2="685" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="685,140 681,133 689,133" style="fill:var(--muted)"/>
+
+      <rect x="380" y="140" width="390" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="575" y="162" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">后续请求：LlmRuntime 决定是否回传</text>
+      <text x="575" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">仅当历史与目标 provider 注册到同一个 adapter 实例</text>
+      <text x="575" y="195" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">否则发 provider 中立内容，无私有状态</text>
+
+      <line x1="380" y1="172" x2="320" y2="172" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="320,172 327,168 327,176" style="fill:var(--muted)"/>
+
+      <rect x="60" y="140" width="260" height="64" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="190" y="162" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">读不懂 ≠ 失败</text>
+      <text x="190" y="180" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">该条 message 降级为 provider 中立转换</text>
+      <text x="190" y="195" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">附 diagnostic，请求照常发出</text>
+
+      <text x="400" y="240" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">max-tokens finish：丢全部工具调用 + 同步修剪逐 block 条目 —— 内容与元数据一个决定</text>
+    </svg>
+    <figcaption>
+      ReplayEnvelope 的生命周期：adapter 私有的回放状态随组装进入日志，只在同一个 adapter
+      实例面前复活；读不懂就降级，绝不失败。
+    </figcaption>
+  </figure>
+
+  <h2 id="sec-adapters">10.5 llm 组的五个包</h2>
 
   <table>
     <thead>
@@ -245,7 +329,7 @@
     只在无法对齐时退回启发式估算。
   </p>
 
-  <h2 id="sec-default-model">10.5 请求配置：从默认模型到 request/header</h2>
+  <h2 id="sec-default-model">10.6 请求配置：从默认模型到 request/header</h2>
 
   <p>
     一个 agent 的 provider/model 从哪来？入口点位（如 <code class="small">dsh --profile headless</code>、
@@ -293,11 +377,12 @@
     </p>
   </div>
 
-  <h2 id="sec-recap">10.6 本章回顾</h2>
+  <h2 id="sec-recap">10.7 本章回顾</h2>
   <ul>
     <li><code>ctx.llm</code> = 供应商中立词汇 + adapter 注册表；<code>registerAdapter(providers, adapter)</code> 一个 provider 路由一个 adapter，换供应商就是换插件。</li>
     <li>词汇三层：Message（不可变、带 id/角色/source）→ content blocks（text/reasoning/tool-call/tool-result，可合并扩展）→ StreamChunk 原始流协议（七种块，唯一 finish 终结，失败也走 finish 不抛异常）。</li>
     <li><code>BlockAssembler</code> 是唯一拼装器；chunk 双轨消费：落 <code>assistant/chunk</code> 保真 + 攒块；流终结才落一条 <code>assistant/message</code>，deriveMessages 只认 message。</li>
+    <li>成功的 finish 可携带 <code>ReplayEnvelope</code>（adapter 私有回放状态）：assembly 丢 block 时同步修剪逐 block 条目；只有同一个 adapter 实例能拿回它，读不懂就降级为 provider 中立转换而非失败。</li>
     <li>llm 组分工：llm（词汇/服务）、llm-deepseek（deepseek-official 路由）、llm-pi-ai（多供应商）、llm-retry（挂 agent/request-error，落 llm/retry 事件）、token-meter（从日志折叠用量）。</li>
     <li><code>ctx.agentDefaultModel</code> 供入口点位读部署默认；<code>prepareCall()</code> 绑定精确模型默认与 retryPolicy；生效配置以 <code>request/header</code> 落日志，adapter 默认字段带标记、换路由重新解析。</li>
     <li>e2e 测试读 <code>DEEPSEEK_API_KEY</code> / <code>DEEPSEEK_BASE_URL</code>，无 key 自跳过；凭据走 <code>ctx.credentials</code> 引用。</li>
@@ -441,6 +526,18 @@
       <div class="key-points">
         <div class="hint">只勾选你确实回答到的要点 —— 少勾伤害书的校准，多勾只是骗自己。</div>
       </div>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="10-12" data-type="mcq" data-correct='["b"]'
+         data-answer="B —— assembly 丢弃一个 block 时会同时丢弃同位置的逐 block 条目，因此存储的元数据永远描述存储的内容。"
+         data-rationale="B 正确：keep/drop 是一个决定，blocks() 与 replayState 不会打架。A 错：envelope 两半对 harness 都不透明，共享的只有拆分方式。C 错：只有「历史与目标 provider 注册到同一个 adapter 实例」时 LlmRuntime 才回传，校验与转换归该 adapter 独占。D 错：读不懂的状态把该条 message 降级为 provider 中立转换并给出 diagnostic，请求不失败。"
+         data-review="sec-replay-state">
+      <div class="prompt"><span class="qnum">Q12.</span> 关于 <code>ReplayEnvelope</code>（<code>replayState</code>），下列哪项说法是对的？</div>
+      <label class="opt"><input type="radio" name="q-10-12" value="a"> A. envelope 的内容对 harness 可读，loop 用它校验供应商元数据</label>
+      <label class="opt"><input type="radio" name="q-10-12" value="b"> B. assembly 丢弃一个 block 时会同时丢弃同位置的逐 block 条目，因此存储的元数据永远描述存储的内容</label>
+      <label class="opt"><input type="radio" name="q-10-12" value="c"> C. 任何 adapter 都能读取历史消息里的 replayState 并据此优化请求</label>
+      <label class="opt"><input type="radio" name="q-10-12" value="d"> D. adapter 读不懂 replayState 时该次请求直接失败</label>
       <div class="feedback"></div>
     </div>
 

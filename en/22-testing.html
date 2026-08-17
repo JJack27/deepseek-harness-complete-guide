@@ -447,6 +447,14 @@
     </p>
   </div>
 
+  <p>
+    One more snapshot surface lives outside every vitest lane: the expected outputs of the
+    TypeScript and Python SDKs. They are two projections of the agent-loop / session lifecycle /
+    <code>SessionEventMap</code> (Chapter 21), and changes to those surfaces must update both
+    SDKs' goldens in the same PR by hand — <code>pnpm run test</code> covers neither (an AGENTS.md
+    convention added in 2026-08; see item 9 in Chapter 23).
+  </p>
+
   <h2 id="sec-recap">22.8 Chapter recap</h2>
   <ul>
     <li>The five channels divide by evidence surface: unit (package-level behavior), e2e (real providers), snapshot (assembled transcripts), web (Chromium rendering), stress/perf (load).</li>

@@ -27,7 +27,7 @@
       一个「everything is a plugin」的仓库，靠什么让几十个包的插件不打架？答案分两层：
       一层是可执行的<strong>门禁</strong>——run-gates.ts 调度的几十个验证命令加 lefthook 钩子；
       另一层是写在 AGENTS.md 里的<strong>硬约定</strong>——每一条都在回答「为什么这么写才不会烂」。
-      本章把这两层摊开：先给你命令地图与「按证据面选检查」的本地哲学，再逐条讲透二十条约定。
+      本章把这两层摊开：先给你命令地图与「按证据面选检查」的本地哲学，再逐条讲透二十一条约定。
       读完你就有了在这个仓库里判断「这么做行不行」的内化标准。
     </p>
   </div>
@@ -38,7 +38,7 @@
       <li>默写常用命令地图：clean / test / test:coverage / test:e2e / test:snapshot[:record] / typecheck / lint / duplication / build / hygiene / doc-sync / website:build 与 <code>dsh --profile headless</code>。</li>
       <li>按「证据面 → 检查」为一次改动选出最小检查集，而不是默认全量套件。</li>
       <li>说出 lefthook 三个钩子各查什么、刻意不查什么，以及 run-gates.ts 的 CI lane 划分。</li>
-      <li>逐条复述 AGENTS.md 的二十条硬约定，并为每条讲出「为什么」。</li>
+      <li>逐条复述 AGENTS.md 的二十一条硬约定，并为每条讲出「为什么」。</li>
       <li>区分 <code>test</code> 与 <code>test:coverage</code>：后者才是 CI 覆盖率门禁。</li>
     </ul>
   </div>
@@ -206,7 +206,7 @@
   return 就是短路整条链。为什么：waterfall 的语义是层层委托（如权限审批的链式放行），忘了委托的
   监听器会把下游所有监听器无声地藏起来——这是最难排查的一类「权限突然全拒绝」。</p>
 
-  <h2 id="sec-contracts-visible">23.5 模型可见性与扩展点：三条结构性约定</h2>
+  <h2 id="sec-contracts-visible">23.5 模型可见性与扩展点：四条结构性约定</h2>
 
   <p><strong>6）model-visible ⟺ logged。</strong>凡到达模型请求的东西必须能从会话日志重建；新增一个
   模型可见输入必须新增一个会话事件。为什么：会话日志是可回放、可审计、可做快照金标准的唯一事实源
@@ -222,33 +222,39 @@
   「能力」没法换实现，缺 Consumer 的「能力」没人用，缺 Definition 的两端各自理解协议——三角色是
   第 11 章可替换性的最小完备集。</p>
 
+  <p><strong>9）双 SDK 投影 loop。</strong>agent-loop、会话生命周期、<code>SessionEventMap</code>
+  的任何变更，必须在同一个 PR 里更新 TypeScript 与 Python SDK 的期望输出；<code>pnpm run
+  test</code> 对两者都不覆盖。为什么：两个 SDK 是同一个循环的两个投影面（第 21 章）——loop 变了
+  只更新一边，另一边的金标准就在静默腐烂，而单测通道根本看不见这种漂移，只能靠约定在改动的
+  当场强制同步。</p>
+
   <h2 id="sec-contracts-boundary">23.6 包边界与配置：六条工程约定</h2>
 
-  <p><strong>9）优先维护良好的依赖而非手滚。</strong>当依赖真能删掉自有代码与测试时用它——这有政策
+  <p><strong>10）优先维护良好的依赖而非手滚。</strong>当依赖真能删掉自有代码与测试时用它——这有政策
   文档（<code>.agents/notes/implemented/process/2026-07-26-dependencies-over-hand-rolling.md</code>）背书。
   为什么：「我们自己写更快」的直觉常忽略维护与测试的长期账单；但反过来，为省三行代码引入一个依赖
   同样亏，所以判据是「真正删掉 owned code 与 tests」。</p>
 
-  <p><strong>10）包边界显式 &gt; 隐式。</strong>默认值是 owning 实现里一个显式的
+  <p><strong>11）包边界显式 &gt; 隐式。</strong>默认值是 owning 实现里一个显式的
   <code>resolve(request): Spec</code> 步骤，绝不是 <code>run()</code> 里藏着的 <code>?? default</code>
   ——<code>dsh-shell</code> 的 request/spec 拆分是模板。为什么：藏在执行路径里的默认值在审查与配置
   面上都不可见，策略漂移无声发生；显式 resolve 让「谁拥有默认」一处可查。</p>
 
-  <p><strong>11）插件里不许硬编码 tunables。</strong>部署可变的选项是经过校验的 <code>Config</code> 字段，
+  <p><strong>12）插件里不许硬编码 tunables。</strong>部署可变的选项是经过校验的 <code>Config</code> 字段，
   可从 cordis.yml 改；<code>DEFAULT_*</code> 常量或测试钩子不算可配置。协议常数、外部规范与安全
   不量保持固定。为什么：一个写死的超时在别的部署里就是故障；而「安全不变量」如果做成可配置，就
   不再是不变量。</p>
 
-  <p><strong>12）配置错误大声失败。</strong>能自证时在加载期失败，否则在最早可解析点；绝不静默跳过
+  <p><strong>13）配置错误大声失败。</strong>能自证时在加载期失败，否则在最早可解析点；绝不静默跳过
   缺失的引用。为什么：静默跳过把错误推迟到运行中最贵的时刻，还伪装成正常；fail loud 让坏配置在
   <code>--dump-config</code> 或启动时就爆。</p>
 
-  <p><strong>15）source plane 与 artifact plane 永不混合。</strong>静态门禁与测试经 tsconfig
+  <p><strong>16）source plane 与 artifact plane 永不混合。</strong>静态门禁与测试经 tsconfig
   <code>paths</code> 把 workspace 导入解析到 <code>src</code>，在干净树上通过；消费构建 <code>lib/</code>
   的门禁显式声明该依赖。为什么：混用会装出第二份模块单例、让陈旧产物混进源码验证，两边各自证明的
   东西就都不可信了（22.7 节）。</p>
 
-  <p><strong>16）每包一个聚合 compiler face。</strong>唯一例外是 <code>api/remotes</code>（Host 与
+  <p><strong>17）每包一个聚合 compiler face。</strong>唯一例外是 <code>api/remotes</code>（Host 与
   Client 两份 tsconfig，因 Host Typert 图与 Client <code>/remote</code> 声明的先后依赖而拆）。仓库级
   程序要从 <code>tsconfig.host.json</code> 或 <code>tsconfig.client.json</code> 起种，绝不用根 solution。
   为什么：两侧在相同键下 declaration-merge 出不同的 <code>Context</code>，压进一个 <code>ts.Program</code>
@@ -256,36 +262,36 @@
 
   <h2 id="sec-constraints-discipline">23.7 类型与代码纪律：六条小而硬的规矩</h2>
 
-  <p><strong>13）跨边界 id 用 branded 类型。</strong><code>Branded&lt;B&gt;</code>（来自
+  <p><strong>14）跨边界 id 用 branded 类型。</strong><code>Branded&lt;B&gt;</code>（来自
   <code>dsh-brand</code>），绝不裸 <code>string</code>。为什么：session id、turn id、goal id 在运行时
   都是字符串，但把它们混着传是真实发生过的一类 bug；branded 类型把这类错误从运行时提前到编译时，
   且零运行时开销。</p>
 
-  <p><strong>14）类型化同进程边界信任 TypeScript。</strong>静态接口已要求的值，不额外加运行时校验、
+  <p><strong>15）类型化同进程边界信任 TypeScript。</strong>静态接口已要求的值，不额外加运行时校验、
   回退行为或敌意输入测试；校验只发生在 parser/config、排队、模型/工具 JSON、durable/文件、worker、
   进程与 wire 边界。为什么：为类型已保证的东西写防御代码，等于宣称自己的类型系统不可信——这些代码
   无法被测试有意义地触发，只会腐烂。边界清单就是「不信任恰好开始的地方」。</p>
 
-  <p><strong>17）空 <code>catch</code> 要点名吞了什么、为什么别的到不了；<code>try</code> 只包一条
+  <p><strong>18）空 <code>catch</code> 要点名吞了什么、为什么别的到不了；<code>try</code> 只包一条
   语句。</strong>为什么：空 catch 是「这里出过错，然后有人把它按住了」的化石——不说清楚，下一个读者
   无法判断吞掉的是预期分支还是新故障；<code>try</code> 缩小到一条语句让「吞了什么」在语法上无处
   可藏。</p>
 
-  <p><strong>18）平行值保持对称。</strong>未解释的不对称通常是漏掉一次提取的信号。为什么：成对出现
+  <p><strong>19）平行值保持对称。</strong>未解释的不对称通常是漏掉一次提取的信号。为什么：成对出现
   的值（两个 provider、两个方向、请求与响应）一旦不对称，要么是 bug，要么是没写下来的设计决策；
   约定逼你二选一：改对称，或把理由写出来。</p>
 
-  <p><strong>19）测试描述行为，不描述正确性。</strong>行为过时就连测试一起改，并在 PR 里说明为什么。
+  <p><strong>20）测试描述行为，不描述正确性。</strong>行为过时就连测试一起改，并在 PR 里说明为什么。
   为什么：把测试当「正确性的碑文」会导致实现改进被旧断言锁死；测试的寿命应该等于它描述的行为的
   寿命。</p>
 
-  <p><strong>20）TODO 标记按紧急度：<code>FIXME</code>（应阻塞新发布）&lt; <code>TODO</code>（尽快修）
+  <p><strong>21）TODO 标记按紧急度：<code>FIXME</code>（应阻塞新发布）&lt; <code>TODO</code>（尽快修）
   &lt; <code>XXX</code>（也许哪天修）。文件以恰好一个尾随换行结束</strong>，<code>git diff --cached
   --check</code> 在 pre-commit 把关。为什么：扫描代码的人要能一眼分出发布阻塞与 someday-maybe；
   换行约定则是给 diff 与工具链一个确定的文件终界。</p>
 
   <div class="box key">
-    <div class="box-title">把二十条读成一句话</div>
+    <div class="box-title">把二十一条读成一句话</div>
     <p>
       Cordis 层：注册可撤销、不变量断言关系、事件可合并、union 可穷尽、waterfall 必须委托。可见性层：
       模型可见必被日志记录、行为上扩展点而不是 loop、seam 三角色齐全。边界层：依赖优先但看删除量、

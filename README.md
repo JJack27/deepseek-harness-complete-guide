@@ -8,7 +8,7 @@ An interactive, bilingual learning book that takes you from *"what is an agent h
 
 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) is an open-source, plugin-based LLM agent harness built on the [Cordis](https://github.com/cordiverse/cordis) plugin framework: everything — tools, shell execution, filesystem access, subagents, persistence — is a plugin. This book teaches that architecture end to end using the repository's real source: real file paths (`packages/core/session`, `packages/shell/…`), real event names (`session/event`, `tool/call`), and real config surfaces (`cordis.yml`, profiles, patch layers).
 
-The book was generated from the 2026-08 source snapshot by the personal-book-forger workflow, then hand-finished. It is community learning material, **not** official DeepSeek documentation; details may drift as the repository evolves.
+The book was generated from the 2026-08 source snapshot by the personal-book-forger workflow, then hand-finished; it was refreshed against `dsh` 0.1.0-rc.7 (2026-08-17) — chapter 10 gained the `ReplayEnvelope` replay-state section, chapter 23 the twenty-first convention (both SDKs project the loop), chapter 17 the plugin-owned settings surface and the PTC Mode rename, and chapter 24 the settings-card cookbook. It is community learning material, **not** official DeepSeek documentation; details may drift as the repository evolves.
 
 ## Who it's for
 
