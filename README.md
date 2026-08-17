@@ -1,40 +1,41 @@
 # DeepSeek Harness Complete Guide
 
-一本可交互的中文电子书：**《DeepSeek Harness 专家之路》**，25 章，带你从「agent harness 是什么」一路读到能上手改 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 仓库的任何需求。
+An interactive book — *The DeepSeek Harness Expert Path*（《DeepSeek Harness 专家之路》）— 25 chapters that take you from "what is an agent harness" all the way to picking up any requirement in the [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) repository and knowing which package to read, which extension point to hook, and which test channel to run.
 
-## 在线阅读 / Read online
+## Read online
 
-- 中文版：**https://jjack27.github.io/deepseek-harness-complete-guide/zh/**
 - English edition: **https://jjack27.github.io/deepseek-harness-complete-guide/en/**
+- 中文版：**https://jjack27.github.io/deepseek-harness-complete-guide/zh/**
 
-## 离线阅读 / Read offline
+## Read offline
 
-无需服务器、无需联网、无外部请求：
+No server, no internet connection, no external requests:
 
 ```sh
 git clone https://github.com/JJack27/deepseek-harness-complete-guide.git
-open zh/index.html   # 或 en/index.html；双击文件即可
+open en/index.html   # or zh/index.html — double-clicking the file works too
 ```
 
-两种语言通过每页右上角的语言切换链接互跳；阅读进度按语言分别记录。 / Both languages cross-link via the toggle in the top bar of every page; reading progress is tracked per language.
+Both languages cross-link via the language toggle in the top bar of every page; reading progress is tracked separately per language.
 
-## 书里有什么
+## What's inside
 
-- **25 章**：Cordis 插件模型 → 会话日志（事件溯源）→ turn/step 循环 → 工具执行管道 → capability seams → 子代理 → Web UI / RPC / ACP / Python SDK → 测试与贡献流程。
-- **每章末尾有小测**（单选/多选/填空/简答），≥ 80% 即「可以继续前进」；进度保存在浏览器 `localStorage`，目录页有总进度面板。
-- **17 个内联交互演示**（waterfall 短路、事件日志推导、补丁层叠加、seam 换 provider……），全部本地运行。
-- 所有图表为内联 SVG；每个章节文件自包含。
+- **25 chapters**: the Cordis plugin model → the session log (event sourcing) → the turn/step loop → the tool execution pipeline → capability seams → subagents → Web UI / RPC gateway / ACP / Python SDK → testing and the contribution process.
+- **A chapter test** at the end of every chapter (single-choice / multi-choice / fill-in / short answer); scoring **≥ 80%** means "learned enough to move forward" (a soft gate — nothing is locked). Progress is saved in the browser's `localStorage`, with an overall-progress dashboard on the table of contents.
+- **17 inline interactive demos** (waterfall short-circuiting, deriving model history from the event log, stacking patch layers, swapping a seam provider, …), all running locally in your browser.
+- All diagrams are inline SVG; every chapter file is fully self-contained.
 
-## 目录结构
+## Repository layout
 
 ```
-zh/               中文版（primary edition）
-en/               English edition
-  index.html      目录面板（从这里开始 / start here）
-  01-…html … 25-…html   各章 / chapters
-  assets/         共享样式与脚本（book.js 含演示注册表；跨语言逐字节相同）
+en/                     English edition
+zh/                     中文版（primary edition）
+  index.html            Dashboard — start here
+  01-…html … 25-…html   Chapters
+  assets/               Shared stylesheet and script (book.js holds the demo
+                        registry; byte-identical across languages)
 ```
 
-## 来源
+## Provenance
 
-内容由 [personal-book-forger](https://github.com/) 技能基于 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 仓库真实源码（2026-08 快照）锻造。本书是社区学习材料，不是 DeepSeek 官方文档；仓库演进后细节可能与书中有出入。
+The content was forged by the [personal-book-forger](https://github.com/) skill from the real source of the [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) repository (2026-08 snapshot). This is community learning material, not official DeepSeek documentation; details may drift as the repository evolves.
