@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 16 · The Human Plane: commands, permission, approval, ask-user — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 16 · The Human Plane</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/16-human-plane.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="16">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 16 · Part III · Capability Seams in Depth</div>
+    <h1>The Human Plane: commands, permission, approval, ask-user</h1>
+    <p class="lede">
+      The <code>/compact</code> command in the previous chapter already gave away this chapter's core
+      distinction: human-agent interaction in dsh splits across two planes. On the
+      <strong>command plane</strong>, slash commands dispatch through <code>ctx.commands</code> and
+      execute directly, without a model turn; on the <strong>message plane</strong>, everything that
+      must reach the model is logged as a SessionEvent. This chapter walks through the entire
+      interaction service family — the command registry, the one-shot approval waterfall, permission
+      presets, structured questions — and then, together with the three state plugins plan-mode,
+      todo, and feedback, lays out the complete mechanics of how a human steers a running agent.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Use the command-plane/message-plane dichotomy to decide, for any interaction, which route it takes, whether it writes to the log, and whether it enters model history</li>
+      <li>Describe the registration and dispatch contracts of <code>ctx.commands</code>, including the <code>command/run</code>/<code>command/done</code> event pair and agent-scope shadowing</li>
+      <li>Explain the one-shot approval waterfall: the outcome vocabulary, fail-closed behavior, and how a <code>tools/pre-execute</code> <code>ask</code> decision routes to <code>ctx.approval</code></li>
+      <li>Name the two mechanism knobs that permission-presets bundles, and why <code>custom</code> can only be derived, never selected</li>
+      <li>Distinguish plan-mode's logged state from enforcement: plan mode is soft guidance, while sandbox and approval enforce independently</li>
+      <li>Identify the two destinations of todo and feedback — session log events vs a Host-side sidecar — and why neither enters the model conversation</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-two-planes">16.1 Two planes: commands vs messages</h2>
+
+  <p>
+    dsh's interaction services are all assembled on existing contracts, with no loop changes. The
+    first sentence of the <code>packages/interaction/</code> group README states the scope: these
+    are the services and plugins for “humans collaborating with a running agent” — questions,
+    approvals, permission presets, commands. Set them on the event-sourcing foundation from
+    Chapter 4 and you get the axis of judgment that runs through this chapter:
+  </p>
+  <ul>
+    <li>
+      <strong>Command plane</strong>: the human types a slash command, and
+      <code>ctx.commands.execute(agent, line, signal)</code> parses and runs the handler directly.
+      <strong>No model turn</strong> — no request, no tokens; the result is rendered directly by
+      the UI adapter and <strong>never enters model history</strong>. But the command lifecycle
+      itself is an audit subject: every parsed call appends a log-only <code>command/run</code>
+      (minting a <code>commandId</code> first) and <code>command/done</code> (at settlement) event
+      pair to that agent's session, with no turn wrapping them.
+    </li>
+    <li>
+      <strong>Message plane</strong>: anything to be sent to the model — direct prompts, steering,
+      injected context — is logged as a surface event (model-visible ⟺ logged) and enters the
+      request through the turn/step loop from Chapter 7.
+    </li>
+  </ul>
+
+  <p>
+    That the command plane “bypasses the model yet still lands in the log” is not a contradiction:
+    the log is <strong>the sole authority for audit and replay</strong>, while model history is one
+    projection of it (<code>deriveMessages()</code> takes only surface events). If a command
+    handler does need to trigger model work, it must explicitly use the recipient's
+    <code>Agent</code> (for example, <code>/plan [message]</code> submits the message via
+    <code>agent.steer()</code>) — at that point it has switched to the message plane and owns the
+    resulting message contract itself. The registry never implicitly submits <code>rawInput</code>
+    to an agent.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 660 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Command plane vs message plane comparison">
+      <rect x="25" y="130" width="110" height="64" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="80" y="167" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">Human</text>
+
+      <text x="392" y="28" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Command plane · ctx.commands (no model turn)</text>
+      <rect x="200" y="42" width="180" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="290" y="65" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Slash command dispatch</text>
+      <text x="290" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">/compact · /plan · /feedback …</text>
+
+      <rect x="440" y="42" width="195" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="537" y="65" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Direct result</text>
+      <text x="537" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Rendered by the UI adapter</text>
+
+      <line x1="135" y1="148" x2="167" y2="148" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="148" x2="167" y2="71" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="71" x2="196" y2="71" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="199,71 191,67 191,75" style="fill:var(--muted)"/>
+
+      <line x1="380" y1="71" x2="436" y2="71" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="439,71 431,67 431,75" style="fill:var(--muted)"/>
+
+      <line x1="537" y1="104" x2="537" y2="178" style="stroke:var(--fail)" stroke-width="2" stroke-dasharray="5 4"/>
+      <text x="546" y="145" style="fill:var(--fail)" font-size="10">Results never enter model history</text>
+
+      <text x="392" y="168" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Message plane · everything model-visible is in the log</text>
+      <rect x="200" y="182" width="180" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="290" y="205" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Agent · turn/step loop</text>
+      <text x="290" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">followup / steer / inject</text>
+
+      <rect x="440" y="182" width="195" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="537" y="205" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Model request</text>
+      <text x="537" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Projection of deriveMessages()</text>
+
+      <line x1="135" y1="176" x2="167" y2="176" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="176" x2="167" y2="211" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="167" y1="211" x2="196" y2="211" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="199,211 191,207 191,215" style="fill:var(--muted)"/>
+
+      <line x1="380" y1="211" x2="436" y2="211" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="439,211 431,207 431,215" style="fill:var(--muted)"/>
+
+      <rect x="200" y="274" width="435" height="50" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="417" y="295" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">Session log (append-only)</text>
+      <text x="417" y="313" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Command plane writes log-only events · the message plane's surface events are the source of model history</text>
+
+      <line x1="250" y1="100" x2="250" y2="271" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="250,274 246,266 254,266" style="fill:var(--muted)"/>
+      <text x="240" y="195" text-anchor="end" style="fill:var(--fg-dim)" font-size="9">command/run · command/done (log-only)</text>
+
+      <line x1="335" y1="240" x2="335" y2="271" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <polygon points="335,274 331,266 339,266" style="fill:var(--muted)"/>
+      <text x="345" y="262" style="fill:var(--fg-dim)" font-size="9">Surface events</text>
+    </svg>
+    <figcaption>The two planes side by side: the command plane bypasses the model straight to results (but the command lifecycle enters the log as log-only events); on the message plane, everything model-visible is in the log.</figcaption>
+  </figure>
+
+  <p>
+    This dichotomy also explains the differences across surfaces: the Web client provides a command
+    adapter; headless, ACP automation, and JSON-RPC do not — so commands like <code>/compact</code>
+    and <code>/feedback</code> do not exist there, while automatic compaction keeps working. The
+    corresponding row in the “Where new behavior goes” table in <code>docs/architecture.md</code>
+    reads: <em>Add a human command → register on <code>ctx.commands</code>; it dispatches without
+    a model turn</em>.
+  </p>
+
+  <h2 id="sec-commands">16.2 ctx.commands: the command registry</h2>
+
+  <p>
+    <code>dsh-commands</code> owns <code>ctx.commands</code>. Registering a command is
+    <code>register(definition)</code>: a lowercase command name (letters, digits, <code>_</code>,
+    <code>-</code>), a description, an optional input hint, an optional <code>recordInput</code>
+    policy, and a cancellable handler. <code>recordInput</code> defaults to true; set it to false
+    when the command's authoritative domain event carries its own payload, and
+    <code>command/run</code> then omits <code>args</code> instead of recording the input twice —
+    <code>/feedback</code> does exactly this (the text lives only in the
+    <code>feedback/record</code> event).
+  </p>
+
+  <p>
+    Scoping follows the host+per-scope layering you saw in Chapter 11: registrations on a plain
+    context are global; a command producer mounted under <code>agent.ctx</code> declares its own
+    <code>commands</code> injection, creates an exact agent-scope definition, and
+    <strong>shadows</strong> the same-named global definition. Duplicate names within a layer fail
+    at registration. Registration and removal notify all <code>commands/change</code> observers so
+    the active adapter can refresh its discovery list. <code>parseCommand()</code> accepts only
+    “byte 0 is a slash + lowercase name + whitespace or end”; every byte after the name is
+    <code>rawInput</code> — command-specific syntax is parsed by each command itself.
+  </p>
+
+  <p>
+    The dispatch settlement contract: a handler returns <code>success</code> or <code>error</code>
+    plus optional UI text; on success it may also return <code>sourceEventSeq</code> pointing at an
+    earlier non-command event in the same session, for when that domain event carries a richer
+    presentation (e.g. <code>/compact</code> points at <code>compaction/summary</code>). A
+    lifecycle invariant requires the reference to be to a <strong>prior</strong> non-command event.
+    An unknown command or invalid syntax returns <code>undefined</code> and produces no log at all
+    (admission misses are not recorded); the bundled adapters refuse unknown slash input outright
+    rather than turning it into a prompt for the model.
+  </p>
+
+  <h2 id="sec-approval">16.3 user-approval: the one-shot approval waterfall</h2>
+
+  <p>
+    <code>dsh-user-approval</code> defines the channel-neutral <strong>one-shot approval</strong>
+    seam (<code>ctx.approval</code>). An <code>approval.request(req)</code> returns one of four
+    outcomes: <code>allowed-once</code>, <code>rejected</code>, <code>cancelled</code>,
+    <code>unavailable</code> — note that the vocabulary contains only <strong>once</strong>: there
+    is no allow-always, no memory rule, no grant store, and one grant covers only the single action
+    requested. When the answerer is absent or fails, it <strong>fails closed</strong>. Every
+    request must belong to an open agent turn; the service appends a paired
+    <code>approval/asked</code> and <code>approval/decided</code> audit record (log-only), and all
+    the model ever sees is the final requesting tool's result.
+  </p>
+
+  <p>
+    Answerers are <code>approval/request</code> waterfall listeners — the waterfall semantics from
+    Chapter 2 are a hard requirement here: <strong>either return an outcome to answer for this
+    agent, or call <code>next()</code> to delegate</strong>; returning silently cuts off the whole
+    chain. Agent-scoped listeners receive only that agent's requests; each deployment assembles
+    exactly one terminal answerer, because sibling listener order is not a policy-precedence
+    mechanism. The ACP automation bridge provides a machine-decided one-shot answerer for the
+    sessions it owns.
+  </p>
+
+  <p>
+    The junction with the tool pipeline is from Chapter 8: the <code>tools/pre-execute</code>
+    decision union includes <code>{kind:'ask', reason?}</code> — the registry routes it to
+    <code>ctx.approval</code>; when the seam is not mounted it <strong>degrades to deny</strong>
+    (the registry consumes approval opportunistically via <code>ctx.get('approval')</code>, with no
+    static injection, so a deployment without it keeps ask→deny semantics). The sandboxed bash tool
+    also goes through this seam on escalation retries. Session-level policy has exactly two
+    settings: <code>ApprovalPolicy</code> is <code>ask</code> or <code>never</code>, the effective
+    value is the last <code>approval/policy</code> event (falling back to configuration), and
+    <code>setApprovalPolicy()</code> is the write path; <code>never</code> refuses before
+    interactive dispatch. The first request and every effective policy change append a short
+    runtime-context snapshot for the model (for example, under <code>never</code> the model is told
+    explicitly to stop requesting sandbox escalations).
+  </p>
+
+  <div class="demo" data-demo="permissionOnce">
+    <div class="demo-title">Try it — the one-shot permission waterfall</div>
+    <button data-run>Request a tool approval</button>
+    <div class="demo-output empty">Click to start.</div>
+  </div>
+
+  <div class="box note">
+    <div class="box-title">Why one-shot only</div>
+    <p>
+      “Remember my choice” would require grant storage, invalidation, and revocation semantics — a
+      separate domain that does not exist yet. One-shot keeps the audit semantics minimal: one
+      explicit decision per dangerous action, with <code>approval/asked</code> /
+      <code>approval/decided</code> replayable as a pair. To reduce interruptions, switch the whole
+      policy group with a preset from 16.4 instead of letting a single grant generalize.
+    </p>
+  </div>
+
+  <h2 id="sec-presets">16.4 permission-presets: user-facing knob bundles</h2>
+
+  <p>
+    <code>sandbox/mode</code> and <code>approval/policy</code> are two independent mechanism knobs;
+    <code>dsh-permission-presets</code> (<code>ctx.permissionPresets</code>) <strong>bundles them
+    into presets a user can understand</strong>. Each configured preset name binds one set of
+    values; the bundled defaults are <code>workspace-write</code> (<code>workspace-write</code> +
+    <code>ask</code>) and <code>danger-full-access</code> (<code>danger-full-access</code> +
+    <code>never</code>). A UI adapter can render the table as a picker, while sandbox execution and
+    approval keep consuming their own knobs — a preset is a presentation and user-intent layer, not
+    a new enforcement mechanism.
+  </p>
+
+  <p>
+    <code>set(session, name)</code> first appends a log-only
+    <code>permissionPresets/preset</code> event recording the user's choice, then calls each knob's
+    setter when an effective value changes — the choice event comes first, preserving the user's
+    intent when presets share the same bundle; a net-zero choice appends nothing.
+    <code>current(events)</code> prefers a recorded selection that still matches, then the first
+    matching table entry, and returns <code>custom</code> when nothing matches:
+    <strong><code>custom</code> can only be derived, never selected</strong> — the user can switch
+    away from a knob combination that no longer matches, but cannot persist it as a target. A
+    table entry named <code>custom</code> throws at load.
+  </p>
+
+  <p>
+    Session creation pins three things: <code>permissionPresets/preset</code>,
+    <code>sandbox/mode</code>, and <code>approval/policy</code> land in that session, and later
+    default changes no longer touch existing sessions; a restored seed (including an explicitly
+    empty seed) keeps its effective permissions. The service requires a restricted
+    <code>ctx.shell</code> executor and <code>ctx.approval</code> — loading fails when the
+    combination matches no preset and no <code>defaultPreset</code> is given. Two optional
+    subcomponents activate with the registry: a session projection cell (folding the three
+    whole-value knob events into a selection view) and the <code>/permissionPresets</code> command
+    (a bare invocation reports the current preset and table; with an argument it switches).
+  </p>
+
+  <h2 id="sec-ask-user">16.5 user-questions and tool-ask-user: the model asks the user</h2>
+
+  <p>
+    So far the human initiates (commands) and the human approves (approvals);
+    <code>dsh-user-questions</code> completes the reverse direction: <strong>the model pauses its
+    work and asks the human for a decision</strong>. The Service Definition
+    <code>ctx.userQuestions</code> has only two verbs: <code>registerProvider(provider)</code> on
+    the UI side (one context allows a single active provider; duplicate registration throws
+    <code>DUPLICATE_PROVIDER</code>) and <code>ask(request)</code> (awaits the active provider's
+    answer). The vocabulary is the shape of a question form:
+    <code>questions: [{ id, question, detail?, header?, options?, multiSelect? }]</code>, with the
+    answer as <code>{ answers: [{ id, selected, custom? }] }</code> — for single select,
+    <code>custom</code> overrides <code>selected</code>; for multi-select it supplements it. The
+    loop is unchanged: one tool call awaits one promise, and the tool result returns to the agent
+    loop as usual; while waiting, <strong>not a single token is spent</strong>.
+  </p>
+
+  <p>
+    The Consumer package <code>dsh-tool-ask-user</code> exposes it as the model-visible
+    <code>ask_user_question</code> tool: it accepts the same questions array (the recommended
+    option goes first with <code>(Recommended)</code> appended to its label), calls
+    <code>ctx.userQuestions.ask()</code>, and returns compact JSON. It renders no UI and does not
+    know how input is collected — it only translates parameters and results.
+  </p>
+
+  <p>
+    Two boundary designs are worth recording. First, <strong>a runtime-owned subagent cannot ask
+    the user</strong>: when the request carries an <code>agent</code>, <code>ask()</code>
+    authenticates the exact runtime root identity through the active <code>AgentRegistry</code>; a
+    subagent owned by another live agent is refused (the tool side surfaces this as a
+    <code>DELEGATED_CALLER</code> error instructing the subagent to write the pending question into
+    its final result) — durable lineage is not authoritative: a session with historical delegation
+    depth that is restored as a new runtime root can ask normally. This continues Chapter 14's
+    principle that lineage is data, not visibility. Second, <strong>presentation intent</strong>:
+    a question's <code>intent</code> field declares it a known kind of decision (such as
+    <code>plan-review</code>); a UI that recognizes it can render a review card, one that does not
+    renders the generic option table, and in both cases the caller reads the same answer fields.
+  </p>
+
+  <h2 id="sec-plan-mode">16.6 plan-mode: logged state, not a privileged mode</h2>
+
+  <p>
+    <code>dsh-plan-mode</code> is the best specimen of two-plane collaboration. Its durable state
+    is a log-only, whole-value-replacement <code>plan/mode</code>
+    (<code>{ active: boolean }</code>) SessionEvent: <code>foldPlanMode(events)</code> returns the
+    last recorded value or <code>false</code>, so resume, fork, and compaction all restore plan
+    state straight from the session log, and the UI observes flips through
+    <code>session/event</code>. <strong>Plan mode is state recorded in the log, not a privileged
+    mode of the process</strong> — there is no such thing as the runtime gaining special
+    permissions after entering plan mode.
+  </p>
+
+  <p>
+    For the model, an activated plan mode renders the configured <code>section</code> text into the
+    system prompt (prompt order 50); for the human, it registers <code>/plan [message]</code> via
+    <code>ctx.commands</code> (a bare invocation selects plan mode; a non-empty argument other
+    than <code>off</code> first selects the mode, then submits the message via
+    <code>agent.steer()</code> as an ordinary logged user message — this is the example of a
+    command handler explicitly switching to the message plane) and <code>/plan off</code> (exits
+    directly, sending no model input). Exit review goes through the always-registered
+    <code>exit_plan_mode</code> tool: executable only while active, and it must obtain the user's
+    explicit approval through <code>ctx.userQuestions</code> (the question carries the
+    <code>plan-review</code> intent, and <code>Approve</code> is the approval label); when the user
+    dismisses the review and speaks instead, the model is told to stay in plan mode and await a
+    message. The tool schema is stable across states — mode switches do not change the tool
+    catalog.
+  </p>
+
+  <p>
+    The most easily misunderstood point: <strong>plan mode is soft guidance</strong>. It steers the
+    model toward exploring a design before delivering a plan, but enforces no restrictions —
+    sandbox mode and approval policy enforce independently and never read or write plan state.
+    Deployments that need hard constraints should configure sandbox and approval (16.3, 16.4)
+    rather than counting on <code>section</code> text. On the session-projection side, when
+    <code>ctx.sessionProjections</code> is mounted it registers a <code>plan</code> cell folding
+    both <code>command/run</code> (named plan) and <code>plan/mode</code> events;
+    <code>view</code> derives <code>{ active, pending }</code> — <code>pending</code> is a pure
+    replay quantity that a host restart, another tab, or a cold read can each recover from the log
+    alone.
+  </p>
+
+  <h2 id="sec-todo-feedback">16.7 todo and feedback: two destinations for plans</h2>
+
+  <p>
+    <code>dsh-tool-todo</code> registers the model-visible <code>todo_write</code> tool with a
+    maximally restrained design: <strong>whole-list replacement</strong> is the only operation —
+    every call sends the complete task list (<code>{ content, status }</code>, with status as
+    <code>pending</code>/<code>in_progress</code>/<code>completed</code>); there is no partial
+    update and no per-item editing. Each call appends a full-snapshot event via
+    <code>agent.session.append('todo/write', { todos })</code>; the current list is simply the
+    latest one (last-write-wins on replay). The list belongs to the <strong>single</strong> agent
+    session that called it — there is no subagent/shared/swarm scope, and non-agent callers are
+    refused outright. <code>allowParallelInProgress</code> is a required config field: whether
+    concurrent active tasks are legal is the deployment's choice, not a fixed rule; but the
+    durable-log invariant does not tighten with it (a log written during the parallel era must
+    still replay after tightening). When the projection registry is mounted, the
+    <code>todos</code> cell clears on every <code>turn/start</code> — a standing plan lives only
+    until the next turn starts, and <code>turn/end</code> preserves the completed list.
+  </p>
+
+  <p>
+    The feedback family is two deliberately separated contracts for “recording human feedback.”
+    Command side: <code>dsh-command-feedback</code>'s <code>recordFeedback(session, text)</code>
+    appends a log-only <code>feedback/record</code> event, and the
+    <code>/feedback &lt;text&gt;</code> command is merely the human entry to that write path
+    (hence <code>recordInput: false</code> — the command pair event does not duplicate the text).
+    Feedback is trigger-agnostic: another UI, a hook, or a host integration can call the producer
+    directly. The text receives no parsing, truncation, or merging; the log is append-only, with no
+    retraction. <code>dsh-session-telemetry-otel</code> optionally observes this event to release
+    the feedback-gated telemetry prefix. Message side: <code>dsh-message-feedback</code>
+    (<code>ctx.messageFeedback</code>) is an <strong>editable</strong> per-assistant-message
+    rating/note stored in storage-domain sidecar rows, publishing the Host
+    <code>messageFeedback.list/put/delete</code> Remote contracts with <code>ifVersion</code>
+    compare-and-set and per-message version-conflict semantics — it is not a Session event, not a
+    projection, and triggers no telemetry handover.
+  </p>
+
+  <div class="box key">
+    <div class="box-title">Key points</div>
+    <p>
+      Four kinds of human input, four destinations: slash commands → direct execution on the
+      command plane + a log-only lifecycle; approvals/questions → one-shot decisions inside a tool
+      call, with a log-only audit pair while the model sees only the tool result; plans → log-only
+      <code>plan/mode</code> state + soft guidance in the system prompt; feedback → a log-only
+      <code>feedback/record</code> event or the Host sidecar.
+      <strong>None of them stuffs the UI interaction itself into model history.</strong>
+    </p>
+  </div>
+
+  <h2 id="sec-recap">16.8 Chapter recap</h2>
+  <ul>
+    <li>Two planes: the command plane dispatches through <code>ctx.commands</code> — no model turn, results never enter model history, but it records log-only <code>command/run</code>/<code>command/done</code>; on the message plane, everything model-visible is logged as surface events.</li>
+    <li>Command registry: global registration + <code>agent.ctx</code> scope shadowing, duplicate names within a layer fail; <code>recordInput: false</code> lets the authoritative domain event own the payload alone; unknown slash input is refused by the bundled adapters rather than becoming a prompt.</li>
+    <li>Approval is one-shot: <code>allowed-once | rejected | cancelled | unavailable</code>, and a grant covers only the requested action; the answerer waterfall either answers or calls <code>next()</code>; absence/failure fails closed; a <code>tools/pre-execute</code> <code>ask</code> decision routes to <code>ctx.approval</code> and degrades to deny when unmounted.</li>
+    <li>permission-presets bundles <code>sandbox/mode</code> + <code>approval/policy</code> (defaults <code>workspace-write</code>/<code>danger-full-access</code>); <code>custom</code> can only be derived; session creation pins the three events.</li>
+    <li><code>ctx.userQuestions</code> has a single provider; <code>ask_user_question</code> is the Consumer; a subagent owned by a live parent is refused (<code>DELEGATED_CALLER</code>) and durable lineage is not authoritative; <code>intent</code> (such as <code>plan-review</code>) changes only presentation, never the answer fields.</li>
+    <li>plan-mode is logged state: a <code>plan/mode</code> whole-value-replacement event + soft guidance in the system prompt + <code>exit_plan_mode</code> exiting through explicit approval; enforced restrictions come from sandbox and approval independently.</li>
+    <li>todo_write does whole-list replacement, single owner, <code>todo/write</code> full-snapshot events, projection clears on <code>turn/start</code>; feedback splits two ways: the log-only <code>feedback/record</code> event (command-triggerable but trigger-agnostic) and the <code>ctx.messageFeedback</code> sidecar (a Host Remote with CAS).</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming a slash command's result enters model context — it does not; a command handler that wants to trigger model work must use the <code>Agent</code> explicitly and own the resulting message contract.</li>
+      <li>Returning <code>undefined</code> from an approval waterfall listener without calling <code>next()</code> — the whole chain is cut off; waterfall listeners must delegate.</li>
+      <li>Expecting allow-always or “remember my choice” — the vocabulary has only <code>allowed-once</code>; to reduce interruptions, switch policy with a preset.</li>
+      <li>Assuming <code>ask</code> either allows through or raises to the user when the approval seam is not mounted — it degrades to deny; fail closed is deliberate.</li>
+      <li>Treating plan mode as an enforced boundary — it is soft guidance; hard constraints belong to sandbox/approval, and neither reads or writes plan state.</li>
+      <li>Designing a partial-update API for todo_write — whole-list replacement is the only operation, and extending the item shape (ids, nesting) fails loud in validation.</li>
+      <li>Treating message-feedback as a Session event or projection — it is a storage-domain sidecar, a separate contract from the immutable <code>feedback/record</code> event.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="16">
+    <h2>Chapter 16 Test</h2>
+
+    <div class="q" data-id="16-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — ctx.commands.execute parses and runs the handler directly: no model turn, the result is rendered by the adapter and never enters model history, but the command lifecycle is recorded as a log-only event pair."
+         data-rationale="B is correct. A is wrong: the command plane deliberately bypasses the model. C is wrong: command results are rendered directly, not logged as a user surface message. D is wrong: an admission miss (unknown command / invalid syntax) produces no log at all; only parsed calls record command/run and command/done."
+         data-review="sec-two-planes">
+      <div class="prompt"><span class="qnum">Q1.</span> After the user types <code>/compact</code> in the Web client, what is the execution path?</div>
+      <label class="opt"><input type="radio" name="q-16-1" value="a"> A. It becomes a user message sent to the model, which decides on compaction</label>
+      <label class="opt"><input type="radio" name="q-16-1" value="b"> B. The command plane dispatches and executes it directly, without a model turn; the result is rendered by the UI and never enters model history, and the lifecycle is logged as log-only events</label>
+      <label class="opt"><input type="radio" name="q-16-1" value="c"> C. It goes through the tools pipeline as a tool call, and the model sees a compact tool</label>
+      <label class="opt"><input type="radio" name="q-16-1" value="d"> D. The command is silently ignored with nothing written to the log</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, and C."
+         data-rationale="A, B, and C never enter a model request: command results are rendered directly by the adapter; approval/asked and approval/decided are a log-only audit pair, and the model only sees the final tool result; the UI clicks during a plan review are not model context — what the model sees is the exit_plan_mode tool result. D is wrong: the human's answer returns to the agent loop as a compact JSON tool result, which is exactly the input the model consumes."
+         data-review="sec-two-planes">
+      <div class="prompt"><span class="qnum">Q2.</span> Which of the following <strong>never enter a model request</strong>? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="a"> A. The direct result text of <code>/compact</code></label>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="b"> B. The <code>approval/asked</code> / <code>approval/decided</code> audit events</label>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="c"> C. The user's click interactions in the UI during a plan review themselves</label>
+      <label class="opt"><input type="checkbox" name="q-16-2" value="d"> D. The human's answer JSON returned to <code>ask_user_question</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — allowed-once, rejected, cancelled, unavailable."
+         data-rationale="C is correct: this is the complete outcome vocabulary of ctx.approval.request. The allowed-always in A does not exist — there is no allow-always, no memory rule, no grant store. The denied and timeout in B are not in the vocabulary (refusal is rejected, and aborts resolve to cancelled). D mistakes permissionPresets event names for approval outcomes."
+         data-review="sec-approval">
+      <div class="prompt"><span class="qnum">Q3.</span> Which set is the outcome vocabulary of a one-shot approval request?</div>
+      <label class="opt"><input type="radio" name="q-16-3" value="a"> A. allowed-once, allowed-always, rejected, cancelled</label>
+      <label class="opt"><input type="radio" name="q-16-3" value="b"> B. allowed, denied, timeout, unavailable</label>
+      <label class="opt"><input type="radio" name="q-16-3" value="c"> C. allowed-once, rejected, cancelled, unavailable</label>
+      <label class="opt"><input type="radio" name="q-16-3" value="d"> D. ask, never, preset, custom</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B — It degrades to deny: the registry opportunistically consumes ctx.get('approval'), so a deployment without the approval seam keeps ask→deny semantics — fail closed."
+         data-rationale="B is correct — this is deliberate fail-closed design. A is wrong: the call is not allowed through. C is wrong: the tools pipeline pops no UI; interactive answers come from the approval answerer the deployment assembles. D is wrong: the registry does not break without approval — it works fine, ask just degrades."
+         data-review="sec-approval">
+      <div class="prompt"><span class="qnum">Q4.</span> A <code>tools/pre-execute</code> listener returns <code>{kind:'ask'}</code>, but the deployment has not mounted the approval seam. What happens?</div>
+      <label class="opt"><input type="radio" name="q-16-4" value="a"> A. The call is allowed through, because there is no one to refuse</label>
+      <label class="opt"><input type="radio" name="q-16-4" value="b"> B. ask degrades to deny and the call is refused</label>
+      <label class="opt"><input type="radio" name="q-16-4" value="c"> C. The tool registry pops up an interactive question window</label>
+      <label class="opt"><input type="radio" name="q-16-4" value="d"> D. The tool registry unloads itself</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-5" data-type="fill"
+         data-accepted='["sandbox/mode 和 approval/policy","sandbox/mode + approval/policy","sandbox/mode 与 approval/policy","sandbox mode 和 approval policy"]'
+         data-answer="The two mechanism knobs: sandbox/mode and approval/policy."
+         data-rationale="A preset is a presentation and user-intent layer: each name bundles a set of values for these two knobs, defaulting to workspace-write (workspace-write + ask) and danger-full-access (danger-full-access + never); sandbox execution and approval keep consuming their own knobs. Filling in plan/mode mistakes plan state for a permission mechanism."
+         data-review="sec-presets">
+      <div class="prompt"><span class="qnum">Q5.</span> Fill in the blank: a permission preset bundles ______, the two mechanism knobs.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-6" data-type="mcq" data-correct='["c"]'
+         data-answer="C — A subagent owned by a live parent agent is refused (DELEGATED_CALLER); the failure message says to write the pending question or decision into the subagent's final result."
+         data-rationale="C is correct: ask() authenticates the exact runtime root identity; durable lineage is not authoritative — a session restored as a runtime root can ask normally even with historical delegation depth. A and B both ignore this boundary. D is wrong: the parent receives no automatic forwarding; communication is the subagent's responsibility via its final result."
+         data-review="sec-ask-user">
+      <div class="prompt"><span class="qnum">Q6.</span> A subagent owned by a running parent agent calls <code>ask_user_question</code>. What happens?</div>
+      <label class="opt"><input type="radio" name="q-16-6" value="a"> A. The question is automatically forwarded to the parent agent's user</label>
+      <label class="opt"><input type="radio" name="q-16-6" value="b"> B. The subagent gets the human's answer as usual</label>
+      <label class="opt"><input type="radio" name="q-16-6" value="c"> C. The call is refused (DELEGATED_CALLER), and the subagent should write the pending question into its final result</label>
+      <label class="opt"><input type="radio" name="q-16-6" value="d"> D. The question queues until the subagent finishes its turn</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-7" data-type="mcq" data-correct='["d"]'
+         data-answer="D — plan/mode is a log-only, whole-value-replacement SessionEvent; resume/fork/compaction restore plan state straight from the log."
+         data-rationale="D is correct — that is exactly what logged state, not a privileged mode, means. A is wrong: it is soft guidance with no enforcement semantics. B is wrong: mode switches do not change the tool catalog; exit_plan_mode is registered in both states. C is wrong: sandbox mode and approval policy enforce independently and never read or write plan state."
+         data-review="sec-plan-mode">
+      <div class="prompt"><span class="qnum">Q7.</span> Which statement about plan-mode's state and boundaries is correct?</div>
+      <label class="opt"><input type="radio" name="q-16-7" value="a"> A. While plan mode is active, the runtime gains enforced read-only permissions</label>
+      <label class="opt"><input type="radio" name="q-16-7" value="b"> B. Entering plan mode swaps out the entire tool schema</label>
+      <label class="opt"><input type="radio" name="q-16-7" value="c"> C. Plan mode is responsible for tightening sandbox and approval policy</label>
+      <label class="opt"><input type="radio" name="q-16-7" value="d"> D. <code>plan/mode</code> is a log-only whole-value-replacement event, and resume/fork/compaction all restore it from the log</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-8" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A, B, and D are correct: whole-list replacement is the only operation, todo/write is a full-snapshot event (last-write-wins on replay), and the todos projection clears on every turn/start (standing plan). C is the opposite: the list belongs to the single agent session that called it, there is no shared scope, and non-agent callers are refused."
+         data-review="sec-todo-feedback">
+      <div class="prompt"><span class="qnum">Q8.</span> Which statements about <code>todo_write</code> are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="a"> A. Every call sends the complete list; there is no partial update</label>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="b"> B. The <code>todo/write</code> event carries a full snapshot of the list</label>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="c"> C. The list can be shared between a subagent and its parent</label>
+      <label class="opt"><input type="checkbox" name="q-16-8" value="d"> D. The <code>todos</code> projection cell clears on every <code>turn/start</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-9" data-type="mcq" data-correct='["b"]'
+         data-answer="B — A log-only feedback/record event is appended; the command pair event does not duplicate the text because recordInput is false."
+         data-rationale="B is correct: the feedback text lives only in the single durable payload of feedback/record, and that event is authoritative (feedback can come from other triggers). A is wrong: it is not a Session projection. C is wrong: the editable per-message rating lives in the ctx.messageFeedback storage sidecar, a separate contract from command feedback. D is wrong: the log is append-only, with no retraction or tombstone."
+         data-review="sec-todo-feedback">
+      <div class="prompt"><span class="qnum">Q9.</span> After the user runs <code>/feedback the UI feels slow</code>, where does the text go?</div>
+      <label class="opt"><input type="radio" name="q-16-9" value="a"> A. It becomes an item in the todo projection</label>
+      <label class="opt"><input type="radio" name="q-16-9" value="b"> B. A log-only <code>feedback/record</code> event is appended; it never enters model context</label>
+      <label class="opt"><input type="radio" name="q-16-9" value="c"> C. It is written into a <code>ctx.messageFeedback</code> sidecar row</label>
+      <label class="opt"><input type="radio" name="q-16-9" value="d"> D. It is kept in the UI as a retractable draft</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-10" data-type="mcq" data-correct='["a"]'
+         data-answer="A — Plan mode is state recorded in the session log (a plan/mode event + soft guidance in the system prompt), not a privileged mode of the process."
+         data-rationale="A is correct: foldPlanMode takes the last value from the log, and resume/fork/compaction all restore it. B is wrong: it only guides the model and enforces nothing. C is wrong: no privileged process mode exists. D is wrong: /plan and /plan off are commands on ctx.commands and never take a model turn."
+         data-review="sec-plan-mode">
+      <div class="prompt"><span class="qnum">Q10.</span> What is the correct reading of the statement that plan mode is logged state rather than a privileged mode?</div>
+      <label class="opt"><input type="radio" name="q-16-10" value="a"> A. The state persists as a log-only <code>plan/mode</code> event, restored by replay; for the model it is soft guidance</label>
+      <label class="opt"><input type="radio" name="q-16-10" value="b"> B. Once active, the runtime enters a read-only privileged process mode</label>
+      <label class="opt"><input type="radio" name="q-16-10" value="c"> C. The plan is kept in memory and lost on process restart</label>
+      <label class="opt"><input type="radio" name="q-16-10" value="d"> D. The <code>/plan</code> command itself is a model tool</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="16-11" data-type="short"
+         data-key-points='["Command plane: dispatches via ctx.commands, no model turn, results never enter model history, lifecycle is log-only (command/run + command/done)","Message plane: everything sent to the model is logged as surface events (model-visible ⟺ logged)","A command handler that wants to trigger model work must use the Agent explicitly (e.g. /plan [message] via agent.steer()) and own the resulting message contract","Approvals/questions are decisions inside a tool call: the audit pair is log-only, the model only sees the tool result"]'
+         data-answer="The two planes are the axis of judgment: the command plane (/compact, /plan, /feedback, /permissionPresets) executes directly through ctx.commands — no model turn, no tokens, results rendered by the adapter and never entering model history — while parsed calls record log-only command/run/command/done for audit replay; on the message plane (prompts, steering, injected context), everything model-visible is logged as surface events, and deriveMessages() projects model history from them. A command handler that wants to trigger model work must use the Agent explicitly (/plan [message] switches to the message plane via agent.steer()) and own the message contract itself. Approvals and questions are human decisions inside tool calls: the approval/asked and approval/decided audit pair is log-only, and the model sees only the final tool result."
+         data-rationale="The two planes + the two kinds of human decisions inside tool calls + the command handler's explicit switch — that is the entire skeleton of the human collaboration plane."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q11.</span> In your own words, explain the distinction between the command plane and the message plane with one example each; then explain what a command handler must do when it wants the model to do work.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a key point if you genuinely covered it — under-checking hurts your calibration; over-checking just fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="17-capability-tour.html"><strong>Chapter 17 · A Tour of Capabilities</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

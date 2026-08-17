@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 15 · Context Pressure Management: compaction, spill, and the context plugins — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 15 · Context Pressure</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/15-context-pressure.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="15">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 15 · Part III · Capability Seams in Depth</div>
+    <h1>Context Pressure Management: compaction, spill, and the context plugins</h1>
+    <p class="lede">
+      The Chapter 7 turn/step loop assumed every request can hold the entire history — but the context window
+      is finite, and one <code>bash</code> output or one web fetch can fill it instantly. dsh answers with
+      three gates: <strong>spill</strong> offloads oversized outputs the moment they are produced,
+      <strong>pruner</strong> trims tool results once pressure triggers, and <strong>compaction</strong>
+      summarizes older history into a checkpoint when pressure persists. This chapter takes the three gates
+      apart one by one, then adds the final link in the pressure picture: the queued
+      <code>agent.inject()</code> injection waiting for admission.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Draw the three gates' trigger timing and cost ordering: spill (at result production), pruner (after pressure triggers, before region selection), compaction (summary replacement)</li>
+      <li>Explain compaction's surface contract — why the only surface change is a <code>user/message</code> carrying <code>surfaceOp: replace</code>, while all <code>compaction/*</code> events are log-only</li>
+      <li>Configure <code>dsh-compaction-basic</code>'s thresholds and retention policy (<code>thresholdRatio</code> / <code>retainRatio</code> / <code>modelPolicies</code>), and explain how the summary call reuses the KV cache</li>
+      <li>Distinguish the pruner's trimming from spill's offloading: one rewrites a surface node, the other moves the full text out of context leaving only a locator</li>
+      <li>State that <code>/compact</code> is a human command rather than a model tool, and describe <code>agent.inject()</code>'s queuing and admission semantics</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-problem">15.1 The problem: a finite window that tool results fill instantly</h2>
+
+  <p>
+    The context window is everything a model can see in one request: the system prompt, tool schemas, routing
+    information, assistant completions, tool results, buffered context, and steering. Chapter 9 showed how the
+    system prompt is assembled; Chapter 8 showed how tool results land in <code>tool/result</code> surface
+    events. Put together, an engineering problem appears: <strong>history grows monotonically, and the window
+    does not</strong>. An unbounded <code>grep -r</code>, a full web-page fetch, or a massive test output can
+    blow up every following request within a single step.
+  </p>
+
+  <p>
+    dsh's answer is not a new branch in agent-loop but three independent plugin families hanging on existing
+    extension points:
+  </p>
+  <ul>
+    <li>
+      <code>packages/spill/</code> — <strong>spill</strong>: when a tool result is produced
+      (<code>tools/post-execute</code>), offload oversized plain-text results to storage, leaving only a
+      bounded preview plus a locator in the model context.
+    </li>
+    <li>
+      <code>packages/compaction/compaction-tool-result-pruner/</code> — <strong>pruner</strong>: after the
+      pressure trigger and before selecting the summary region, rewrite over-budget <code>tool/result</code>
+      surface nodes into head + omission marker + tail.
+    </li>
+    <li>
+      <code>packages/compaction/</code> (the other three packages) — <strong>compaction</strong>: summarize an
+      older history region into a single checkpoint message, replacing the shadowed region.
+    </li>
+  </ul>
+
+  <p>
+    The division of labor is written into the group README's role table: measurement (how big is this request,
+    really) belongs to the LLM family's <code>ctx.tokenMeter</code>, not to any gate; spill owns only storage
+    and locating (no retention policy, no retrieval API); compaction owns only the contract for when-is-it-too-
+    big and how-to-summarize, with concrete strategy implemented by backends. This is a group application of
+    Chapter 11's capability seam methodology.
+  </p>
+
+  <h2 id="sec-three-gates">15.2 The three gates: timing and cost</h2>
+
+  <p>
+    Place the three families into the life cycle of one tool result and the order becomes clear.
+    <strong>Gate 1 (spill) is the preventive gate</strong>: it intercepts the final result at
+    <code>tools/post-execute</code>, and plain text over <code>maxInlineBytes</code> is offloaded before it
+    ever enters the context — the big output never reaches the window at all. <strong>Gates 2 (pruner) and 3
+    (compaction) are responsive gates</strong>: only when the pressure reported by <code>ctx.tokenMeter</code>
+    crosses the threshold (or the provider confirms a window overflow) does the pruner first trim over-budget
+    tool results and re-measure; only if pressure persists does compaction perform the summary replacement.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 660 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The three context-pressure gates">
+      <rect x="30" y="40" width="180" height="58" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="120" y="63" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">Tool execution</text>
+      <text x="120" y="82" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">tools/post-execute</text>
+
+      <line x1="120" y1="98" x2="120" y2="128" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="120,131 116,123 124,123" style="fill:var(--muted)"/>
+
+      <rect x="30" y="131" width="180" height="58" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="120" y="154" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">Context window accumulates</text>
+      <text x="120" y="173" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">surface · measured by ctx.tokenMeter</text>
+
+      <line x1="120" y1="189" x2="120" y2="219" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="120,222 116,214 124,214" style="fill:var(--muted)"/>
+
+      <rect x="30" y="222" width="180" height="58" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="120" y="245" text-anchor="middle" style="fill:var(--warn)" font-size="13" font-weight="700">Pressure trigger</text>
+      <text x="120" y="264" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">agent/pre-step · agent/request-error</text>
+
+      <rect x="320" y="30" width="310" height="78" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="475" y="54" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">Gate 1 · spill (prevention)</text>
+      <text x="475" y="73" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Oversized plain-text results offloaded to storage</text>
+      <text x="475" y="89" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Context keeps only a bounded preview + locator · zero model calls</text>
+
+      <line x1="210" y1="69" x2="316" y2="69" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="319,69 311,65 311,73" style="fill:var(--muted)"/>
+
+      <rect x="320" y="214" width="310" height="66" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="475" y="238" text-anchor="middle" style="fill:var(--accent-2)" font-size="13" font-weight="700">Gate 2 · pruner (trimming)</text>
+      <text x="475" y="257" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Over-budget tool/result rewritten as head + marker + tail</text>
+      <text x="475" y="272" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Original events kept in the log · zero model calls</text>
+
+      <line x1="210" y1="251" x2="316" y2="251" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="319,251 311,247 311,255" style="fill:var(--muted)"/>
+
+      <rect x="320" y="290" width="310" height="62" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="475" y="313" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">Gate 3 · compaction (summarization)</text>
+      <text x="475" y="332" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">One auxiliary llm.stream call replaces the old region with a checkpoint</text>
+      <text x="475" y="346" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">The checkpoint returns to the surface; the window is writable again</text>
+
+      <line x1="475" y1="280" x2="475" y2="287" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="475,290 471,282 479,282" style="fill:var(--muted)"/>
+      <text x="500" y="288" style="fill:var(--fg-dim)" font-size="10">still over threshold</text>
+    </svg>
+    <figcaption>The three gates: spill prevents at result production; pruner and compaction respond in order after the pressure trigger. Zero model calls first, one auxiliary call later.</figcaption>
+  </figure>
+
+  <p>
+    This ordering is also <strong>cost economics</strong>: spill and pruner make no model calls — one trades for
+    storage, the other slices plain text; compaction pays one auxiliary <code>llm.stream()</code> call and
+    invalidates the KV cache of the replaced region. So the repository orders them most expensive last: if
+    re-measuring after the pruner's trim is already below pressure, compaction-basic skips the summary
+    outright. Conversely, some situations defeat all three gates: the compaction README states plainly that a
+    single indivisible huge unit (a non-tool node, an untrimmable tool unit) and a system prompt/tool schema
+    that overflows the window by itself are both outside the surface-compaction contract — those are the
+    assembly layer's business (Chapter 9).
+  </p>
+
+  <h2 id="sec-compaction-seam">15.3 The compaction seam: ctx.compaction's contract</h2>
+
+  <p>
+    <code>packages/compaction/compaction/</code> is the Service Definition package:
+    <code>CompactionEngine</code> (<code>ctx.compaction</code>) defines <strong>what compaction does</strong>
+    — deciding when history is too large and summarizing older regions into a single surface node — without
+    saying <strong>how</strong>. All three operations are abstract:
+  </p>
+  <table>
+    <thead><tr><th>Member</th><th>Semantics</th></tr></thead>
+    <tbody>
+      <tr><td><code>compactIfNeeded(agent, trigger, signal)</code></td><td>Automatic compaction entry; <code>trigger</code> is <code>pressure</code> or <code>context-overflow</code>; returns a <code>CompactionResult</code>, or <code>null</code> when there is no safe region</td></tr>
+      <tr><td><code>compactNow(agent, signal)</code></td><td>Explicit compaction: summarizes a useful balanced region even below automatic pressure; synchronously reserves an idle-turn admission and records an independent bracket with <code>turn: null</code></td></tr>
+      <tr><td><code>compactRegion(start, end, agent, signal?)</code></td><td>Forcibly summarizes the surface-position region <code>[start, end]</code> (inclusive seq); note it is a <strong>surface-position region</strong>, not a numeric seq range — after one replace, surface order no longer follows seq order</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The part of the contract most worth memorizing is the <strong>surface contract</strong>. Chapter 4 showed
+    that <code>SurfaceEventType</code> is a closed union: only <code>user/message</code>,
+    <code>assistant/message</code>, and <code>tool/result</code> can carry <code>surfaceOp</code>, so
+    <code>compaction/*</code> events <strong>can never appear on the surface</strong>. A successful compaction
+    is five steps:
+  </p>
+  <ol>
+    <li>Append <code>compaction/start</code> (log-only) — acquiring the lock;</li>
+    <li>Summarize the selected region;</li>
+    <li>Append <code>compaction/summary</code> (log-only), carrying the summary, the region, the shadowed seqs, token counts, and the provider/model call envelope;</li>
+    <li>Append <strong>one</strong> <code>user/message</code> with source <code>compactCheckpointSource(compactionId)</code> carrying <code>surfaceOp: { op: 'replace', start, end }</code> — the operation's <strong>only surface change</strong>;</li>
+    <li>Append <code>compaction/end</code> (log-only) — releasing the lock.</li>
+  </ol>
+
+  <p>
+    So the model history rendered by <code>deriveMessages()</code> is: the checkpoint summary (in the user
+    role, framed by a <code>&lt;compacted-summary&gt;</code> tag) plus the retained recent nodes; the shadowed
+    original events remain in the append-only log, and replay stays deterministic. The lock itself is a log
+    record: an unpaired <code>compaction/start</code> is the busy signal, and a crash leaves behind a
+    detectable orphan lock rather than a <code>compaction/end</code> that would falsely claim the compaction
+    completed.
+  </p>
+
+  <p>
+    Two more deviations from Chapter 11's methodology deserve attention. First, the Definition exports the
+    boundary helper <code>toolPairingBalancedBefore/After(session, seq)</code>: a safe cut edge cannot cross
+    an unanswered assistant tool call, and this pairing-balance validation belongs to the Definition for every
+    backend to reuse. Second, this Definition departs from the depend-only-on-cordis convention by depending
+    on <code>dsh-session</code> and <code>dsh-llm</code> — because its verbs are defined on
+    <code>Session</code> and its output is the <code>ContentBlock</code> vocabulary; the two packages are
+    unavoidable. The deviation is deliberate and recorded in the compaction capability-seam Agent Note.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Why the only surface change is that one user/message</div>
+    <p>
+      Because model-visible ⟺ logged (the Chapter 4 invariant). For the model to see the summary, it must
+      exist as a surface event; while locks, ledgers, and call envelopes are implementation details the model
+      does not need, so they are all log-only. <code>compactCheckpointSource(compactionId)</code> ties the
+      checkpoint to its <code>compaction/*</code> transaction, and <code>isCompactCheckpointSource()</code>
+      lets client code recognize the marker without knowing the backend's identity.
+    </p>
+  </div>
+
+  <h2 id="sec-compaction-basic">15.4 compaction-basic: the pressure, retention, and summarization backend</h2>
+
+  <p>
+    <code>dsh-compaction-basic</code> is the basic backend (Service Provider): it requires
+    <code>ctx.llm</code>, <code>ctx.tokenMeter</code>, and <code>ctx.sessions</code>, and owns the complete
+    compaction strategy. Pressure measurement is delegated to the singleton <code>ctx.tokenMeter</code> — it
+    prices the latest canonical log envelope + current surface against the same consumed log version, so the
+    pressure at a step boundary <strong>already includes</strong> the actual consumption of the system prompt,
+    tools, routing, assistant completions, tool results, buffered context, and steering. The threshold is not
+    an absolute token count but resolves against the <strong>currently routed model's window</strong>:
+    <code>floor(routedContextWindow × thresholdRatio)</code>. This explains why the same compact plugin can
+    safely serve models of different capacities.
+  </p>
+
+  <p>
+    There are two trigger paths: with the default <code>auto: true</code>, a serialized
+    <code>agent/pre-step</code> listener checks pressure <strong>before</strong> request derivation; a
+    provider-confirmed window overflow enters through <code>agent/request-error</code> and takes a separate
+    overflow-recovery path (trim first, then one maximal balanced head reduction). The retention policy
+    compacts the oldest complete surface units and retains a recent tail, with cut edges going through the
+    Definition's pairing-balance helper; old steps inside a runaway turn get no turn-boundary protection.
+  </p>
+
+  <p>
+    The summary itself is <strong>one direct one-shot <code>ctx.llm.stream()</code> call</strong>, not a loop
+    step (so per-call interception happens at <code>llm/stream</code>, not <code>agent/request</code>). It
+    replays the session's own system prompt, tool schemas, and the shadowed region's messages verbatim —
+    image references included — then appends the compaction instruction as the final user message. Because the
+    prefix is byte-identical to the last routed request, the provider's warm-prefix cache <strong>is
+    reused</strong>; only the trailing instruction and the summary are uncached. The call carries
+    <code>GenerateOptions.purpose: 'compaction'</code> (the DeepSeek adapter sends the
+    <code>x-deepseek-harness-compact: 1</code> attribution header without touching the model-visible body);
+    only returned text enters the checkpoint — reasoning and tool calls are excluded, or private reasoning
+    would leak and orphan calls would be created.
+  </p>
+
+  <table>
+    <thead><tr><th>Config key</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>thresholdRatio</code></td><td><code>0.8</code></td><td>Compact at <code>floor(routed window × ratio)</code></td></tr>
+      <tr><td><code>retainRatio</code></td><td><code>0.16</code></td><td>Retain a recent surface as a fraction of the routed window (mutually exclusive with <code>retainTokens</code>)</td></tr>
+      <tr><td><code>retainTokens</code></td><td>—</td><td>Absolute token budget for retaining recent surface; must be below the resolved threshold</td></tr>
+      <tr><td><code>summarizationProvider</code> / <code>summarizationModel</code></td><td><code>''</code></td><td>Paired settings for the summarization model; empty falls back to the newest logged request target, then the agent target</td></tr>
+      <tr><td><code>maxTokens</code></td><td><code>8192</code></td><td>Generation cap for the summary call</td></tr>
+      <tr><td><code>compactionRetries</code></td><td><code>1</code></td><td>Extra attempts when pressure is still over threshold</td></tr>
+      <tr><td><code>maxOverflowRetries</code></td><td><code>1</code></td><td>Maximum retries after a window overflow (<code>0</code> disables only recovery)</td></tr>
+      <tr><td><code>modelPolicies</code></td><td><code>[]</code></td><td>Partial policy overrides for exact <code>{ provider, model }</code> pairs</td></tr>
+      <tr><td><code>auto</code></td><td><code>true</code></td><td>Register the step-boundary pressure and overflow-recovery listeners; <code>false</code> is fully manual</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Every key is optional and validated at plugin load (unknown keys, duplicate targets, mutually exclusive
+    retention forms, and <code>retainRatio</code> not below <code>thresholdRatio</code> all fail the load) —
+    the standard embodiment of the repository's misconfiguration-fails-loud and no-hardcoded-tunables
+    conventions. To swap the summarization implementation, subclass
+    <code>BasicCompactionEngine</code> and override the protected <code>summarize()</code> — the only
+    subclassing hook; pressure, retention, and the event ledger all stay in the base class.
+  </p>
+
+  <h2 id="sec-pruner">15.5 compaction-tool-result-pruner: model-free trimming</h2>
+
+  <p>
+    <code>dsh-compaction-tool-result-pruner</code> registers <code>ctx.toolResultPruner</code>; it is an
+    <strong>optional companion plugin</strong> of compaction-basic — neither a backend nor a model tool.
+    compact-basic reads it through the optional <code>ctx.get('toolResultPruner')</code>, so the two packages
+    assemble independently — enabling it is just placing it before compact-basic as a sibling plugin in load
+    order.
+  </p>
+
+  <p>
+    What it does is purely syntactic with zero model calls: <code>pruneSession(session)</code> scans a stable
+    snapshot of the current surface and replaces each over-budget <code>tool/result</code> with a newly
+    appended <code>tool/result</code> carrying <code>surfaceOp: { op: 'replace', start: originalSeq, end:
+    originalSeq }</code> and <code>sourceEventSeqs: [originalSeq]</code>. The replacement copies the original
+    event data in full and changes only <code>content</code>: a retained head, the fixed omission marker
+    <code>[... tool result middle pruned ...]</code>, and a retained tail. <strong>The original events stay in
+    the append-only log</strong>, available for persistence, replay, and exact log inspection.
+  </p>
+
+  <p>
+    The three config keys are all Unicode code-point counts: <code>thresholdChars</code> (default
+    <code>8192</code>), <code>headChars</code> (default <code>4096</code>), and <code>tailChars</code>
+    (default <code>1024</code>), constrained by <code>head + marker + tail ≤ threshold</code>, guaranteeing a
+    second scan produces no further replacements. Two points prevent misunderstanding: first, <strong>step
+    checks below pressure never trim</strong> — the pruner runs only after a pressure or overflow trigger
+    qualifies and before region selection, and after trimming compact-basic re-measures and skips the summary
+    if already safe; second, the character budget is not a token budget — the verdict on whether trimming
+    relieved request pressure still belongs to <code>ctx.tokenMeter</code>.
+  </p>
+
+  <h2 id="sec-command-compact">15.6 command-compact: /compact is a human command</h2>
+
+  <p>
+    The first line of the group README's known limitations says it plainly: <strong>Human command, not a
+    model tool</strong>. dsh has <em>no</em> model-visible compact tool — no model-side entry point for
+    triggering compaction exists; automatic pressure and the human command are the only two entries.
+    <code>dsh-command-compact</code> registers a global command on <code>ctx.commands</code>: a bare
+    <code>/compact</code> calls <code>ctx.compaction.compactNow(agent, signal)</code>, summarizing a useful
+    balanced region even below automatic pressure, then reports the number of replaced history entries and an
+    estimated token count. Any argument returns a usage error; with no compactable history it returns
+    <code>No compactable history yet.</code>.
+  </p>
+
+  <p>
+    Notice what happens when the command executes: <strong>no model turn</strong>. The slash input and the
+    direct result never enter a model request (and spend no tokens), but every resolved invocation records a
+    log-only <code>command/run</code> / <code>command/done</code> event pair on that agent's session —
+    <code>command/done.sourceEventSeq</code> points at the transaction's <code>compaction/summary</code>
+    event, letting the presentation layer fold the command's lifecycle onto the corresponding checkpoint
+    without parsing result text. The closed error codes of <code>ManualCompactionError</code>
+    (<code>busy | changed | summary | commit | persistence</code>) are translated into stable direct-error
+    wording.
+  </p>
+
+  <p>
+    Why not let the model compact on its own? Because the entry's <strong>owner is the human control
+    plane</strong>: the command plane dispatches without a model turn, which is exactly the next chapter's
+    protagonist. Plant the seed here: <code>/compact</code>'s bypasses-the-model-yet-logs pattern is the
+    command plane's standard shape.
+  </p>
+
+  <h2 id="sec-spill">15.7 spill: offload, don't truncate</h2>
+
+  <p>
+    The pruner's strategy is keep-head-keep-tail-cut-the-middle — enough for log-type output, but some
+    results carry their value precisely in the full text: the model may later want to <code>grep</code> inside
+    it or <code>read</code> it in segments. The spill family answers that: <strong>move the full text out of
+    context, leave a locator</strong>. The three packages' role table:
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>Role</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-spill</code></td><td>Service Definition</td><td>Abstract <code>ctx.spillStore</code> service + vocabulary types (<code>SaveTextSpill</code> / <code>SpillRef</code> / the branded <code>SpillLocator</code>)</td></tr>
+      <tr><td><code>dsh-spill-local</code></td><td>Service Provider</td><td>Session-scoped private local file storage</td></tr>
+      <tr><td><code>dsh-spill-policy</code></td><td>Consumer</td><td><code>tools/post-execute</code> transformer deciding when to offload and assembling the notice</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The seam owns storage only: <code>saveText(input)</code> persists <code>input.content</code> verbatim and
+    returns a <code>SpillRef</code> (locator, bytes written, retrieval hint); genuine storage failures reject.
+    It has <strong>no</strong> retention policy (that is the util family's <code>dsh-output-retention</code>),
+    <strong>no</strong> tool-result replacement (that is spill-policy), and <strong>no</strong>
+    retrieval/search API — the backend's <code>retrievalHint</code> tells the model what to do with the
+    locator. <code>SpillLocator</code> is a branded type rendered to the model as an opaque string:
+    spill-local returns a local path, and future remote backends can return a URI, a database key, or a
+    command token, with the policy and tool consumers unchanged by a single line.
+  </p>
+
+  <p>
+    <code>dsh-spill-local</code>'s storage layout is a model of safe design: files land in
+    <code>&lt;root&gt;/session-&lt;hash&gt;/&lt;random&gt;-&lt;safeName&gt;</code> — when <code>root</code>
+    is omitted it is a lazily created 0700 private directory under the OS temp directory (a predictable,
+    world-readable root would let other local users read offloaded output or plant symlinks);
+    <code>session-&lt;hash&gt;</code> is a <code>sha256(sessionId)</code> prefix so one session's offloaded
+    files group together for future per-session cleanup; the file name carries an unpredictable hexadecimal
+    prefix, and writes use exclusive owner-only creation (<code>open(path, 'wx', 0o600)</code>), so any
+    already-existing path (including a planted symlink) fails.
+  </p>
+
+  <p>
+    <code>dsh-spill-policy</code> is the sole Consumer: a <code>tools/post-execute</code> transformer. It
+    does exactly four things — lets the tool run first (delegating with <code>next()</code>), acts only when
+    the result is plain text over <code>maxInlineBytes</code>, offloads the full text through
+    <code>ctx.spillStore</code>, and replaces the model-visible result with a bounded head/tail preview plus a
+    notice, staying within budget overall:
+  </p>
+  <pre><code>&lt;retained head/tail preview&gt;
+
+(Omitted N bytes. Full formatted result stored at: /…/session-…/…-web_fetch.txt.
+Use read with offset/limit, or grep this path to search within it.)</code></pre>
+
+  <p>
+    The exemption list matters just as much: nested execution (<code>exec.parent</code> present), accepted
+    value substitution, results of the <code>read</code> tool (avoiding a <code>read → spill → read
+    again</code> cycle), decisions other than <code>accept</code>, and results containing any non-text block —
+    all pass through untouched. Everything is best-effort: no session owner, no mounted backend, or a rejected
+    <code>saveText</code> each logs a warning and keeps the inline result — an offload failure never turns a
+    successful call into <code>isError</code> or hides the result. It also has a second arm: it listens on
+    <code>tools/code-dispatch-log</code> and applies the same cap to the <strong>durable log copies</strong>
+    of Code Mode <code>run_code</code> sub-call results (Code Mode returns in Chapter 17).
+  </p>
+
+  <div class="box key">
+    <div class="box-title">Key point</div>
+    <p>
+      The threshold is <strong>policy, not a constant</strong>: <code>maxInlineBytes</code> is a load-time
+      validated Config key in UTF-8 bytes; <strong>leaving it unset disables the plugin entirely</strong> (it
+      registers nothing). The replacement result's byte count never exceeds the cap — the notice's own byte
+      cost is reserved out of the budget and the preview shrinks to fit, so offloading never adds bytes.
+    </p>
+  </div>
+
+  <div class="demo" data-demo="spillOffload">
+    <div class="demo-title">Try it — spilling an oversized tool result</div>
+    <p>Drag the slider to change the tool result size (threshold 64 KB):</p>
+    <input type="range" min="4" max="200" value="10">
+    <div class="demo-output empty">Try dragging.</div>
+  </div>
+
+  <h2 id="sec-context-plugins">15.8 The context group: injections queue, waiting for admission</h2>
+
+  <p>
+    The last link in pressure management is the party that adds things to the window. The
+    <code>packages/context/</code> group is a set of product plugins that <strong>define no tools and only add
+    model-visible request context</strong>: <code>agent-instructions</code> (the workspace instruction chain,
+    assembled by default with the agent spine demo bundle and disableable via bundle config),
+    <code>time-context</code> (current time and elapsed time), <code>tmux-context</code> (tmux location
+    context), and <code>session-reference</code> (bounded snapshots of other sessions,
+    <code>ctx.sessionReferenceResolver</code>). You saw them from the assembly angle in Chapter 9; from the
+    pressure angle the question is: <strong>when does this content enter a request?</strong>
+  </p>
+
+  <p>
+    The answer is <code>agent.inject(message)</code>'s queuing semantics: it queues <strong>non-waking
+    next-step context</strong> into the inbox. A running driver claims it at the <strong>nearest next
+    pre-step boundary</strong>; an idle driver holds it suspended until <code>followup()</code> or
+    <code>steer()</code> wakes it. It can even miss a request — if that request's pre-step already claimed its
+    own batch. The Where new behavior goes table in <code>docs/architecture.md</code> compresses this into one
+    line: <em>Add model-visible context → call <code>agent.inject()</code>; it lands in the next admitted
+    request</em>. The injected content lands in the log as <code>user/message</code> events, so Chapter 4's
+    model-visible ⟺ logged invariant holds as usual — and this chapter already showed the evidence: during a
+    manual <code>/compact</code>, an idle-injected context can land between <code>compaction/start</code> and
+    <code>compaction/end</code>, and positional replacement keeps it visible after the checkpoint.
+  </p>
+
+  <p>
+    The pressure view adds two more crossings. First, <code>ctx.tokenMeter</code>'s pricing includes buffered
+    context and steering — queued injections are <strong>already counted</strong> in pressure; they are not
+    free. Second, compaction resets the context plugins: <code>agent-instructions</code>'s scope re-arms after
+    its context event leaves the visible surface, and the next entering pre-step reassembles the current
+    baseline; the skill catalog (Chapter 17) likewise rebuilds on the next full observation after being
+    shadowed by compaction. The three gates narrow the window, and the context plugins rebuild the necessary
+    context in the freed space — the cooperation of these two forces is complete pressure management.
+  </p>
+
+  <h2 id="sec-recap">15.9 Chapter recap</h2>
+  <ul>
+    <li>The three gates divide by timing: spill prevents at <code>tools/post-execute</code> (offloading oversized plain text, leaving preview + locator); pruner trims over-budget <code>tool/result</code> after pressure/overflow qualifies; compaction summarizes-and-replaces when pressure persists.</li>
+    <li>Cost ordering: spill and pruner make zero model calls, compaction pays one auxiliary <code>llm.stream()</code> call and invalidates the replaced region's cache; if below pressure after the pruner's trim, the summary is skipped.</li>
+    <li>Compaction's surface contract: <code>compaction/start → compaction/summary → user/message (surfaceOp replace, the only surface change) → compaction/end</code>; the lock is a log bracket, and an orphan start means busy.</li>
+    <li><code>compaction-basic</code>'s policy lives entirely in Config: <code>thresholdRatio</code> (default 0.8, resolved against the routed window), <code>retainRatio</code>/<code>retainTokens</code>, <code>modelPolicies</code>, <code>auto</code>; the summary replays the prefix verbatim to reuse the KV cache.</li>
+    <li>The pruner's replacement preserves original events; the character budget is not a token budget — the verdict stays with <code>ctx.tokenMeter</code>; below pressure, nothing is ever trimmed.</li>
+    <li>There is no model-visible compact tool: <code>/compact</code> is a human command on <code>ctx.commands</code>, bypassing model turns while recording the log-only <code>command/run</code>/<code>command/done</code> pair.</li>
+    <li>The spill seam owns storage only: <code>saveText</code> → <code>SpillRef</code> (branded <code>SpillLocator</code> + retrievalHint); policy (<code>maxInlineBytes</code>, unset means disabled) and file layout (0700 root, sha256 session prefix, exclusive 0600 writes) belong to spill-policy and spill-local respectively.</li>
+    <li><code>agent.inject()</code> queues non-waking context that lands in the next admitted request; injections count toward tokenMeter pressure, and after compaction the context plugins rebuild the catalog and instruction baseline.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming a model-visible compact tool exists — there is none; the only entries are automatic pressure/overflow and the human <code>/compact</code> command.</li>
+      <li>Confusing pruner with spill: the pruner rewrites a surface node (head + marker + tail, original events stay in the log); spill moves the full text out of context, leaving a retrievable locator.</li>
+      <li>Assuming <code>compaction/*</code> events appear on the surface — the closed union lets only <code>user/message</code> / <code>assistant/message</code> / <code>tool/result</code> carry <code>surfaceOp</code>.</li>
+      <li>Hardcoding thresholds as token counts: compaction thresholds resolve as a ratio of the <strong>routed model's window capacity</strong>, and the pruner threshold is a character count; all policy goes through load-time-validated Config.</li>
+      <li>Expecting compaction to solve every overflow: indivisible units and system-prompt/tool-schema overflow are outside the surface-compaction contract.</li>
+      <li>Dropping entries from <code>spill-policy</code>'s exemption list: nested execution, <code>read</code> results, non-text blocks, and non-accept decisions all pass through untouched — <code>read</code> especially, to prevent an offload cycle.</li>
+      <li>Assuming injections take effect immediately: <code>agent.inject()</code> queues for the next admitted request; when idle it waits for a <code>followup()</code>/<code>steer()</code> wake.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="15">
+    <h2>Chapter 15 Test</h2>
+
+    <div class="q" data-id="15-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — spill-policy hangs on tools/post-execute and offloads oversized plain text before the result enters the context; it is the preventive gate."
+         data-rationale="B is correct. A is wrong: the pruner runs only after a pressure or overflow trigger qualifies. C is wrong: compaction summarizes-and-replaces after the threshold is crossed. D is wrong: ctx.tokenMeter only measures and never gates, and it is an LLM-family service, not one of the three gates."
+         data-review="sec-three-gates">
+      <div class="prompt"><span class="qnum">Q1.</span> Of the three gates, which one acts the moment a tool result is <strong>produced</strong>?</div>
+      <label class="opt"><input type="radio" name="q-15-1" value="a"> A. compaction-tool-result-pruner</label>
+      <label class="opt"><input type="radio" name="q-15-1" value="b"> B. spill-policy (tools/post-execute)</label>
+      <label class="opt"><input type="radio" name="q-15-1" value="c"> C. compaction-basic</label>
+      <label class="opt"><input type="radio" name="q-15-1" value="d"> D. ctx.tokenMeter</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-2" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A, C."
+         data-rationale="A and C are correct: a successful compaction replaces the old region with one user/message carrying surfaceOp replace (the only surface change), and the shadowed original events stay in the append-only log for replay. B is wrong: compaction/summary is a log-only event that never reaches the surface. D is wrong: SurfaceEventType is a closed union, and compaction/* cannot carry surfaceOp at all."
+         data-review="sec-compaction-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> About the surface contract of a successful compaction, which statements are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="a"> A. The change the model sees is: one user/message carrying <code>surfaceOp: { op: 'replace', start, end }</code> and the checkpoint summary</label>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="b"> B. The <code>compaction/summary</code> event carrying the summary appears on the surface</label>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="c"> C. The shadowed original events remain in the append-only log, and replay is deterministic</label>
+      <label class="opt"><input type="checkbox" name="q-15-2" value="d"> D. After compaction, <code>deriveMessages()</code> renders both the original region and the summary</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-3" data-type="fill"
+         data-accepted='["ctx.tokenMeter","tokenMeter","token meter"]'
+         data-answer="ctx.tokenMeter (the singleton measurement service provided by dsh-token-meter)."
+         data-rationale="Measurement is a separate service: compaction-basic delegates to ctx.tokenMeter, which prices the newest canonical envelope and current surface against the same consumed log version, so the pressure already includes the system prompt, tools, buffered context, and other actual consumption. Answering compaction or pruner is wrong — they consume measurements, they don't own them."
+         data-review="sec-compaction-basic">
+      <div class="prompt"><span class="qnum">Q3.</span> Fill in the blank: compaction-basic delegates pressure measurement to the ______ service, which prices the complete request at step boundaries.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C — One direct one-shot ctx.llm.stream() call that replays the session's own system prompt, tools, and shadowed-region messages verbatim, reusing the provider's warm-prefix cache."
+         data-rationale="C is correct: the replayed prefix is byte-identical to the last routed request, so only the trailing instruction and summary output are uncached; the call carries purpose compaction. A is wrong: it is not a loop step, and per-call interception happens at llm/stream, not agent/request. B is wrong: no subagent is spawned. D is wrong: compaction-basic makes a real model call; a template backend is merely another implementation overriding summarize()."
+         data-review="sec-compaction-basic">
+      <div class="prompt"><span class="qnum">Q4.</span> How does compaction-basic issue the summary call?</div>
+      <label class="opt"><input type="radio" name="q-15-4" value="a"> A. As an ordinary loop step through the agent/request extension point</label>
+      <label class="opt"><input type="radio" name="q-15-4" value="b"> B. It spawns a dedicated summarization subagent to do it</label>
+      <label class="opt"><input type="radio" name="q-15-4" value="c"> C. One direct one-shot <code>ctx.llm.stream()</code> call that replays the session prefix verbatim, reusing the provider's KV cache</label>
+      <label class="opt"><input type="radio" name="q-15-4" value="d"> D. It doesn't call the model; the summary is assembled from a fixed template</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Bounded head, fixed omission marker, bounded tail; the original events stay in the append-only log."
+         data-rationale="B is correct: the replacement node uses surfaceOp replace and changes only content; the original tool/result remains in the log for replay. A is wrong: the log is append-only and cannot delete original events. C is wrong: offloading to storage with a locator is spill's business. D is wrong: trimming happens after an automatic pressure or overflow trigger qualifies, not only on /compact; and below pressure, checks never trim."
+         data-review="sec-pruner">
+      <div class="prompt"><span class="qnum">Q5.</span> After the pruner handles an over-budget tool result, what do the model and the log each see?</div>
+      <label class="opt"><input type="radio" name="q-15-5" value="a"> A. The model sees head + tail; the original events are deleted from the log</label>
+      <label class="opt"><input type="radio" name="q-15-5" value="b"> B. The model sees the replacement node head + omission marker + tail; the original events stay in the log</label>
+      <label class="opt"><input type="radio" name="q-15-5" value="c"> C. The model sees a locator, with the full text offloaded to storage</label>
+      <label class="opt"><input type="radio" name="q-15-5" value="d"> D. Trimming happens only when a human runs /compact</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D — A human slash command on ctx.commands that calls compactNow(); dsh has no model-visible compact tool."
+         data-rationale="D is correct: the README states Human command, not a model tool. A is wrong: dsh deliberately registers no model-side compaction tool. B is wrong: the command bypasses model turns; neither the slash input nor the direct result enters a model request. C is wrong: the only entries are automatic pressure/overflow and the human command; there is no third programmatic API acting as a model tool."
+         data-review="sec-command-compact">
+      <div class="prompt"><span class="qnum">Q6.</span> What is <code>/compact</code> in dsh?</div>
+      <label class="opt"><input type="radio" name="q-15-6" value="a"> A. A human alias for a model-visible compact tool</label>
+      <label class="opt"><input type="radio" name="q-15-6" value="b"> B. A special prompt sent to the model</label>
+      <label class="opt"><input type="radio" name="q-15-6" value="c"> C. One of three trigger entries, the other two being a model tool and a timer</label>
+      <label class="opt"><input type="radio" name="q-15-6" value="d"> D. A human command on <code>ctx.commands</code>: it calls <code>compactNow()</code> directly without a model turn, while recording log-only command lifecycle events</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, C."
+         data-rationale="A, B, and C are explicit exemptions: nested execution goes through the dispatch-log arm, read is skipped to avoid a read → spill → read-again cycle, and results with non-text blocks pass untouched. D is exactly the opposite — a plain-text result over maxInlineBytes is precisely what the policy offloads."
+         data-review="sec-spill">
+      <div class="prompt"><span class="qnum">Q7.</span> Which of the following results does spill-policy pass through <strong>untouched</strong> (no offload)? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="a"> A. Results of nested execution (<code>exec.parent</code> present)</label>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="b"> B. Oversized results of the <code>read</code> tool</label>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="c"> C. Results mixing in image blocks</label>
+      <label class="opt"><input type="checkbox" name="q-15-7" value="d"> D. Plain-text results over <code>maxInlineBytes</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-8" data-type="fill"
+         data-accepted='["SpillLocator","spillLocator","SpillLocator (branded)"]'
+         data-answer="SpillLocator (a branded type, rendered to the model as an opaque string)."
+         data-rationale="SpillLocator is declared with dsh-brand's branded type: spill-local returns a local path, future remote backends may return a URI or key, and the policy and tool consumers never learn the backend's identity. A bare string would violate the repository's cross-boundary ids must be branded convention."
+         data-review="sec-spill">
+      <div class="prompt"><span class="qnum">Q8.</span> Fill in the blank: the locator type spill hands the model is the branded ______, rendered to the model as an opaque string.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — It queues non-waking next-step context: a running driver claims it at the nearest next pre-step boundary; when idle it stays suspended until followup()/steer() wakes it."
+         data-rationale="C is correct, and it matches architecture.md's wording verbatim (lands in the next admitted request). A is wrong: inject is non-waking. B is wrong: the waking next-step input is steer(). D is wrong: it can miss a request — that request's pre-step already claimed its own batch."
+         data-review="sec-context-plugins">
+      <div class="prompt"><span class="qnum">Q9.</span> What are the semantics of <code>agent.inject(message)</code>?</div>
+      <label class="opt"><input type="radio" name="q-15-9" value="a"> A. It immediately modifies the next in-flight model request</label>
+      <label class="opt"><input type="radio" name="q-15-9" value="b"> B. It queues waking next-step input: an idle agent immediately starts a turn synchronously</label>
+      <label class="opt"><input type="radio" name="q-15-9" value="c"> C. It queues non-waking next-step context that lands in the next admitted request</label>
+      <label class="opt"><input type="radio" name="q-15-9" value="d"> D. It appends directly to the session log and notifies all listeners synchronously</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="15-10" data-type="short"
+         data-key-points='["Timing of the three gates: spill at result production (tools/post-execute), pruner and compaction after a pressure/overflow trigger","Cost ordering: spill and pruner make zero model calls, compaction pays one auxiliary llm.stream call and invalidates the KV cache of the replaced region","The compaction surface contract: the only surface change is the user/message checkpoint with surfaceOp replace; compaction/* is entirely log-only","The surrounding links: ctx.tokenMeter counts buffered injections; agent.inject() queues for admission; after compaction the context plugins rebuild the baseline"]'
+         data-answer="The three gates divide by timing and cost: spill is the preventive gate, offloading oversized plain text to storage at tools/post-execute and leaving only a preview + branded locator in context, with zero model calls; after the pressure trigger the pruner first rewrites over-budget tool/results into head + marker + tail (original events preserved), and if pressure persists compaction replaces the old region with a checkpoint via one auxiliary llm.stream call (the only surface change is the user/message with surfaceOp replace; compaction/* events are log-only; the lock is the log bracket). Measurement is independent of the gates: ctx.tokenMeter counts buffered injections in the pressure too; agent.inject() queues for the next admitted request; after compaction shadowing, agent-instructions and the skill catalog rebuild their baselines."
+         data-rationale="Grasp timing, cost, the surface contract, and measurement-plus-injection, and you hold dsh's complete pressure-management picture."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q10.</span> In your own words, explain each gate's trigger timing and cost, and compaction's surface contract; then add where measurement (tokenMeter) and injection (agent.inject) sit in this picture.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check a point only if your answer truly covers it — under-checking hurts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="16-human-plane.html"><strong>Chapter 16 · The Human Collaboration Plane</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

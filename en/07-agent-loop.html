@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 7 · The Agent Loop: Turn/Step Lifecycle — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 7 · Agent Loop</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/07-agent-loop.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="7">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 7 · Part II · The Core Spine</div>
+    <h1>The Agent Loop: Turn/Step Lifecycle</h1>
+    <p class="lede">
+      In the first six chapters you met plugins, events, the session log, and the Agent
+      interface — but one black box remained: after messages enter the inbox, who exactly, and in
+      what order, keeps the machine of 'model request → tool call → request again' turning? This
+      chapter opens that black box. By the end you will know everything that happens in a turn
+      from open to close, which events go into the log, which live only in the process, and at
+      which points you can intercept it.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State how <code>ctx.agentLoop</code> and <code>ReactLoopAgent</code> relate to the <code>Agent</code> interface from Chapter 6</li>
+      <li>Distinguish the three layers: driver (the outer loop), turn (one drain of admitted input), step (one model request + its tools)</li>
+      <li>Recite, in order, every event and extension point of a complete turn</li>
+      <li>Separate durable session events from live in-process events, and name the waterfalls whose listeners must call <code>next()</code></li>
+      <li>Explain the inbox's <code>followup</code> / <code>steer</code> / <code>inject</code> deliveries, parallel tool scheduling, and cancel/recovery behavior</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-driver">7.1 The one driver: ReactLoopAgent and ctx.agentLoop</h2>
+
+  <p>
+    Chapter 6 said that <code>Agent</code> is the surface all plugins (UI, hooks, orchestrators)
+    program against: <code>ctx.agents.get(id)</code> retrieves it, you call
+    <code>followup()</code> upward on it and await <code>whenIdle()</code> downward. But
+    <code>Agent</code> is only an interface — who implements the loop that 'turns messages into
+    model requests, model replies into tool calls, and tool results into the next request'?
+  </p>
+  <p>
+    The answer lives in <code>packages/core/agent-loop/</code>. It has two roles:
+  </p>
+  <ul>
+    <li>
+      <strong><code>AgentLoop</code> service (<code>ctx.agentLoop</code>)</strong>: plugged in at
+      <code>packages/core/agent-loop/src/index.ts</code>; it is an <code>AgentFactory</code> —
+      responsible for creating/resuming agents per configuration, publishing them into the
+      <code>ctx.agents</code> / <code>ctx.sessions</code> registries, and owning orderly teardown.
+      It declares <code class="small">static inject = ['agents', 'sessions', 'llm', 'tools', 'systemPrompt']</code>,
+      which is to say an agent loop naturally stands at the junction of those five services.
+    </li>
+    <li>
+      <strong><code>ReactLoopAgent</code> (<code>src/agent.ts</code>)</strong>: the driver that
+      actually implements the <code>Agent</code> interface. Its module doc states it in one
+      sentence: <em>'Default Agent driver over queued turns and step-boundary input. Every request
+      is derived from the session log.'</em> It is <strong>the repository's only concrete driver
+      of the Agent interface</strong>, and it is a private implementation inside the package — no
+      code outside the loop depends on this class; everyone depends on the interface.
+    </li>
+  </ul>
+  <p>
+    'Every request is derived from the session log' deserves a pause. This is not a style
+    preference but the landing spot of the Chapter 4 invariant: in every step, the model history
+    is not an array accumulated in memory but a projection from the log's event stream produced
+    by calling <code class="small">session.deriveMessages()</code>. At the end of this chapter you
+    will see that <code>packages/core/agent-loop/src/invariant.ts</code> even hangs a runtime
+    assertion on <code>llm/stream</code>: the request's messages must match the log-derived
+    result byte for byte.
+  </p>
+  <p>
+    Internally, <code>ReactLoopAgent</code> maintains a three-state <code>Phase</code>:
+    <code>idle</code> (no activity), <code>running</code> (a driver is executing turns, with
+    turn/step counters and an AbortController), and <code>maintenance</code> (running a non-turn
+    maintenance job). State switches broadcast <code>agent/status</code>
+    (<code>idle</code> / <code>running</code>) externally — the source of that little status light
+    in the UI.
+  </p>
+
+  <h2 id="sec-vocabulary">7.2 Three layers of vocabulary: driver, turn, step</h2>
+
+  <p>
+    Let's fix the vocabulary first. Three layers, outside in:
+  </p>
+  <ul>
+    <li>
+      <strong>driver (the outer loop; some systems call it a round)</strong>: a woken driver keeps
+      starting turns until nothing is owed and no input is queued, then returns to idle. For
+      honesty's sake: the dsh source has no entity named round — the outer layer is just the
+      <code class="small">while (await this.turn()) {}</code> loop inside
+      <code class="small">kick()</code>; durable numbering also goes down only to the turn/step
+      two levels. Remember this layer as the 'policy-iteration layer': it decides whether to open
+      another turn.
+    </li>
+    <li>
+      <strong>turn</strong>: one complete 'drain of admitted input' process, containing zero or
+      more steps. The definition in <code>docs/architecture.md</code>, verbatim: a turn
+      <em>opens before the first input that claims it and closes when nothing is owed</em>. Every
+      turn has a monotonically increasing number; in the log it is framed by the
+      <code>turn/start</code> / <code>turn/end</code> event pair, and <code>turn/end</code>
+      carries the end reason <code>TurnEndReason</code>: <code>completed</code> /
+      <code>max-tokens</code> / <code>blocked</code> / <code>aborted</code> / <code>error</code>.
+    </li>
+    <li>
+      <strong>step</strong>: one model request plus all the tools it calls. In the log it is
+      framed by <code>step/start</code> and <code>step/end</code>, numbered from 1 within the
+      turn. Tool results that 'owe' a response, or new input cutting in, both spawn the next
+      step.
+    </li>
+  </ul>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="driver/turn/step hierarchy">
+      <rect x="10" y="20" width="740" height="210" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="30" y="45" style="fill:var(--fg-dim)" font-size="13" font-weight="700">driver (the kick loop · called round in this book: the policy-iteration layer)</text>
+      <rect x="30" y="60" width="340" height="150" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="50" y="85" style="fill:var(--accent)" font-size="13" font-weight="700">turn #1 (turn/start … turn/end)</text>
+      <rect x="50" y="100" width="140" height="90" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="120" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">step 1</text>
+      <text x="120" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">model request</text>
+      <text x="120" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">+ tool calls</text>
+      <rect x="210" y="100" width="140" height="90" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="280" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">step 2</text>
+      <text x="280" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool results owe a response</text>
+      <text x="280" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ request again</text>
+      <line x1="190" y1="145" x2="210" y2="145" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="210,145 203,141 203,149" style="fill:var(--muted)"/>
+      <rect x="400" y="60" width="180" height="150" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="420" y="85" style="fill:var(--accent)" font-size="13" font-weight="700">turn #2</text>
+      <rect x="420" y="100" width="140" height="90" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="490" y="122" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">step 1</text>
+      <text x="490" y="142" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">no tool calls</text>
+      <text x="490" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ natural close</text>
+      <line x1="370" y1="135" x2="400" y2="135" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="400,135 393,131 393,139" style="fill:var(--muted)"/>
+      <rect x="610" y="85" width="120" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="670" y="112" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">idle</text>
+      <text x="670" y="132" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">inbox empty, nothing owed</text>
+      <line x1="580" y1="135" x2="610" y2="135" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="610,135 603,131 603,139" style="fill:var(--muted)"/>
+    </svg>
+    <figcaption>The driver keeps starting turns; a turn contains zero or more steps; a step = one model request + the tools it calls.</figcaption>
+  </figure>
+
+  <p>
+    A turn can also have <strong>zero steps</strong>: if the input is rejected by
+    <code>agent/pre-step</code>, or the first batch is rewritten to empty, the turn still opens
+    and closes (7.3 below explains why this is not waste). Conversely, the number of steps in a
+    turn has no static upper bound; it is decided solely by 'is anything owed'.
+  </p>
+
+  <h2 id="sec-turn-flow">7.3 The lifecycle of a complete turn</h2>
+
+  <p>
+    The flow below follows the 'Turn flow' section of <code>docs/architecture.md</code>; for each
+    step I have marked the corresponding code location in <code>agent.ts</code>. Treat this
+    section as a checklist when debugging.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="complete turn event flow">
+      <text x="130" y="28" style="fill:var(--fg)" font-size="13" font-weight="700">durable (goes to the log)</text>
+      <rect x="30" y="18" width="200" height="14" rx="7" style="fill:var(--accent);opacity:.25"/>
+      <text x="420" y="28" style="fill:var(--fg)" font-size="13" font-weight="700">live extension points (in-process)</text>
+      <rect x="300" y="18" width="240" height="14" rx="7" style="fill:var(--accent-2);opacity:.25"/>
+
+      <rect x="50" y="45" width="160" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="64" text-anchor="middle" style="fill:var(--fg)" font-size="12">turn/start</text>
+      <line x1="130" y1="75" x2="130" y2="95" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,95 126,88 134,88" style="fill:var(--muted)"/>
+      <rect x="30" y="95" width="200" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="130" y="113" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">claim: take next-step input</text>
+      <text x="130" y="129" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">+ one queued message (inbox.claim)</text>
+      <line x1="230" y1="117" x2="300" y2="117" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,117 293,113 293,121" style="fill:var(--muted)"/>
+      <rect x="300" y="95" width="240" height="44" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="113" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">assemble prompt sections + tool schemas</text>
+      <text x="420" y="129" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">(ctx.systemPrompt.assemble)</text>
+      <line x1="420" y1="139" x2="420" y2="159" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="420,159 416,152 424,152" style="fill:var(--muted)"/>
+      <rect x="300" y="159" width="240" height="38" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="420" y="177" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">agent/pre-step (waterfall)</text>
+      <text x="420" y="192" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">reject | enter(messages)</text>
+      <line x1="420" y1="197" x2="420" y2="230" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="420,230 416,223 424,223" style="fill:var(--muted)"/>
+      <rect x="300" y="230" width="240" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--fail)" stroke-width="1.5"/>
+      <text x="420" y="251" text-anchor="middle" style="fill:var(--fail)" font-size="11">reject / first enter emptied → turn closes with no step</text>
+      <line x1="130" y1="139" x2="130" y2="290" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,290 126,283 134,283" style="fill:var(--muted)"/>
+      <rect x="50" y="290" width="160" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="309" text-anchor="middle" style="fill:var(--fg)" font-size="12">step/start</text>
+      <line x1="130" y1="320" x2="130" y2="340" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,340 126,333 134,333" style="fill:var(--muted)"/>
+      <rect x="30" y="340" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="359" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">enter's messages land as user/message</text>
+      <line x1="130" y1="370" x2="130" y2="390" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,390 126,383 134,383" style="fill:var(--muted)"/>
+      <rect x="30" y="390" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="409" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">deriveMessages() derives history from the log</text>
+      <line x1="230" y1="405" x2="300" y2="405" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,405 293,401 293,409" style="fill:var(--muted)"/>
+      <rect x="300" y="390" width="240" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="409" text-anchor="middle" style="fill:var(--accent-2)" font-size="12">agent/request → llm/stream</text>
+      <line x1="130" y1="420" x2="130" y2="440" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,440 126,433 134,433" style="fill:var(--muted)"/>
+      <rect x="30" y="440" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="459" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">assistant/chunk × n (logged one by one)</text>
+      <line x1="130" y1="470" x2="130" y2="490" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,490 126,483 134,483" style="fill:var(--muted)"/>
+      <rect x="30" y="490" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="130" y="509" text-anchor="middle" style="fill:var(--fg)" font-size="12">assistant/message</text>
+      <line x1="130" y1="520" x2="130" y2="540" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,540 126,533 134,533" style="fill:var(--muted)"/>
+      <rect x="30" y="540" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="559" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool/call × n (recorded before execution)</text>
+      <line x1="230" y1="555" x2="300" y2="555" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,555 293,551 293,559" style="fill:var(--muted)"/>
+      <rect x="300" y="540" width="240" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="559" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">tools/pre-execute → execute → post-execute</text>
+      <line x1="130" y1="570" x2="130" y2="590" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,590 126,583 134,583" style="fill:var(--muted)"/>
+      <rect x="30" y="590" width="200" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="609" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool/result × n</text>
+      <line x1="130" y1="620" x2="130" y2="640" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,640 126,633 134,633" style="fill:var(--muted)"/>
+      <rect x="50" y="640" width="160" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="130" y="659" text-anchor="middle" style="fill:var(--fg)" font-size="12">step/end</text>
+      <line x1="540" y1="555" x2="600" y2="555" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="600,555 593,551 593,559" style="fill:var(--muted)"/>
+      <rect x="600" y="500" width="160" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="680" y="525" text-anchor="middle" style="fill:var(--warn)" font-size="11" font-weight="700">pending-response check</text>
+      <text x="680" y="545" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tools owe a response,</text>
+      <text x="680" y="560" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">or next-step has new input</text>
+      <text x="680" y="580" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ claim again</text>
+      <text x="680" y="598" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">→ next step</text>
+      <line x1="680" y1="500" x2="680" y2="480" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <line x1="680" y1="480" x2="420" y2="480" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="420,480 427,476 427,484" style="fill:var(--muted)"/>
+      <text x="560" y="472" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">back to step/start (same turn)</text>
+      <line x1="130" y1="670" x2="130" y2="678" style="stroke:var(--muted)" stroke-width="2"/>
+      <rect x="300" y="655" width="240" height="30" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="420" y="674" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">agent/turn-stopping (serial, no next())</text>
+      <line x1="230" y1="670" x2="300" y2="670" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="300,670 293,666 293,674" style="fill:var(--muted)"/>
+      <line x1="420" y1="685" x2="420" y2="692" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="230" y1="670" x2="230" y2="700" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="230" y1="700" x2="130" y2="700" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="130,700 137,696 137,704" style="fill:var(--muted)"/>
+      <rect x="30" y="686" width="200" height="28" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="130" y="704" text-anchor="middle" style="fill:var(--fg)" font-size="12">turn/end (carries reason)</text>
+    </svg>
+    <figcaption>
+      The complete turn event flow (matching the 'Turn flow' section of docs/architecture.md). Blue boxes (var(--accent)) are durable session events;
+      green boxes (var(--accent-2)) are live extension points; dashed lines are the two non-standard paths — 'close with no step' and 'the next step'.
+    </figcaption>
+  </figure>
+
+  <p>Let's walk the flow, watching four gates in particular:</p>
+
+  <p>
+    <strong>Opening (<code>turn()</code>).</strong>
+    The driver first lands <code>turn/start</code>, numbered as the previous turn + 1 (when
+    resuming a session, the number is recovered from the log via
+    <code class="small">findLast(turn/start)</code>, so numbering continues across processes).
+    Then it enters the loop: each candidate step first passes through <code>preStep()</code> —
+    which does three things: <code class="small">this.inbox.claim(target, turn)</code> claims the
+    next-step input plus one queued message; it calls
+    <code class="small">ctx.systemPrompt.assemble()</code> to assemble the prompt sections and
+    tool schemas (expanded in Chapter 9); and finally it hands the claim result to the
+    <code>agent/pre-step</code> waterfall.
+  </p>
+
+  <p>
+    <strong>The admission gate (<code>agent/pre-step</code>).</strong>
+    This is the authoritative decision point for 'what the model sees this round'. The default
+    decision is <code>enter(messages)</code>; listeners may rewrite that batch of messages or
+    return <code>reject</code>. Two endings are worth memorizing:
+  </p>
+  <ul>
+    <li><code>reject</code> → the turn closes with <code>{kind:'blocked'}</code>, spending not a
+      single step;</li>
+    <li>
+      the first enter rewritten to empty → the turn closes with
+      <code>{kind:'completed'}</code>, likewise spending no step. The code comment puts it
+      plainly: <em>a removed wake-up message, or an enter decision rewritten to empty, still owns
+      this turn boundary, but it costs no model call</em>.
+    </li>
+  </ul>
+  <p>
+    Note that 'spends no step' does not mean 'leaves no trace': <code>turn/start</code> and
+    <code>turn/end</code> are already in the log, so the attempt is forever queryable. That is
+    exactly the intent of Chapter 4's 'durable boundary events frame everything'.
+  </p>
+
+  <p>
+    <strong>Inside a step (<code>step()</code> and <code>buildRequest()</code>).</strong>
+    Once admitted: land <code>step/start</code>, append each enter message to the log as
+    <code>user/message</code> (including context carried by the previous step's tools and
+    plugin-injected context); then derive the model history from the log with
+    <code class="small">session.deriveMessages()</code>;
+    <code>buildRequest()</code> first lets the <code>agent/request</code> waterfall propose the
+    request configuration (provider/model/sampling parameters), binds an adapter via
+    <code class="small">ctx.llm.prepareCall()</code>, and — when the configuration changes — lands
+    <code>request/header</code> and <code>request/context</code> events (expanded in
+    Chapter 10). The request then enters <code>llm/stream</code>: every chunk in the stream is
+    immediately logged as <code>assistant/chunk</code> and fed to <code>BlockAssembler</code>;
+    when the stream ends normally, one <code>assistant/message</code> event is assembled
+    (carrying usage and the sequence of chunks it references, <code>sourceEventSeqs</code>).
+  </p>
+
+  <p>
+    If the assistant message contains <code>tool-call</code> blocks, it is
+    <code>executeToolCalls()</code>'s turn (7.6): each call is first logged as
+    <code>tool/call</code> (recorded before execution), passes through Chapter 8's execution
+    pipeline, and finishes with <code>tool/result</code>. Tool results naturally owe a model
+    response — unless a result is flagged <code>concludesTurn</code> — so the loop claims again
+    and opens the next step. When the assistant message has no tool calls, or hits
+    <code>max-tokens</code> (a reason that is 'sticky' within the turn: later steps that complete
+    normally cannot downgrade it), the step ends with the corresponding reason.
+  </p>
+
+  <p>
+    <strong>Closing.</strong>
+    After a step ends, if 'nothing is owed and the next-step inbox is empty', the loop first
+    broadcasts <code>agent/turn-stopping</code> — a final checkpoint that is <strong>serial and
+    has no <code>next()</code></strong> (wrap-up plugins make their last moves here) — and then
+    lands <code>turn/end</code>. Whatever happens in between, <code>turn/end</code> is appended in
+    a <code>finally</code> block: crash, cancellation, and error all still produce a closing
+    event with a reason.
+  </p>
+
+  <div class="demo" data-demo="turnStepFlow">
+    <div class="demo-title">Try it — walk through a complete turn</div>
+    <p>Step through a turn that contains two model requests and one tool call:</p>
+    <button data-run>Next</button>
+    <div class="demo-output empty">Click to start.</div>
+  </div>
+
+  <h2 id="sec-events">7.4 Two classes of events: durable and live</h2>
+
+  <p>
+    Slice the 7.3 flow by 'does it go into the log' and you get a table worth memorizing.
+    <strong>Durable events</strong> are part of the session log; replay, resume, fork, and
+    transcripts all depend on them. <strong>Live events</strong> are broadcast only within this
+    process, for coordination and interception, and they die with the process.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Class</th><th>Events</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>durable</td>
+        <td><code>turn/start</code>, <code>turn/end</code>, <code>step/start</code>, <code>step/end</code></td>
+        <td>boundary frames; <code>turn/end</code> carries <code>TurnEndReason</code></td>
+      </tr>
+      <tr>
+        <td>durable</td>
+        <td><code>user/message</code>, <code>assistant/chunk</code>, <code>assistant/message</code></td>
+        <td>the conversation surface; chunks serve replay, messages serve derivation</td>
+      </tr>
+      <tr>
+        <td>durable</td>
+        <td><code>tool/call</code>, <code>tool/result</code></td>
+        <td>tool-call pairs; recorded before execution</td>
+      </tr>
+      <tr>
+        <td>durable</td>
+        <td><code>request/header</code>, <code>request/context</code> (plus <code>llm/retry</code> and friends from llm-retry)</td>
+        <td>a reconstructable snapshot of request configuration and environment</td>
+      </tr>
+      <tr>
+        <td>live</td>
+        <td><code>agent/status</code>, <code>agent/error</code>, <code>agent/inbox/inserted|claimed|discarded</code></td>
+        <td>status and queue coordination signals</td>
+      </tr>
+      <tr>
+        <td>live · waterfall</td>
+        <td><code>agent/pre-step</code>, <code>agent/request</code>, <code>agent/request-error</code>, <code>llm/stream</code>, <code>tools/pre-execute</code>, <code>tools/execute</code>, <code>tools/post-execute</code></td>
+        <td>interceptable and rewritable; listeners <strong>must call <code>next()</code></strong> to delegate downstream or the whole chain short-circuits</td>
+      </tr>
+      <tr>
+        <td>live · serial</td>
+        <td><code>agent/turn-stopping</code></td>
+        <td>serial broadcast, no <code>next()</code>; observation/wrap-up only, cannot rewrite the decision</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="box note">
+    <div class="box-title">Runtime evidence of the invariant</div>
+    <p style="margin:.4rem 0 0;">
+      <code>packages/core/agent-loop/src/invariant.ts</code> hangs an assertion at the very front
+      of <code>llm/stream</code>: the loop-built request must be frozen, carry a live
+      <code>sessionId</code>, its <code>request.messages</code> must match the result of
+      <code class="small">session.deriveMessages()</code> exactly, and its header must match the
+      <code>request/header</code> collapsed from the log. Any plugin that slips the model
+      something mid-flight that does not exist in the log gets caught here — 'model-visible ⟺
+      logged' is not a documentation slogan; it is an executed check.
+    </p>
+  </div>
+
+  <h2 id="sec-inbox">7.5 The inbox: the single entry point for all input</h2>
+
+  <p>
+    The UI chat box, the command system, hooks, subagents, compaction plugins — everyone who
+    wants to talk to the agent goes through the same inbox. <code>ReactLoopAgent</code>'s
+    constructor creates <code class="small">new Inbox(session, {...})</code> and maps
+    insert/discard/claim immediately to the three live events
+    <code>agent/inbox/inserted</code> / <code>agent/inbox/discarded</code> /
+    <code>agent/inbox/claimed</code>. The semantics of the unified entry live on
+    <code>send(message, target, wakeup)</code>:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Method</th><th>target</th><th>Wakes</th><th>Semantics</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>followup(msg)</code></td><td><code>next-turn</code></td><td>yes</td><td>a new utterance, handled by the next turn</td></tr>
+      <tr><td><code>steer(msg)</code></td><td><code>next-step</code></td><td>yes</td><td>a cut-in instruction, entering the model's view at the next step as soon as possible</td></tr>
+      <tr><td><code>inject(msg)</code></td><td><code>next-step</code></td><td><strong>no</strong></td><td>injected context, queued for the next admitted request</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The key difference is <code>wakeup</code>: some messages wake the driver immediately
+    (followup/steer), some do not (inject). The line in <code>docs/architecture.md</code>'s
+    extension table — 'Add model-facing context → call <code>agent.inject()</code>; it lands in
+    the next admitted request' — means: the injected content rests quietly in the next-step queue
+    until some message wakes the driver, or the current turn's next step comes to claim it. An
+    idle agent stays idle after <code>inject()</code>.
+  </p>
+  <p>
+    The interaction between cancellation and wake-up has one fine point (the source comments call
+    it the wake latch): a waking input that collides with an in-flight cancellation is reassigned
+    to <code>next-turn</code> and replayed after the activity settles to idle; and a wake-up
+    delivered to an already-idle agent always opens its own turn boundary. You do not need to
+    memorize the details — just know this: <strong>wake-ups are never lost, at most
+    delayed</strong>.
+  </p>
+
+  <h2 id="sec-tool-calls">7.6 Scheduling tool calls: the parallel pool and barriers</h2>
+
+  <p>
+    One step's assistant message can carry multiple <code>tool-call</code> blocks.
+    <code>executeToolCalls()</code> in <code>src/tool-calls.ts</code> schedules them, with only
+    three rules:
+  </p>
+  <ul>
+    <li>
+      <strong>Classify first.</strong> Each call is classified via
+      <code class="small">ctx.tools.executionMode(exec)</code>: only when the tool's
+      <code>isConcurrencySafe(args)</code> returns exactly <code>true</code> is it
+      <code>parallel</code>; undeclared, throwing, or returning non-true are all treated as
+      <code>exclusive</code> — fail conservative.
+    </li>
+    <li>
+      <strong>Exclusive is a barrier.</strong> An exclusive call forms its own group, creating a
+      sequential barrier; parallel calls form a <strong>bounded rolling pool</strong>
+      (<code>maxParallelToolCalls</code>, default 10, adjustable at runtime via agent-loop's
+      settings). Inside the pool, 'dispatch may overlap while policy and results keep model
+      order': pre-execute runs serially in order, tool bodies run concurrently, and results are
+      committed to the log in the order the model gave.
+    </li>
+    <li>
+      <strong>Re-classify before launch.</strong> Before each call launches, the current registry
+      is re-queried (tools may be registered/unregistered mid-flight); a call that has since
+      become exclusive waits for the current pool to drain and forms its own barrier.
+    </li>
+  </ul>
+  <p>
+    Cancellation semantics likewise serve replay: after an abort, <strong>already-started</strong>
+    calls drain normally and commit their results; <strong>unstarted</strong> calls get a
+    synthetic pair of <code>tool/call</code> + <code>tool/result</code> (error code
+    <code>ABORTED_BEFORE_DISPATCH</code>), guaranteeing that every call in the log has a result
+    and replay has no gaps.
+  </p>
+
+  <h2 id="sec-cancel-error">7.7 Cancel, maintenance, and error recovery: the agent handle</h2>
+
+  <p>
+    The 'The agent handle' section of <code>docs/subsystems/core.md</code> lays out the public
+    lifecycle methods clearly; here are the four most relevant from the loop's perspective:
+  </p>
+  <ul>
+    <li>
+      <code>cancel(cause, options?)</code>: by default clears the inbox and aborts activity; pass
+      <code>{keepInbox:true}</code> to preserve queued work. The first cause wins; a no-op when
+      nothing is running. Cancellation is not a hard kill — it propagates cooperatively along the
+      AbortSignal to the step, the stream, and every tool (Chapter 8's tool-cancellation contract
+      shares this source).
+    </li>
+    <li>
+      <code>whenIdle()</code>: waits for the whole agent to reach quiescence (the current driver
+      and every successor finish). The teardown flow (dispose) is exactly 'one
+      <code>cancel({kind:'disposed'})</code> plus <code>whenIdle()</code>'.
+    </li>
+    <li>
+      <code>runMaintenance(job)</code>: runs a non-turn maintenance job (say, compaction
+      wrap-up) from true idle; wake-up inputs arriving meanwhile stay in the inbox and replay
+      when the job ends, with the visible status remaining <code>idle</code>.
+    </li>
+    <li>
+      Error recovery: <strong>structured failure</strong>. <code>LlmError</code> keeps its own
+      code/facts; other exceptions are flattened by <code>errorChain()</code> into
+      <code>UNKNOWN</code>-code text; after a failure is reported via <code>agent/error</code> it
+      is contained at the driver boundary, and <code>turn/end</code> records
+      <code>{kind:'error', error}</code>. In-stream failures first pass through the
+      <code>agent/request-error</code> waterfall: by default the original error is kept;
+      returning <code>{kind:'retry'}</code> re-issues the request <strong>within the same
+      step</strong> (the llm-retry plugin lands <code>llm/retry</code> and
+      <code>llm/retry-started</code> events around the wait; the failed attempt's chunks stay in
+      the log but are never assembled into a message, so the model history stays unpolluted).
+    </li>
+  </ul>
+
+  <div class="box key">
+    <div class="box-title">The key intuition of this chapter</div>
+    <p style="margin:.4rem 0 0;">
+      The agent loop is a log-first state machine: events land first, actions follow; every model
+      input derives from the log, and every boundary (turn/step/tool call) has a durable frame.
+      Whenever you write a plugin, just ask 'which cell of the log does my behavior land in, and
+      which live point do I intercept at' and you will not get lost.
+    </p>
+  </div>
+
+  <h2 id="sec-recap">7.8 Chapter recap</h2>
+  <ul>
+    <li><code>ctx.agentLoop</code> (the <code>AgentLoop</code> service) creates/resumes agents; <code>ReactLoopAgent</code> is the only concrete driver of the <code>Agent</code> interface — private to the package, deriving every request from the session log.</li>
+    <li>Three layers of vocabulary: the driver outer loop (called round in this book; no such name in the source) > turn (a drain of zero or more steps) > step (one model request + its tools).</li>
+    <li>A complete turn: turn/start → claim → assemble → agent/pre-step (reject | enter) → step/start → user/message → derive → agent/request → llm/stream → assistant/chunk* → assistant/message → tool/call* → the tools pipeline → tool/result* → step/end → (next step if anything is owed) → agent/turn-stopping → turn/end.</li>
+    <li>reject or an emptied first enter → the turn closes with no step (blocked/completed), but the log records the attempt; <code>turn/end</code> always lands and carries a reason.</li>
+    <li>durable: turn/*, step/*, user/message, assistant/*, tool/*, request/*; live: agent/*, llm/stream, tools/*. Waterfall listeners must call <code>next()</code>; <code>agent/turn-stopping</code> is serial with no next().</li>
+    <li>The inbox is the unified entry: followup (next-turn, wakes), steer (next-step, wakes), inject (next-step, does not wake).</li>
+    <li>Tool scheduling: isConcurrencySafe strictly gates parallel; exclusive forms barriers; the pool is bounded; results commit in model order; abort backfills synthetic results for unstarted calls.</li>
+    <li>The handle: cancel/keepInbox, whenIdle, runMaintenance; errors are structured, and retry re-issues within the same step.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming 'a turn that executed nothing never happened' — a step-less turn still leaves turn/start + turn/end, which is exactly what audit needs.</li>
+      <li>Forgetting to call <code>next()</code> inside a waterfall listener — you are not 'adding a hook', you are cutting off the entire chain (the Chapter 2 semantics are a hard rule here).</li>
+      <li>Treating <code>inject()</code> as 'send the model a message right now' — it does not wake the agent; it only queues for the next admission.</li>
+      <li>Assuming a parallel tool's 'result order' equals its 'completion order' — dispatch may overlap, but commits always follow model order.</li>
+      <li>Assuming a retry opens a newly numbered turn — per agent.ts and the llm-retry tests, the retry action re-issues the request within the same step.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="7">
+    <h2>Chapter 7 Test</h2>
+
+    <div class="q" data-id="7-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — ReactLoopAgent is the only concrete driver of the Agent interface; the implementation is private to the package, and outsiders depend only on the interface."
+         data-rationale="B is correct. A reverses the direction: Agent is the interface, ReactLoopAgent the implementation. C is wrong about 'multiple' — the repository has exactly one concrete driver. D is wrong: it has no UI duties; the UI renders via session/event."
+         data-review="sec-driver">
+      <div class="prompt"><span class="qnum">Q1.</span> What is the relationship between <code>ReactLoopAgent</code> and the <code>Agent</code> interface?</div>
+      <label class="opt"><input type="radio" name="q-7-1" value="a"> A. <code>Agent</code> is a subclass of <code>ReactLoopAgent</code></label>
+      <label class="opt"><input type="radio" name="q-7-1" value="b"> B. <code>ReactLoopAgent</code> implements the <code>Agent</code> interface; it is the repository's only concrete driver and is private outside the loop</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="c"> C. The two are interchangeable drivers sitting at the same layer</label>
+      <label class="opt"><input type="radio" name="q-7-1" value="d"> D. <code>ReactLoopAgent</code> only renders UI state</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — a step = one model request + the tools it calls; a turn consists of zero or more steps."
+         data-rationale="C is correct. A reverses the granularity (that is the definition of a turn). B is wrong: a turn can have no steps at all (closed by reject or an empty enter). D is wrong: when tool results leave a pending response, the same turn holds multiple steps and multiple model requests."
+         data-review="sec-vocabulary">
+      <div class="prompt"><span class="qnum">Q2.</span> By dsh's definition, a <strong>step</strong> is?</div>
+      <label class="opt"><input type="radio" name="q-7-2" value="a"> A. A drain process spanning zero or more model requests</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="b"> B. A turn that necessarily contains at least one model request</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="c"> C. One model request plus the tools it calls</label>
+      <label class="opt"><input type="radio" name="q-7-2" value="d"> D. One tool call and its result</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-3" data-type="fill" data-accepted='["turn","一个 turn","the turn"]'
+         data-answer="turn (a round)."
+         data-rationale="The complete lifecycle is turn-level: turn/start and turn/end frame everything, and steps are subdivisions inside a turn. Answering step or driver gets the hierarchy wrong."
+         data-review="sec-vocabulary">
+      <div class="prompt"><span class="qnum">Q3.</span> Fill in the blank: the complete drain process framed in the log by the <code>turn/start</code> / <code>turn/end</code> event pair is called ______.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-4" data-type="mcq" data-correct='["d"]'
+         data-answer="D — a rejection or an emptied enter still closes a durable turn (recording the attempt) but spends no step / model call."
+         data-rationale="D is correct. A and C both say 'nothing happens'; they are wrong because turn/start and turn/end still land in the log. B is wrong: reject's end reason is blocked, not error."
+         data-review="sec-turn-flow">
+      <div class="prompt"><span class="qnum">Q4.</span> What happens when <code>agent/pre-step</code> returns reject (or the first enter is rewritten to empty)?</div>
+      <label class="opt"><input type="radio" name="q-7-4" value="a"> A. Nothing happens; the log keeps no trace at all</label>
+      <label class="opt"><input type="radio" name="q-7-4" value="b"> B. The turn closes with the error reason and retries</label>
+      <label class="opt"><input type="radio" name="q-7-4" value="c"> C. The messages are returned to the inbox to wait for the next wake-up</label>
+      <label class="opt"><input type="radio" name="q-7-4" value="d"> D. The turn still opens/closes (the log records the attempt) but spends no step</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-5" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A, C, D are durable events. B's first half is wrong: llm/stream is a live in-process waterfall and does not go into the log (the request/header in the second half is indeed durable, but the statement as a whole fails on its first half)."
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q5.</span> Which of the following are durable session events (they go into the log)? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="a"> A. <code>assistant/chunk</code> and <code>assistant/message</code></label>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="b"> B. <code>llm/stream</code> and <code>request/header</code> — both are persisted with the request</label>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="c"> C. <code>tool/call</code> and <code>tool/result</code></label>
+      <label class="opt"><input type="checkbox" name="q-7-5" value="d"> D. <code>turn/end</code> (carrying TurnEndReason)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — agent/turn-stopping is a serial broadcast with no next()."
+         data-rationale="B is correct. A, C, and D are all waterfalls; their listeners must call next() to delegate or the chain short-circuits — a direct application of the Cordis waterfall semantics (Chapter 2) inside the loop."
+         data-review="sec-events">
+      <div class="prompt"><span class="qnum">Q6.</span> Which live extension point is <strong>serial and has no</strong> <code>next()</code>?</div>
+      <label class="opt"><input type="radio" name="q-7-6" value="a"> A. <code>agent/pre-step</code></label>
+      <label class="opt"><input type="radio" name="q-7-6" value="b"> B. <code>agent/turn-stopping</code></label>
+      <label class="opt"><input type="radio" name="q-7-6" value="c"> C. <code>tools/execute</code></label>
+      <label class="opt"><input type="radio" name="q-7-6" value="d"> D. <code>llm/stream</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-7" data-type="fill" data-accepted='["inject","agent.inject","agent.inject()"]'
+         data-answer="agent.inject()."
+         data-rationale="The extension-point table says it verbatim: Add model-facing context → call agent.inject(); it lands in the next admitted request. followup/steer are both wrong — they are waking deliveries whose semantics are user input / cutting in line, not silent injection."
+         data-review="sec-inbox">
+      <div class="prompt"><span class="qnum">Q7.</span> Fill in the blank: to add model-visible context without waking an idle agent, call <code>______</code>; the content lands in the next admitted request.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A — inject is next-step + no wake; steer is next-step + wake; followup is next-turn + wake."
+         data-rationale="A is correct. B reverses steer's wake semantics. C reverses followup's target (it is next-turn). D conflates everything — the differences among the three are the core of this section."
+         data-review="sec-inbox">
+      <div class="prompt"><span class="qnum">Q8.</span> Which statement about the three delivery methods <code>followup</code> / <code>steer</code> / <code>inject</code> is correct?</div>
+      <label class="opt"><input type="radio" name="q-7-8" value="a"> A. inject lands in the next-step queue and does not wake the driver; steer lands in next-step and wakes; followup lands in next-turn and wakes</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="b"> B. All three wake the driver immediately; only the queue position differs</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="c"> C. followup lands in next-step; steer lands in next-turn</label>
+      <label class="opt"><input type="radio" name="q-7-8" value="d"> D. inject interrupts the current model request and splices its content into the system prompt immediately</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-9" data-type="mcq" data-multiselect="true" data-correct='["b","c"]'
+         data-answer="B and C."
+         data-rationale="B, C are correct: dispatch (tool bodies) can overlap and results are committed in model order. A is wrong: only isConcurrencySafe(args) returning exactly true counts as parallel; undeclared/throwing/non-true are all treated as exclusive. D is wrong: unstarted calls get synthetic error results (ABORTED_BEFORE_DISPATCH) so replay stays complete."
+         data-review="sec-tool-calls">
+      <div class="prompt"><span class="qnum">Q9.</span> Which statements about the scheduling of multiple tool calls within one step are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="a"> A. By default all tool calls run in parallel unless the tool explicitly declares exclusivity</label>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="b"> B. Exclusive calls form sequential barriers; parallel calls enter a bounded rolling pool</label>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="c"> C. Dispatch can overlap, but results and context are committed in model order</label>
+      <label class="opt"><input type="checkbox" name="q-7-9" value="d"> D. After an abort, unstarted calls leave no events in the log</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-10" data-type="mcq" data-correct='["c"]'
+         data-answer="C — the retry action makes step() continue internally and re-issues the request within the same step; the failed attempt's chunks stay in the log but never become a message."
+         data-rationale="C is correct (per the agent.ts code and llm-retry's transport-recovery tests: after a retry there is still only one step/start). A and B describe the layering and defaults in reverse: the default is to keep the original error; only returning retry re-issues. D is wrong: no such mechanism exists."
+         data-review="sec-cancel-error">
+      <div class="prompt"><span class="qnum">Q10.</span> When a listener of the <code>agent/request-error</code> waterfall returns <code>{kind:'retry'}</code>, what does the loop do?</div>
+      <label class="opt"><input type="radio" name="q-7-10" value="a"> A. It throws LlmError immediately and ends the session</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="b"> B. The default behavior is infinite retry; no listener is needed</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="c"> C. It re-issues the model request within the same step; the failed attempt's chunks stay in the log but never assemble into a message</label>
+      <label class="opt"><input type="radio" name="q-7-10" value="d"> D. It opens a new session and replays the whole conversation</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-11" data-type="fill" data-accepted='["deriveMessages","session.deriveMessages","deriveMessages()"]'
+         data-answer="session.deriveMessages()."
+         data-rationale="The model history is projected from the log; invariant.ts further asserts the request's messages must match it exactly. Answers like readMessages/getHistory are inventions."
+         data-review="sec-driver">
+      <div class="prompt"><span class="qnum">Q11.</span> Fill in the blank: when each step assembles the request, the model history is derived from the session log via <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="7-12" data-type="short"
+         data-key-points='["a turn is framed by turn/start and turn/end, a step by step/start and step/end, and turn/end carries the end reason","agent/pre-step decides what the model sees: reject, or rewrite the enter messages","the model request goes through agent/request and llm/stream; the stream lands in the log as assistant/chunk and is finalized as assistant/message","tool calls land as tool/call before entering the execution pipeline and finish as tool/result; a pending response spawns the next step","two classes of events, durable and live; waterfalls must call next(), and agent/turn-stopping is serial with no next()"]'
+         data-answer="A turn opens with turn/start: claim inbox input → assemble the prompt and tool schemas → agent/pre-step decides enter or reject (rejected or emptied closes the turn with no step) → step/start → the enter messages land as user/message → deriveMessages derives the history → agent/request/llm/stream issue the request → the chunk stream lands as assistant/chunk and is finalized as assistant/message → tool calls land as tool/call, pass through the tools pipeline, and land as tool/result → step/end → if anything is owed, the next step → when nothing is owed, agent/turn-stopping → turn/end. Durable events (turn/*, step/*, user/message, assistant/*, tool/*) go into the log; live extension points (agent/*, llm/stream, tools/*) are in-process; waterfalls must call next(), and agent/turn-stopping is serial with no next()."
+         data-rationale="Check against the flow diagram in 7.3: boundary events, the admission gate, request and stream, the tool stretch, the pending-response loop, and the durable/live split — with all five blocks present, the answer is complete."
+         data-review="sec-turn-flow">
+      <div class="prompt"><span class="qnum">Q12.</span> Describe in your own words the complete event sequence of a turn from open to close, and explain the split between durable and live events.</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a point you actually covered — under-checking hurts the book's calibration of you; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">
+    Next chapter: <a href="08-tools-pipeline.html"><strong>Chapter 8 · The Tool System: Registry and Execution Pipeline</strong></a>.
+  </p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

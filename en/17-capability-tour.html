@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 17 · A Tour of Capabilities — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 17 · Capability Tour</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/17-capability-tour.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="17">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 17 · Part III · Capability Seams in Depth</div>
+    <h1>A Tour of Capabilities</h1>
+    <p class="lede">
+      shell, fs, subagent, compaction — the capabilities the previous chapters dug into are only
+      half the repository. This chapter is a one-page map: it walks through the remaining fourteen
+      capability families, one short section each, by what problem they solve, how the packages
+      split, and where to extend. You do not need to memorize every detail — you only need to know
+      <strong>which door to walk through</strong> when a need arises, and inside every door the
+      three-role structure is the same methodology you already mastered in Chapter 11.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Given a capability need (search, orchestration, scheduling, credentials, …), name the matching capability family and its <code>ctx.*</code> service key</li>
+      <li>For each family, point to its extension point: registering a provider, listening on events, or mounting a Consumer tool</li>
+      <li>State a few deliberately tightened boundaries: lsp exposes only four operations, schedule includes no external notification channel, credentials configuration carries no values</li>
+      <li>Cross-reference this map against the full map in <code>docs/capability-seams.md</code> and fill in the details this chapter does not expand on</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-map">17.1 The capability map</h2>
+
+  <p>
+    The fourteen families fall into five groups by concern. Knowledge and external information
+    answers “how does the model know more”; orchestration and continuation answers “how does work
+    carry across steps and turns”; configuration and credentials answers “where do deployment
+    differences live”; data and execution answers “how do binaries and model-written programs run”;
+    introspection and bridging answers “how does the agent modify itself and connect to outside
+    ecosystems”.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Capability-plane group map">
+      <text x="340" y="26" text-anchor="middle" style="fill:var(--fg)" font-size="14" font-weight="700">Fourteen capability families · five concern groups</text>
+
+      <rect x="20" y="46" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="120" y="70" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Knowledge &amp; external info</text>
+      <text x="34" y="96" style="fill:var(--fg)" font-size="11">skill</text><text x="98" y="96" style="fill:var(--fg-dim)" font-size="10">ctx.skills</text>
+      <text x="34" y="120" style="fill:var(--fg)" font-size="11">web</text><text x="98" y="120" style="fill:var(--fg-dim)" font-size="10">ctx.web</text>
+      <text x="34" y="144" style="fill:var(--fg)" font-size="11">lsp</text><text x="98" y="144" style="fill:var(--fg-dim)" font-size="10">ctx.lsp</text>
+      <text x="34" y="168" style="fill:var(--fg)" font-size="11">mcp-client</text><text x="98" y="168" style="fill:var(--fg-dim)" font-size="10">→ ctx.tools</text>
+
+      <rect x="240" y="46" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="340" y="70" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Orchestration &amp; continuation</text>
+      <text x="254" y="96" style="fill:var(--fg)" font-size="11">workflow · ralph</text><text x="378" y="96" style="fill:var(--fg-dim)" font-size="10">ctx.workflowEngine</text>
+      <text x="254" y="120" style="fill:var(--fg)" font-size="11">jobs</text><text x="378" y="120" style="fill:var(--fg-dim)" font-size="10">ctx.jobs</text>
+      <text x="254" y="144" style="fill:var(--fg)" font-size="11">goal</text><text x="378" y="144" style="fill:var(--fg-dim)" font-size="10">ctx.goals</text>
+      <text x="254" y="168" style="fill:var(--fg)" font-size="11">schedule</text><text x="378" y="168" style="fill:var(--fg-dim)" font-size="10">in the session log</text>
+
+      <rect x="460" y="46" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="560" y="70" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Configuration &amp; credentials</text>
+      <text x="474" y="102" style="fill:var(--fg)" font-size="11">settings</text><text x="552" y="102" style="fill:var(--fg-dim)" font-size="10">ctx.settings</text>
+      <text x="474" y="134" style="fill:var(--fg)" font-size="11">credentials</text><text x="552" y="134" style="fill:var(--fg-dim)" font-size="10">ctx.credentials</text>
+
+      <rect x="130" y="226" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="230" y="250" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">Data &amp; execution</text>
+      <text x="144" y="282" style="fill:var(--fg)" font-size="11">attachment</text><text x="238" y="282" style="fill:var(--fg-dim)" font-size="10">ctx.attachments</text>
+      <text x="144" y="314" style="fill:var(--fg)" font-size="11">code-runtime</text><text x="238" y="314" style="fill:var(--fg-dim)" font-size="10">ctx.codeRuntime</text>
+
+      <rect x="350" y="226" width="200" height="150" rx="10" style="fill:var(--surface-2);stroke:var(--fg-dim)" stroke-width="1.5"/>
+      <text x="450" y="250" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Introspection &amp; bridging</text>
+      <text x="364" y="282" style="fill:var(--fg)" font-size="11">extensions</text><text x="452" y="282" style="fill:var(--fg-dim)" font-size="10">ctx.dynamicCordisRunner</text>
+      <text x="364" y="314" style="fill:var(--fg)" font-size="11">hooks</text><text x="452" y="314" style="fill:var(--fg-dim)" font-size="10">bridge to typed interception points</text>
+
+      <text x="340" y="394" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">Every family is the three-role structure from Chapter 11: check docs/capability-seams.md to locate owner / implementations / consumers</text>
+    </svg>
+    <figcaption>The capability-plane group map: five groups, fourteen families. Each group's section lists the packages, ctx keys, and extension points.</figcaption>
+  </figure>
+
+  <h2 id="sec-skill">17.2 skill: a catalog and loader for reusable instructions</h2>
+
+  <p>
+    The skill family discovers reusable agent instructions (SKILL.md and the like) and exposes them
+    to the model through a provider-neutral catalog. <code>dsh-skill</code> is a pure registry:
+    providers register sources with <code>registerProvider(create)</code> (local files, embedded
+    data, HTTP — anything works), and consumers read with
+    <code>snapshot()</code>/<code>list()</code>/<code>get()</code>; <code>skills/change</code> is
+    an invalidation notification that carries no catalog content. The registry layers
+    host+per-scope (the shape the tool registry established in Chapter 11), and the invocation
+    policy separates modelInvocable from userInvocable. <code>dsh-tool-skill</code> snapshots the
+    catalog on every qualifying <code>agent/pre-step</code>, publishes an ordered name/description
+    catalog as a durable user-role <code>&lt;available_skills&gt;</code> message, and appends a
+    full replacement only when the summary digest changes; the <code>skill</code> tool loads by
+    name, and <code>renderSkillContent()</code> guarantees that catalog injection and tool loading
+    render the same <code>&lt;skill_content&gt;</code> shape.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-skill</code></td><td><code>ctx.skills</code> · Definition</td><td><code>registerProvider()</code> / <code>register()</code> (runtime-embedded skills); <code>skills/change</code></td></tr>
+      <tr><td><code>dsh-skill-filesystem</code></td><td>registers on <code>ctx.skills</code></td><td>local filesystem discovery</td></tr>
+      <tr><td><code>dsh-skill-badge</code></td><td>registers on <code>ctx.skills</code></td><td>bundled optional dsh badge skill</td></tr>
+      <tr><td><code>dsh-tool-skill</code></td><td>registers on <code>ctx.tools</code></td><td><code>skill</code> tool + pre-step catalog publication</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-web">17.3 web: search and fetch share one seam</h2>
+
+  <p>
+    <code>dsh-web</code>'s <code>WebRuntime</code> (<code>ctx.web</code>) spans two operations
+    (search, fetch) on one seam: registerSearchProvider and registerFetchProvider each register a
+    backend, and at execution time resolution follows “explicitly configured provider id,
+    otherwise the exactly one available is auto-selected, otherwise throw” —
+    <strong>selection never depends on registration or HMR order</strong>. Errors go through the
+    structured <code>WebError</code> vocabulary (e.g. a configured id that is not registered is
+    <code>WEB_PROVIDER_CONFIGURED_MISSING</code>; unconfigured with several available is
+    <code>WEB_PROVIDER_AMBIGUOUS</code>). Providers register <strong>capabilities, not
+    tools</strong>: <code>dsh-tool-web</code> is the sole owner of the model-visible names
+    (<code>web_search</code>/<code>web_fetch</code>), schema, and presentation. To attach a new
+    search or fetch backend, registering a provider is all it takes.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-web</code></td><td><code>ctx.web</code> · Definition</td><td><code>registerSearchProvider()</code> / <code>registerFetchProvider()</code></td></tr>
+      <tr><td><code>dsh-web-search-exa</code> / <code>-perplexity</code> / <code>-deepseek</code></td><td>registers on <code>ctx.web</code></td><td>three search providers</td></tr>
+      <tr><td><code>dsh-web-fetch-http</code></td><td>registers on <code>ctx.web</code></td><td>anonymous public HTTP(S) fetching</td></tr>
+      <tr><td><code>dsh-tool-web</code></td><td>registers on <code>ctx.tools</code></td><td><code>web_search</code> / <code>web_fetch</code> tools</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-lsp">17.4 lsp: four semantic operations, no escape hatch</h2>
+
+  <p>
+    The LSP family pulls language-server capability into a deliberately narrowed seam:
+    <code>ctx.lsp</code> exposes only four semantic operations — <code>goToDefinition</code>,
+    <code>findReferences</code>, <code>goToImplementation</code>, <code>hover</code> —
+    <strong>with no general JSON-RPC escape hatch</strong>. Swapping providers therefore never
+    changes how the model asks, and no protocol payloads or unreviewed changes can reach the model
+    contract. <code>dsh-lsp-stdio</code> is the general multi-server backend, built on
+    <code>ctx.fs</code> and <code>ctx.subprocess</code> (the shared execution world from Chapter
+    12), opening documents transiently per query; <code>dsh-tool-lsp</code> is the model-visible
+    <code>lsp</code> tool, using one-based UTF-16 cursor coordinates. Providers register
+    capabilities, not tools — the model-facing names and schema belong exclusively to
+    <code>tool-lsp</code>.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-lsp</code></td><td><code>ctx.lsp</code> · Definition</td><td>register providers by branded id plus extension mapping</td></tr>
+      <tr><td><code>dsh-lsp-stdio</code></td><td>registers on <code>ctx.lsp</code></td><td>stdio JSON-RPC multi-server backend (consumes <code>ctx.fs</code>/<code>ctx.subprocess</code>)</td></tr>
+      <tr><td><code>dsh-tool-lsp</code></td><td>registers on <code>ctx.tools</code></td><td><code>lsp</code> tool (four operations)</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-mcp">17.5 mcp-client: a bridge to external tool ecosystems</h2>
+
+  <p>
+    <code>dsh-mcp-client</code> connects to external MCP (Model Context Protocol) servers and
+    registers their tools on <code>ctx.tools</code>, so the model uses them as native tools: the
+    public name is <code>mcp__&lt;serverName&gt;__&lt;rawName&gt;</code>, the same shape as Claude
+    Code and Codex. Each MCP server is one plugin instance in cordis.yml, with transport as
+    <code>stdio</code> or <code>streamable-http</code>; tool names are a pure function of
+    <code>(serverName, rawName)</code> — connection order, re-syncs, and other servers never
+    rename anything. A supervisor restarts dropped connections with exponential backoff and
+    rediscovers; when the budget is exhausted it unregisters the tools until reload. Note that it
+    bridges tools only: MCP Resources and Prompts have no consumers yet.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-mcp-client</code></td><td>consumes <code>ctx.tools</code></td><td>one instance per server in cordis.yml (transport / serverName / command / url / reconnect…)</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-workflow">17.6 workflow and ralph: orchestration written by the model</h2>
+
+  <p>
+    The workflow family runs <strong>orchestration scripts written by the model</strong>.
+    <code>dsh-workflow</code> defines execution and lifecycle
+    (<code>ctx.workflowEngine</code>), and <code>dsh-workflow-worker-thread</code> runs the script
+    on a worker thread — the thread isolates execution from the host event loop but is
+    <strong>not a security boundary</strong>. <code>dsh-tool-workflow</code> exposes the
+    <code>workflow</code> tool (<code>meta</code>/<code>script</code>/<code>args</code>) and
+    projects the run into the caller session's <code>workflow/*</code> log-only events.
+    <code>dsh-tool-ralph</code> is a fixed-policy Consumer on the same engine:
+    <code>ralph({ objective, maxRounds? })</code> hands an immutable objective to a chain of
+    <strong>brand-new subagents</strong> — one fresh child per round (the provider must support
+    structured output with <code>inheritsParentContext: false</code>), the shared workspace serves
+    as long-term memory, and structured handoffs pass between rounds. Nothing in agent-loop was
+    changed for it (echoing Chapters 7 and 14: orchestration is a plugin, not a loop branch).
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-workflow</code></td><td><code>ctx.workflowEngine</code> · Definition</td><td>register engine backends; <code>workflow/*</code> events</td></tr>
+      <tr><td><code>dsh-workflow-worker-thread</code></td><td>registers on <code>ctx.workflowEngine</code></td><td>worker-thread execution</td></tr>
+      <tr><td><code>dsh-tool-workflow</code></td><td>registers on <code>ctx.tools</code></td><td><code>workflow</code> tool (general scripts)</td></tr>
+      <tr><td><code>dsh-tool-ralph</code></td><td>consumes engine + <code>ctx.subagents</code></td><td><code>ralph</code> tool (fixed fresh-agent loop)</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-jobs">17.7 jobs: one protocol for background jobs</h2>
+
+  <p>
+    Long-running tools (builds, watches, collection) need observation, cancellation, waiting, and
+    completion notification — the jobs family gives them <strong>one owner-fenced protocol</strong>.
+    <code>dsh-jobs</code> defines the <code>ctx.jobs</code> registry contract
+    (start/get/list/read/kill/wait/onJobDone/onJobsChanged), and <code>dsh-jobs-local</code> is
+    the in-process implementation. Access is fenced by <code>SessionId</code> (owner fence), and a
+    controller's registration is owner-relative too: an assembly without the controller loaded
+    cannot start work under someone else's control. <code>dsh-tool-jobs</code> exposes three
+    kind-agnostic tools — <code>job_output</code>, <code>job_list</code>, <code>job_kill</code> —
+    plus completion notification. Notifications use two lanes: when the owner is busy,
+    <strong>inject</strong> into the next-step inbox (Chapter 15's <code>agent.inject()</code>;
+    several jobs settling at once cost a single step); when the owner is idle, wake it with a
+    follow-up turn, with a <code>maxConsecutiveWakes</code> budget against self-excitation.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-jobs</code></td><td><code>ctx.jobs</code> · Definition</td><td>producer plugins extending <code>JobKindMap</code>; <code>attachController()</code></td></tr>
+      <tr><td><code>dsh-jobs-local</code></td><td>registers on <code>ctx.jobs</code></td><td>in-process registry</td></tr>
+      <tr><td><code>dsh-tool-jobs</code></td><td>registers on <code>ctx.tools</code></td><td><code>job_output</code> / <code>job_list</code> / <code>job_kill</code> + completion notification</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-goal-schedule">17.8 goal and schedule: two views of time in the same session</h2>
+
+  <p>
+    Both families store state in the <strong>existing session log</strong>, but with opposite
+    directions of time. goal targets objectives pushed forward across many turns:
+    <code>ctx.goals</code> keeps at most one current objective and appends a
+    <code>goal/change</code> event carrying the complete post-change snapshot on every change;
+    <strong>activation (the continuation authorization) is never persisted</strong> — it is
+    process-local, and resume/fork keeps the objective and its stage but does not act; an explicit
+    resume must re-arm it afterwards. <code>dsh-goal-round-driver</code> turns an activated
+    objective into sequential goal rounds: when idle it reserves a turn and queues a
+    <code>&lt;goal_round&gt;</code> prompt as <code>GoalMessageSource</code>'s
+    <code>user/message</code>; human messages take priority and do not consume the goal turn
+    budget. schedule targets future reminders: the single package <code>dsh-schedule</code>
+    provides the session-scoped <code>schedule_create</code>/<code>schedule_list</code>/<code>schedule_delete</code>
+    three tools, with durable state in the session log; the process-local owner waits only while
+    that session has a live root agent, and due work enters the conversation through the ordinary
+    follow-up queue — <strong>it implies no external notification channel whatsoever</strong>.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-goal</code></td><td><code>ctx.goals</code> · Definition</td><td>service verbs + <code>goal/changed</code> events; the continuation consumer admits rounds via <code>GoalMessageSource</code></td></tr>
+      <tr><td><code>dsh-goal-round-driver</code></td><td>continuation Consumer</td><td>turn reservation and queueing for idle agents</td></tr>
+      <tr><td><code>dsh-tool-goal</code> / <code>dsh-command-goal</code></td><td>model tool / human command</td><td>two entry points for objective changes</td></tr>
+      <tr><td><code>dsh-schedule</code></td><td>in the session log (no service key)</td><td>three session-scoped tools; due items go through the follow-up queue</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-settings-credentials">17.9 settings and credentials: configuration and credentials</h2>
+
+  <p>
+    The settings family resolves user-editable configuration: on <code>ctx.settings</code> plugins
+    register namespace schemas, and reads resolve in layers — “schema default → the registrar's
+    assembled base → the user document section”; with no provider mounted, consumers keep
+    resolving entry config only, so every assembly works with or without settings.
+    <code>dsh-settings-file</code> stores the document in a local file and observes external
+    edits. The credentials family's doctrine is three sentences: <strong>configuration carries
+    references, never values</strong> (<code>CredentialRef</code> is branded, and
+    <code>resolve(ref)</code> runs at the start of every operation with no caching across
+    operations — swap a key and the next request already uses it); <strong>describe returns no
+    values</strong> (configuration UIs are safe); <strong>an empty value counts as absent</strong>.
+    <code>dsh-credentials-local</code> layers the process environment over
+    <code>$DSH_HOME/.credentials.yaml</code> with an .env layer as fallback; when a read-only
+    source shadows a reference, <code>set</code>/<code>unset</code> deliberately refuse.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-settings</code></td><td><code>ctx.settings</code> · Definition</td><td><code>register(ns, schema, …)</code>; <code>settings/updated</code> / <code>settings/document-updated</code></td></tr>
+      <tr><td><code>dsh-settings-file</code></td><td>registers on <code>ctx.settings</code></td><td>local file provider (hot publication of external edits)</td></tr>
+      <tr><td><code>dsh-credentials</code></td><td><code>ctx.credentials</code> · Definition</td><td><code>resolve</code> / <code>describe</code> / <code>set</code> / <code>unset</code>; <code>credentials/updated</code></td></tr>
+      <tr><td><code>dsh-credentials-local</code></td><td>registers on <code>ctx.credentials</code></td><td>env + <code>.credentials.yaml</code> + .env layered provider</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-attachment-code-runtime">17.10 attachment and code-runtime: bytes and programs</h2>
+
+  <p>
+    The attachment family handles <strong>durable binaries</strong>:
+    <code>ctx.attachments</code> validates and atomically commits immutable image bytes and
+    returns a serializable <code>ImageAttachmentRef</code> — consumers never stuff browser paths,
+    object URLs, or base64 into session events; unsent draft images stay on the browser side, and
+    bytes reach durable storage only when the user submits a prompt or a provider adapter submits
+    structured output. <code>dsh-attachment-local</code> puts content-addressed private storage
+    under <code>DSH_HOME</code>. The code-runtime family is the foundation of Code Mode:
+    <code>ctx.codeRuntime</code> defines a runtime that “executes a model-written program,
+    evaluates host-provided async bindings, and captures prints and return values”, and
+    <code>dsh-code-runtime-worker-thread</code> is the worker-thread backend; the Consumer is the
+    tool registry's own Code Mode (<code>tools: { mode: code }</code>) — the <code>run_code</code>
+    tool plus an SDK generated for the loaded runtime's language. You already saw one facet of it
+    in Chapter 15: the durable log copy of sub-call results accepts a spill ceiling through
+    <code>tools/code-dispatch-log</code>.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-attachment</code></td><td><code>ctx.attachments</code> · Definition</td><td><code>validateImage</code> / <code>saveImage</code> / <code>readImage</code></td></tr>
+      <tr><td><code>dsh-attachment-local</code></td><td>registers on <code>ctx.attachments</code></td><td>content-addressed storage under <code>DSH_HOME</code></td></tr>
+      <tr><td><code>dsh-code-runtime</code></td><td><code>ctx.codeRuntime</code> · Definition</td><td>register runtime backends (language, isolation, budget)</td></tr>
+      <tr><td><code>dsh-code-runtime-worker-thread</code></td><td>registers on <code>ctx.codeRuntime</code></td><td>worker-thread execution</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-extensions-hooks">17.11 extensions and hooks: introspection and bridging</h2>
+
+  <p>
+    The extensions family lets <strong>the agent inspect and modify its own runtime</strong>:
+    <code>dsh-tool-cordis</code> registers model-visible runtime-inspection and dynamic-package
+    tools on <code>ctx.tools</code> — inspect loaded plugins and service APIs, define and run
+    model-written dynamic packages, then withdraw them; <code>dsh-cordis-host-runner</code>
+    provides <code>ctx.dynamicCordisRunner</code> (a definition registry + <code>node:vm</code>
+    sandbox + request-run round trip), <code>dsh-cordis-client-runner</code> is the browser half,
+    and <code>dsh-ui-cordis</code> provides the operations panel and read-only define cards. This
+    is the machinery behind “demo:cordis lets the agent modify its own runtime”. The hooks family
+    faces outside ecosystems: it faithfully maps Claude Code / Codex style external shell hooks
+    (<code>hooks.json</code>) onto dsh's typed interception points —
+    <code>dsh-hook-protocol</code> is the shared wire-protocol library, while
+    <code>dsh-hooks-claude-code</code> and <code>dsh-hooks-codex</code> each own their dialect's
+    event mapping. Remember the stance: dsh's native extension surface is exactly those typed
+    interception points, and a “native hook” is just an ordinary Cordis plugin mounted on them.
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>ctx key / role</th><th>Extension points</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh-tool-cordis</code></td><td>registers on <code>ctx.tools</code></td><td>runtime inspection + dynamic-package define/run/withdraw tools</td></tr>
+      <tr><td><code>dsh-cordis-host-runner</code></td><td><code>ctx.dynamicCordisRunner</code> (host)</td><td>definition registry + <code>node:vm</code> sandbox</td></tr>
+      <tr><td><code>dsh-cordis-client-runner</code> / <code>dsh-ui-cordis</code></td><td>browser half</td><td>browser plugin evaluation + panel UI</td></tr>
+      <tr><td><code>dsh-hook-protocol</code></td><td>library</td><td>shared shell-hook wire protocol</td></tr>
+      <tr><td><code>dsh-hooks-claude-code</code> / <code>dsh-hooks-codex</code></td><td>bridge plugins</td><td>dialect event mapping to typed interception points</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-recap">17.12 Chapter recap</h2>
+  <ul>
+    <li>Knowledge and external information: skill (<code>ctx.skills</code> catalog + <code>skill</code> tool), web (<code>ctx.web</code> search/fetch on one seam, multiple providers, explicit selection policy), lsp (four operations, no JSON-RPC escape hatch), mcp-client (<code>mcp__server__tool</code> registered on <code>ctx.tools</code>).</li>
+    <li>Orchestration and continuation: workflow (<code>ctx.workflowEngine</code> + worker thread + <code>workflow</code> tool), ralph (fixed fresh-agent loop, workspace as long-term memory), jobs (<code>ctx.jobs</code> owner fencing + <code>job_*</code> tools + inject/wake two-lane notification), goal (<code>ctx.goals</code> event sourcing, activation process-local), schedule (reminders in the session log, no external notification channel).</li>
+    <li>Configuration and credentials: settings (namespaced layered resolution + file provider), credentials (references carry no values, per-operation resolve, empty means absent).</li>
+    <li>Data and execution: attachment (immutable image bytes + <code>ImageAttachmentRef</code>), code-runtime (<code>ctx.codeRuntime</code> + Code Mode's <code>run_code</code> and generated SDK).</li>
+    <li>Introspection and bridging: extensions (<code>ctx.dynamicCordisRunner</code>, the model inspecting/mounting its own plugins), hooks (external shell-hook protocols bridged to typed interception points).</li>
+    <li>The shared pattern: providers register <strong>capabilities, not tools</strong>; model-facing names, schemas, prompts, and presentation belong exclusively to Consumer tool packages; state either enters the session log or stays in a sidecar, never model history.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Giving web/lsp providers tool names — providers register capabilities; model-visible names belong to <code>tool-web</code>/<code>tool-lsp</code>.</li>
+      <li>Expecting web to auto-pick among multiple available providers — unconfigured with several available throws <code>WEB_PROVIDER_AMBIGUOUS</code>; selection must be explicit.</li>
+      <li>Treating worker threads as a security boundary — the threads in workflow and code-runtime only isolate the event loop; they are not a sandbox.</li>
+      <li>Assuming schedule pushes notifications — it is an in-session reminder, delivered only while a live root agent exists.</li>
+      <li>Writing credential values into configuration — config carries only <code>CredentialRef</code>; values are resolved by the provider, and empty counts as unconfigured.</li>
+      <li>Adding a “Ralph mode” or changing agent-loop for ralph — it is a fixed-policy workflow on ordinary plugins.</li>
+      <li>Bypassing <code>ctx.attachments</code> to stuff base64/URLs straight into session events — the only durable reference is <code>ImageAttachmentRef</code>.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="17">
+    <h2>Chapter 17 Test</h2>
+
+    <div class="q" data-id="17-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — With no id configured and multiple available providers it throws WEB_PROVIDER_AMBIGUOUS; the selection policy requires an explicit id or exactly one available provider."
+         data-rationale="C is correct — this is ctx.web's execution-time selection table. A and B invent auto-selection — selection never depends on registration order. D is wrong: fetch and search are independent capability kinds; search's ambiguity does not affect fetch's resolution."
+         data-review="sec-web">
+      <div class="prompt"><span class="qnum">Q1.</span> With no provider id configured and two available search providers registered, what does <code>ctx.web.search()</code> do?</div>
+      <label class="opt"><input type="radio" name="q-17-1" value="a"> A. It automatically uses the one registered first</label>
+      <label class="opt"><input type="radio" name="q-17-1" value="b"> B. It automatically round-robins the two providers</label>
+      <label class="opt"><input type="radio" name="q-17-1" value="c"> C. It throws a <code>WebError</code> (<code>WEB_PROVIDER_AMBIGUOUS</code>)</label>
+      <label class="opt"><input type="radio" name="q-17-1" value="d"> D. It silently degrades to fetch</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-2" data-type="mcq" data-correct='["b"]'
+         data-answer="B — dsh-mcp-client: it connects to external MCP servers and registers their tools on ctx.tools as mcp__&lt;serverName&gt;__&lt;rawName&gt;."
+         data-rationale="B is correct. A is the family for plugging into dsh's internal skill catalog, not for bridging external servers. C's tool-web is the Consumer of the web seam. D's hooks bridge external shell-hook protocols to typed interception points and register no tools."
+         data-review="sec-mcp">
+      <div class="prompt"><span class="qnum">Q2.</span> To let the model directly use the tools an external MCP server (e.g. GitHub) provides, which package do you use?</div>
+      <label class="opt"><input type="radio" name="q-17-2" value="a"> A. dsh-skill-filesystem</label>
+      <label class="opt"><input type="radio" name="q-17-2" value="b"> B. dsh-mcp-client</label>
+      <label class="opt"><input type="radio" name="q-17-2" value="c"> C. dsh-tool-web</label>
+      <label class="opt"><input type="radio" name="q-17-2" value="d"> D. dsh-hooks-codex</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-3" data-type="mcq" data-correct='["a"]'
+         data-answer="A — exactly four semantic operations: goToDefinition, findReferences, goToImplementation, hover; no general JSON-RPC escape hatch."
+         data-rationale="A is correct: the narrowed operation set guarantees that swapping providers never changes how the model asks, and protocol payloads cannot reach the model contract. B is wrong: there is no escape hatch. C is wrong: providers register capabilities; the tool face belongs to tool-lsp. D is wrong: the backend is built on the shared execution world (ctx.fs/ctx.subprocess) and opens documents transiently per query, but the operation count is independent of the provider."
+         data-review="sec-lsp">
+      <div class="prompt"><span class="qnum">Q3.</span> How many semantic operations does the <code>ctx.lsp</code> seam expose?</div>
+      <label class="opt"><input type="radio" name="q-17-3" value="a"> A. Four: goToDefinition, findReferences, goToImplementation, hover</label>
+      <label class="opt"><input type="radio" name="q-17-3" value="b"> B. Any LSP method, including a general JSON-RPC passthrough</label>
+      <label class="opt"><input type="radio" name="q-17-3" value="c"> C. Each backend decides its own operation set</label>
+      <label class="opt"><input type="radio" name="q-17-3" value="d"> D. Two: definition and references</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-4" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, and C."
+         data-rationale="A, B, and C are correct: SessionId is the owner fence (the only boundary beyond predictable ids), the three kind-agnostic tools exist, and a busy owner's notifications enter the next-step inbox (several jobs settling cost one step). D is wrong: notifications use no OS or external push; an idle owner is woken with a follow-up turn under a budget ceiling."
+         data-review="sec-jobs">
+      <div class="prompt"><span class="qnum">Q4.</span> Which statements about the jobs family are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="a"> A. Access is fenced by <code>SessionId</code> (owner fence)</label>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="b"> B. The model-side tools are <code>job_output</code> / <code>job_list</code> / <code>job_kill</code></label>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="c"> C. A busy owner's completion notifications are injected into the next-step inbox</label>
+      <label class="opt"><input type="checkbox" name="q-17-4" value="d"> D. Completion notifications are pushed to the user through the operating system</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — activation is process-local and never persisted; resume/fork keeps the objective and stage, but an explicit resume must re-arm continuation."
+         data-rationale="D is correct — a deliberate safety boundary: the durable log records the objective and lifecycle, while whether to act is a runtime authorization. A is wrong: goal/change carries the complete post-change snapshot and is durable. B is wrong: at most one current objective. C is wrong: goal-round-driver is only a continuation Consumer; the continuation authorization lives in ctx.goals."
+         data-review="sec-goal-schedule">
+      <div class="prompt"><span class="qnum">Q5.</span> In the goal family, what are the persistence semantics of activation (the continuation authorization)?</div>
+      <label class="opt"><input type="radio" name="q-17-5" value="a"> A. Persisted with every <code>goal/change</code> event</label>
+      <label class="opt"><input type="radio" name="q-17-5" value="b"> B. Stored in goal-round-driver's configuration</label>
+      <label class="opt"><input type="radio" name="q-17-5" value="c"> C. Multiple objectives can be active at once, each persisted</label>
+      <label class="opt"><input type="radio" name="q-17-5" value="d"> D. Process-local and never persisted; resume/fork keeps the objective but does not continue automatically</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — ralph is a fixed-policy Consumer on top of ctx.workflowEngine and ctx.subagents: one brand-new subagent per round, the shared workspace as long-term memory, structured handoffs passed between rounds."
+         data-rationale="B is correct: there is no Ralph mode and no fresh-agent loop inside agent-loop. A is wrong: the child is brand new (the provider must have inheritsParentContext false); the parent conversation seeds nothing. C is wrong: each round gets a fresh child rather than continuing the previous child's session; long-term memory is the shared workspace. D is wrong: workspace-as-authority is precisely part of the design."
+         data-review="sec-workflow">
+      <div class="prompt"><span class="qnum">Q6.</span> What orchestration strategy does the <code>ralph</code> tool use?</div>
+      <label class="opt"><input type="radio" name="q-17-6" value="a"> A. A Ralph mode built into agent-loop, reusing the parent session's context</label>
+      <label class="opt"><input type="radio" name="q-17-6" value="b"> B. A fixed-policy workflow: one brand-new subagent per round, the shared workspace as long-term memory, structured handoffs passed between rounds</label>
+      <label class="opt"><input type="radio" name="q-17-6" value="c"> C. A single subagent in a multi-turn conversation, accumulating its session over rounds</label>
+      <label class="opt"><input type="radio" name="q-17-6" value="d"> D. No orchestration: the objective is sent straight to the current agent</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-7" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A, B, and D are the three-sentence doctrine: config carries CredentialRef without values (documents render safely in sync), resolution happens per operation (swap a key and the next request uses it, no restart), and describe answers configuration status without returning values. C is the opposite: an empty stored value counts as absent everywhere — whitespace can never masquerade as a configured key."
+         data-review="sec-settings-credentials">
+      <div class="prompt"><span class="qnum">Q7.</span> Which items belong to the credentials family's doctrine? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="a"> A. Configuration carries references, never values</label>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="b"> B. Consumers resolve at the start of every operation, with no caching across operations</label>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="c"> C. An empty stored value counts as configured but pending</label>
+      <label class="opt"><input type="checkbox" name="q-17-7" value="d"> D. <code>describe()</code> can answer whether configured, the source, and writability, without returning values</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-8" data-type="fill"
+         data-accepted='["ctx.dynamicCordisRunner","dynamicCordisRunner","ctx.dynamicCordisRunner (dsh-cordis-host-runner)"]'
+         data-answer="ctx.dynamicCordisRunner (provided by dsh-cordis-host-runner: definition registry + node:vm sandbox + request-run round trip)."
+         data-rationale="The extensions family's host-side runner provides ctx.dynamicCordisRunner; tool-cordis is the model-visible tool on top of it, and the browser half gets a same-named client service from cordis-client-runner."
+         data-review="sec-extensions-hooks">
+      <div class="prompt"><span class="qnum">Q8.</span> Fill in the blank: dsh-cordis-host-runner provides the ______ service that lets the model define and run dynamic Cordis packages.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="17-9" data-type="short"
+         data-key-points='["Long builds/watches → jobs (ctx.jobs + job_output/job_list/job_kill, owner fencing)","Multi-turn progress on an objective → goal (ctx.goals event sourcing + goal-round-driver continuation; activation is process-local)","Semantic navigation (definition/references/implementation/hover) → lsp (ctx.lsp, four operations)","External MCP tools → mcp-client (mcp__server__tool registered on ctx.tools)","Shared pattern: providers register capabilities, not tools; the model face belongs to Consumer tool packages"]'
+         data-answer="Match needs to families: long builds/watches go to jobs — a producer plugin extends JobKindMap, work starts via ctx.jobs.start, the model observes and stops with job_output/job_list/job_kill, and completion notifications take the inject-or-wake lane by owner busyness; multi-turn objectives go to goal — the objective and lifecycle live in the session log as goal/change events, goal-round-driver admits turns with GoalMessageSource's user/message when idle, and activation is process-local to prevent automatic action; semantic navigation goes to lsp — four fixed operations, swapping providers never changes the model contract; external MCP tools go to mcp-client — one plugin instance per server, tools registered under mcp__server__tool names. The shared pattern across all four: providers register capabilities, not tools, and the model-facing names and schema belong exclusively to Consumer tool packages."
+         data-rationale="Being able to map needs to families and extension points is exactly this map's purpose; for details, go back to each package README and docs/capability-seams.md."
+         data-review="sec-map">
+      <div class="prompt"><span class="qnum">Q9.</span> Scenario mapping: the model needs to run a long build and collect its output afterwards, to push a single objective forward across many turns, to look up a symbol's definition and references, and to use an external MCP server's tools. Which capability family does each use, and where do you extend?</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a key point if you genuinely covered it — under-checking hurts your calibration; over-checking just fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="18-cli-and-boot.html"><strong>Chapter 18 · dsh CLI and boot in depth</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

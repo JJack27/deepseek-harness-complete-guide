@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 24 · Extension Practice: Writing a Plugin from the Cookbook — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 24 · Extension Practice</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/24-extension-practice.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="24">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 24 · Part V · Engineering and Contribution</div>
+    <h1>Extension Practice: Writing a Plugin from the Cookbook</h1>
+    <p class="lede">
+      The first twenty-three chapters had you reading dsh; this chapter has you changing it.
+      Taking add a new capability to dsh as the main thread, we walk docs/cookbook/ three times:
+      add a package, add a tool, add an LLM adapter — each pass extracts a real code skeleton,
+      cites its source, and calls out the contracts that bite. At the end we see how an
+      out-of-tree plugin layers an insert overlay over a shipped composition without ever
+      entering the repository. By the end of this chapter you should be confident submitting your
+      first extension PR.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Create an <code>@deepseek-ai/dsh-&lt;name&gt;</code> package from the docs/cookbook/adding-a-package.md checklist and pass the constraints gate.</li>
+      <li>Write a model-visible tool with <code>defineTool</code> that satisfies the execute() contract and the render-intent discipline.</li>
+      <li>Write an <code>LlmAdapter</code> that satisfies the protocol obligations (usage before finish, two error paths, <code>exec.signal</code>).</li>
+      <li>Explain cordis.yml's <code>!!js</code> boundary and the bare-plugin dependencies requirement, and layer out-of-tree capabilities with an insert overlay.</li>
+      <li>Name the verification obligation for each kind of extension (the same-PR keyless snapshot, the examples' dual smokes).</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-main-thread">24.1 The practice mainline: pick the extension point first, then write code</h2>
+
+  <p>
+    The feature → mechanism map in extension-cookbook.md is the entry point for every extension:
+    every product feature in the repository maps to a listener on some documented extension
+    point — the testable form of the microkernel claim, with <strong>not one line changing the
+    loop</strong>. Before writing anything, find your place in that table: to add a model tool go
+    through <code>ctx.tools</code>, to change the prompt go through
+    <code>ctx.systemPrompt.section()</code>, to connect a new vendor go through
+    <code>ctx.llm.registerAdapter</code>. Pick the wrong extension point and every line after it
+    pays interest.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Extension-point selection map">
+      <rect x="270" y="196" width="240" height="76" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="390" y="226" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">Documented extension points</text>
+      <text x="390" y="248" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Not one line changes agent-loop</text>
+
+      <line x1="150" y1="56" x2="270" y2="216" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="32" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="50" text-anchor="middle" style="fill:var(--fg)" font-size="12">Add a model tool</text>
+      <text x="85" y="68" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">ctx.tools.register</text>
+
+      <line x1="630" y1="56" x2="510" y2="216" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="560" y="32" width="200" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="660" y="50" text-anchor="middle" style="fill:var(--fg)" font-size="12">Connect a new model vendor</text>
+      <text x="660" y="68" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">ctx.llm.registerAdapter</text>
+
+      <line x1="140" y1="140" x2="270" y2="232" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="116" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="134" text-anchor="middle" style="fill:var(--fg)" font-size="12">Change the system prompt</text>
+      <text x="85" y="152" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">systemPrompt.section</text>
+
+      <line x1="640" y1="140" x2="510" y2="232" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="560" y="116" width="200" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="660" y="134" text-anchor="middle" style="fill:var(--fg)" font-size="12">Intercept / wrap / watch tool calls</text>
+      <text x="660" y="152" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">tools/pre-execute | execute | result</text>
+
+      <line x1="130" y1="330" x2="270" y2="250" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="306" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="324" text-anchor="middle" style="fill:var(--fg)" font-size="12">Build a UI</text>
+      <text x="85" y="342" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">session/event + followup</text>
+
+      <line x1="640" y1="330" x2="510" y2="250" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="545" y="306" width="215" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="652" y="324" text-anchor="middle" style="fill:var(--fg)" font-size="12">Drive a turn on a timer / in the background</text>
+      <text x="652" y="342" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">followup(source: cron) / ctx.jobs</text>
+
+      <line x1="150" y1="420" x2="270" y2="258" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="10" y="396" width="150" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="85" y="414" text-anchor="middle" style="fill:var(--fg)" font-size="12">Swap the execution environment</text>
+      <text x="85" y="432" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">fs / subprocess provider</text>
+
+      <line x1="630" y1="420" x2="510" y2="258" style="stroke:var(--muted)" stroke-width="1.5"/>
+      <rect x="545" y="396" width="215" height="48" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="652" y="414" text-anchor="middle" style="fill:var(--fg)" font-size="12">Web Chat business node</text>
+      <text x="652" y="432" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-family="monospace">ConversationNodeDefinition</text>
+    </svg>
+    <figcaption>The extension-point selection map (from extension-cookbook.md's feature → mechanism map): whatever you want to add, find the corresponding registry, event, or seam first; no path leads into the agent-loop itself.</figcaption>
+  </figure>
+
+  <p>
+    This chapter's three practice passes cover the three most common paths: <strong>add a
+    package</strong> (when a new capability needs a new home), <strong>add a tool</strong> (a new
+    model-visible capability), and <strong>add an LLM adapter</strong> (a new vendor). Each pass
+    ends with the same step: the verification obligation. examples/AGENTS.md requires every
+    example to carry dual smokes — the keyless one (boot the cordis.yml through the real Loader,
+    drive it, assert output and a clean exit; it exists to catch the Loader export errors that
+    hand-mounted tests miss, the lesson of postmortem 0001) and the keyed one (send a real prompt
+    and verify the external world rather than the model's self-report).
+  </p>
+
+  <h2 id="sec-adding-package">24.2 Pass one: add a package</h2>
+
+  <p>
+    docs/cookbook/adding-a-package.md gives a file-by-file checklist (it is validated against the
+    bash and adapter packages as templates; if it drifts, fix the doc first):
+  </p>
+
+  <pre><code>packages/&lt;group&gt;/&lt;pkg&gt;/
+package.json     <span class="code-comment"># copy from packages/core/tools, change name/description/deps</span>
+tsconfig.json    <span class="code-comment"># extends ../../../tsconfig.base.json, rootDir src,</span>
+                 <span class="code-comment"># outDir lib/types, references point at vendor and each dsh dependency</span>
+src/index.ts     <span class="code-comment"># service default export or plugin (name/inject/apply/Config)</span>
+README.md        <span class="code-comment"># service API, events, extension points, design notes</span>
+                 <span class="code-comment"># + the Model Experience and Known Limitations sections required by gates</span></code></pre>
+
+  <p>
+    The package.json invariants are enforced by <code>pnpm run constraints</code>
+    (scripts/check-workspace-constraints.ts): <code>private: true</code>, version matching the
+    root package.json, <code>type: module</code>, <code>main: lib/index.js</code>,
+    <code>types: lib/types/index.d.ts</code>, and <code>exports["."]</code> types/default pointing
+    at the same pair of files; <code>@deepseek-ai/cordis</code> must appear in
+    <strong>both</strong> peerDependencies <strong>and</strong> devDependencies (same version
+    range); every dsh peer dependency is mirrored in devDependencies;
+    <code>@deepseek-ai/schemastery</code> belongs in dependencies (it is the runtime validator);
+    the <code>files</code> list enumerates exactly <code>lib/index.js</code>,
+    <code>lib/invariant.js</code>, <code>lib/types/**/*.d.ts</code>, and the package's own runtime
+    artifacts — no src, declaration maps, or JS maps are published. In-package relative imports
+    carry an explicit <code>.ts</code> suffix in source (for example
+    <code>export * from './types.ts'</code>); the compiler rewrites it to <code>.js</code> in the
+    output.
+  </p>
+
+  <p>
+    Registering into the root configuration means touching two places: add one line to the
+    references of <code>tsconfig.host.json</code> (Host packages) or
+    <code>tsconfig.client.json</code> (Client packages) — an ordinary package belongs to exactly
+    one aggregate and never both (the <code>api/remotes</code> split is a repository special case
+    that new packages must not imitate); only a new group requires touching the wildcard in
+    <code>tsconfig.base.json</code>. Everything else (root workspaces, publint, tsdown, oxlint,
+    constraints) is covered automatically by glob or manifest discovery.
+  </p>
+
+  <p>
+    Naming is part of the design: name a responsibility that exists stably, not the first
+    implementation or a possible future. A single engine takes a singular ctx key; registries
+    take the plural; role words must match the behavior — <code>Registry</code> owns a named set
+    of registrations that can be added and removed (including lookup, duplicate/priority rules,
+    and lifecycle), <code>Runtime</code> runs live work and owns scheduling and cancellation,
+    <code>Provider</code> supplies one implementation of one capability definition,
+    <code>Store</code> owns exactly one body of data plus its CRUD/snapshot/subscription. The
+    README ends in a fixed order: Model Experience (What the model sees → Verbatim text → Token
+    effect → KV Cache effect) plus Known Limitations and Deferred Work — both sections are gated
+    by <code>doc-sync</code> validators. Finally run step five of the checklist:
+  </p>
+
+  <pre><code>pnpm install        <span class="code-comment"># register the workspace</span>
+pnpm run doc-sync
+pnpm run constraints && pnpm run typecheck && pnpm run lint
+pnpm run build && pnpm run hygiene</code></pre>
+
+  <h2 id="sec-adding-tool">24.3 Pass two: add a tool</h2>
+
+  <p>
+    Tools follow docs/cookbook/adding-a-tool.md (the tutorial version is
+    docs/user/develop/basic/tool.md). The minimal shape — <code>defineTool</code> is the typed
+    helper for first-party tools (tools sourced from MCP enter <code>ctx.tools.register()</code>
+    directly as bare JSON-Schema <code>ToolDefinition</code>s):
+  </p>
+
+  <pre><code><span class="code-key">import</span> { readFile } <span class="code-key">from</span> <span class="code-str">'node:fs/promises'</span>
+<span class="code-key">import</span> <span class="code-key">type</span> { Context } <span class="code-key">from</span> <span class="code-str">'@deepseek-ai/cordis'</span>
+<span class="code-key">import</span> { defineTool } <span class="code-key">from</span> <span class="code-str">'@deepseek-ai/dsh-tools'</span>
+
+<span class="code-key">export const</span> name = <span class="code-str">'my-tool'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'tools'</span>]
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx: Context) {
+  ctx.tools.<span class="code-fn">register</span>(<span class="code-fn">defineTool</span>({
+    name: <span class="code-str">'read_file'</span>,
+    description: <span class="code-str">'Read a file from disk.'</span>,   <span class="code-comment">// what the model sees</span>
+    parameters: {
+      path: { type: <span class="code-str">'string'</span>, required: <span class="code-key">true</span>, description: <span class="code-str">'Absolute path'</span> },
+      limit: { type: <span class="code-str">'number'</span> },                <span class="code-comment">// optional by default</span>
+    },
+    output: {
+      schema: { type: <span class="code-str">'string'</span> },
+      render: (_args, value) =&gt; [{ type: <span class="code-str">'text'</span>, text: value }],
+    },
+    <span class="code-key">async</span> <span class="code-fn">execute</span>(args, exec) {
+      <span class="code-comment">// the args type is derived from the schema: { path: string; limit?: number }</span>
+      <span class="code-key">return</span> readFile(args.path, { encoding: <span class="code-str">'utf8'</span>, signal: exec.signal })
+    },
+  }))
+}</code></pre>
+
+  <p>
+    Registration is an effect: disposing the plugin fiber unregisters the tool; the schema flows
+    into system-prompt assembly automatically. The contract points of execute():
+    <strong>the arguments are already validated</strong> — <code>defineTool</code> validates the
+    model-generated arguments against the unified ParameterSchemaSpec before execute (types,
+    required fields, literal constraints, exact-one unions, nested values); only constraints the
+    DSL cannot express (non-empty strings, positive numbers, cross-field rules) need your own
+    checks. <strong>Return exactly one canonical JSON value</strong> — <code>output.schema</code>
+    may have an object/array/scalar/null root, and the registry snapshots, validates, and freezes
+    the return value before handing it to <code>output.render</code>; do not return content
+    blocks in the body and do not make callers parse prose to find an id. <strong>Throwing or
+    returning an invalid value both count as <code>isError</code></strong> — infrastructure
+    failures use throw, while imperfect-but-successful domain results (like a nonzero exit code)
+    stay in the canonical value for the render layer to interpret. <strong>Respect
+    <code>exec.signal</code></strong>; for asynchronous notification use
+    <code>exec.agent.inject()</code> (appends persistent context visible to the next model
+    request — not a wake-up signal).
+  </p>
+
+  <div class="box key">
+    <div class="box-title">Render intent is part of the design, decided up front</div>
+    <p>
+      The tool's UI card is separate from the model result and declared with pure projections:
+      <code>presentCall(args)</code> returns the pending card (<code>generic</code> by default /
+      <code>terminal</code> — your call is a shell command / <code>diff</code> — your call
+      creates or modifies files, optionally with <code>locations</code> so the editor can
+      follow); <code>presentResult(args, { content, isError, meta })</code> returns the
+      completion card (there are also <code>search</code> and <code>web</code> result shapes).
+      Hard rule: these functions run both on the live stream and on session-log
+      <strong>replay</strong>, so they must be pure functions of args (+ result) — no I/O, no
+      reading session state, no clock or randomness. Want the file's previous content or the
+      working directory? Stop — that belongs in persisted result metadata or a UI adapter. UI-only
+      formatting (console fencing, relativized paths) never enters the model result. A tool with
+      no UI presentation falls back to the generic card automatically.
+    </p>
+  </div>
+
+  <p>
+    Long tasks go to the background: enable <code>run_in_background</code> via producer config,
+    then register through <code>ctx.jobs.start({ kind, label, owner: exec.agent, run })</code>.
+    A successful background branch returns a typed handle (for example
+    <code>{ kind: 'background', jobId }</code>); the Native renderer may keep the human-readable
+    <code>started background job bash-1</code>, but Code Mode must never parse the jobId out of
+    that prose. Once the id is published, use the job's own cancellation signal rather than
+    <code>exec.signal</code> — cancelling the outer call merely stops waiting; what kills
+    published work is <code>job_kill</code>, owner disposal, and service teardown.
+  </p>
+
+  <p>
+    Deployment policy does not go into the tool itself: extensible allow/deny/ask uses
+    <code>tools/pre-execute</code> (a waterfall returning typed decisions), irrevocable final
+    rejection uses <code>ctx.tools.guard()</code>, timeout/retry/metrics wrap the scheduling
+    lifecycle with <code>tools/execute</code> (only <code>exec.signal</code> is replaceable),
+    explicitly transforming results uses <code>tools/post-execute</code>, and observing the
+    immutable final result uses <code>tools/result</code>. And in Code Mode, every visible
+    registered tool becomes <code>await tools.&lt;name&gt;(args)</code> for free — with types
+    supplied by the <code>ToolArgsMap</code>/<code>ToolOutputMap</code> generated from the same
+    set of schemas.
+  </p>
+
+  <h2 id="sec-adding-llm-adapter">24.4 Pass three: add an LLM adapter</h2>
+
+  <p>
+    docs/cookbook/adding-an-llm-adapter.md connects a new model vendor; the reference
+    implementations are <code>packages/llm/llm-deepseek</code> (direct HTTP, eventsource-parser
+    framing) and <code>packages/llm/llm-pi-ai</code> (wrapping an LLM library). Before starting,
+    read the <code>StreamChunk</code> documentation in
+    <code>packages/llm/llm/src/types.ts</code> — both adapters were validated against the
+    protocol conventions it records. The shape:
+  </p>
+
+  <pre><code><span class="code-key">class</span> MyAdapter <span class="code-key">extends</span> LlmAdapter {
+  <span class="code-key">async</span> * <span class="code-fn">stream</span>(options: GenerateOptions): AsyncIterable&lt;StreamChunk&gt; { … }
+}
+
+<span class="code-key">export const</span> name = <span class="code-str">'llm-myprovider'</span>
+<span class="code-key">export const</span> inject = [<span class="code-str">'llm'</span>]
+<span class="code-key">export const</span> Config = z.<span class="code-fn">object</span>({ apiKey: z.string(), … })
+
+<span class="code-key">export function</span> <span class="code-fn">apply</span>(ctx: Context, config: Config) {
+  ctx.llm.<span class="code-fn">registerAdapter</span>([<span class="code-str">'my-provider'</span>], <span class="code-key">new</span> MyAdapter(…))
+}</code></pre>
+
+  <p>
+    Registration goes through effects (HMR-safe); one adapter per provider route — duplicate
+    registration throws, and multi-route registration is all-or-nothing.
+    <code>options.provider</code> selects the adapter and <code>options.model</code> is the
+    vendor's model id, so a dynamic-catalog adapter serves new models without lifecycle
+    reconfiguration. Keys take the native cordis path: schemastery Config with an env fallback,
+    fed from cordis.yml via <code>!!js process.env.MY_KEY</code> — the code never reads ad-hoc
+    key files.
+  </p>
+
+  <p>
+    Protocol obligations (contracts validated against both implementations): <strong>emit usage
+    before finish, and nothing after finish</strong> — the safe approach buffers finish/usage
+    until the vendor's end-of-stream marker and then flushes. Tool-call <strong>arguments are a
+    bare JSON string end to end</strong>; streaming fragments use <code>argumentsDelta</code>,
+    and if the vendor returns parsed objects, re-serialize at <code>block-end</code>. A block's
+    <code>index</code> is assigned by first appearance in the stream and reused by every delta of
+    the same block. Errors have <strong>exactly two legitimate paths</strong> — throwing from
+    <code>stream()</code> (transport/protocol failure, using an <code>LlmError</code> with a
+    stable code) or ending the stream with <code>finish {kind: 'error' | 'aborted'}</code>
+    (in-band vendor failure); pick one per failure class and document it. Respect
+    <code>options.signal</code>; <code>GenerateOptions</code> fields you cannot honor must throw
+    <code>LlmError(..., 'UNSUPPORTED')</code> rather than be silently dropped. When the vendor
+    needs native metadata like response ids or signatures, emit a minimal lossless JSON
+    projection as <code>finish.replayState</code> and validate it when rebuilding history —
+    never infer native replay from provider/model names alone. Model metadata goes through the
+    provider-neutral capability surface: implement <code>resolveModel()</code>, with reasoning
+    effort as an ordered opaque id the adapter maps onto the vendor request. Structurally, keep
+    wire types, request serialization, transport parsing, chunk translation, and the adapter
+    class as distinct responsibilities.
+  </p>
+
+  <h2 id="sec-out-of-tree">24.5 Out-of-tree: insert overlays and the third-party boundary</h2>
+
+  <p>
+    Not every extension has to enter the repository.
+    <code>examples/web-schedule/cordis.yml</code> is the minimal runnable out-of-tree overlay —
+    the entire file is one insert:
+  </p>
+
+  <pre><code><span class="code-comment"># Opt-in Schedule patch over the shipped Web composition.</span>
+<span class="code-comment"># The owner observes only roots published after this overlay loads.</span>
+- insert:
+    - id: time-context
+      name: <span class="code-str">'@deepseek-ai/dsh-time-context'</span>
+
+    - id: schedule
+      name: <span class="code-str">'@deepseek-ai/dsh-schedule'</span></code></pre>
+
+  <p>
+    It is a patch overlay over the shipped Web composition (the bundle layer of dsh-base +
+    dsh-web-app): the insert appends these lines to the tail of the same include layer, and load
+    order decides visibility — the owner observes only roots published after the overlay loads.
+    <code>dsh web --patch &lt;path&gt;</code> enables it. Comparing with
+    <code>examples/web-cordis/cordis.yml</code> shows the other kind of patch: lines without
+    insert directly <strong>replace</strong> the entire <code>config</code> of the target line
+    (same id) — it pins <code>127.0.0.1:3081</code> on the webserver line, then uses an insert
+    to add the cordis self-check tool.
+  </p>
+
+  <p>
+    Two security boundaries of cordis.yml come from the root AGENTS.md: <code>!!js</code> (never
+    <code>!js</code>) is allowed only under plugin <code>config</code> and entry
+    <code>disabled</code>, while all other metadata stays literal — which is why conditional
+    composition is also expressed with overlays; and bare plugins in Raw/Web cordis.yml must
+    appear in their resolver manifest's <code>dependencies</code>, enforced by
+    <code>verify-cordis-config</code>. The template for third-party capabilities is
+    <code>examples/mcp-memory/</code>: three reference configurations, off by default (memorix,
+    mcp-reference-memory, engram), one insert each, pointing
+    <code>@deepseek-ai/dsh-mcp-client</code> at their respective stdio commands — DSH resolves
+    the overlay, starts the subprocess, discovers the MCP tools, and exposes them as
+    <code>mcp__&lt;serverName&gt;__&lt;tool&gt;</code>; DSH does not download servers, create
+    databases, or manage accounts. The stdio bridge deliberately strips environment variables
+    whose names usually carry credentials, plus all <code>DSH_*</code> variables, before spawning
+    the subprocess.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">The boundary for examples</div>
+    <p>
+      examples/AGENTS.md: examples are runnable compositions, not build targets; reusable logic
+      is extracted into packages/ (which has per-file coverage and README gates), and examples
+      keep only cordis.yml wiring, demo artifacts, and e2e/snapshot scenarios; the app package's
+      bin owns the launch glue. Every example has both a keyless and a with-key smoke.
+    </p>
+  </div>
+
+  <h2 id="sec-verify">24.6 The end of every pass: the verification obligation</h2>
+
+  <p>
+    The Verification sections of all three cookbook passes point back to the same
+    docs/testing.md (Chapter 22). Mapped onto this chapter's three kinds of extension: a
+    <strong>new package</strong> — package-level behavior goes to unit + the coverage gate, and
+    product-visible plugins must have a non-unit real-composition test (a hand-assembled
+    <code>ctx.plugin(...)</code> does not count; it must boot a test-dedicated cordis.yml through
+    the Loader); a <strong>new or changed tool</strong> — shipped model-visible and UI-visible
+    changes both need assembled coverage (a keyless snapshot scenario in the same PR, with UI
+    card changes going into web snapshots), and rendering replays must replay on macOS/Linux; a
+    <strong>new adapter</strong> — testing.md owns adapter coverage, real-vendor checks, and
+    release-entry requirements: every protocol obligation has a test, real provider behavior runs
+    e2e, and the release entry runs a built smoke. If the harness cannot yet express your
+    scenario, the policy requires extending the harness before implementing — which is also why
+    acp-snapshot concentrates the comparison machinery into one package.
+  </p>
+
+  <h2 id="sec-recap">24.7 Chapter recap</h2>
+  <ul>
+    <li>Pick the extension point in the feature → mechanism map first, then write code; no path leads into agent-loop.</li>
+    <li>Add a package: the five-piece checklist (package.json/tsconfig/src/README/registration), the constraints gate's invariants, names matching roles, README ending with Model Experience + Known Limitations.</li>
+    <li>Add a tool: <code>defineTool</code>'s execute() contract (arguments pre-validated, one canonical JSON value, throw means isError, respect the signal); render intent decided up front and a pure function of args; background work goes through <code>ctx.jobs.start</code> returning a typed handle; policy goes on extension points, not into the tool body.</li>
+    <li>Add an adapter: <code>ctx.llm.registerAdapter</code> registers per route; usage before finish, arguments are a bare JSON string, errors have only the throw and <code>finish {kind}</code> paths, unsupported options throw UNSUPPORTED, native replay state goes through <code>finish.replayState</code>.</li>
+    <li>Out-of-tree: an insert overlay layers over the shipped composition (web-schedule is the minimal template); lines without insert replace the target line's entire config; <code>!!js</code> only under config and disabled; bare plugins must be in the resolver manifest's dependencies.</li>
+    <li>Every pass ends with the verification obligation: the same-PR keyless snapshot + the examples' dual smokes + a real-composition test.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common misconceptions</div>
+    <ul style="margin:0;">
+      <li>Hand-writing argument validation inside <code>execute()</code> — <code>defineTool</code> already validates against the schema; add only constraints the DSL cannot express.</li>
+      <li>Wanting to read a file's previous content or the working directory inside <code>presentCall</code> — that is persisted result metadata or a UI adapter's job; the presenter must stay pure.</li>
+      <li>Making Code Mode parse a jobId out of rendered prose — background branches return typed handles; prose is for humans only.</li>
+      <li>Writing deployment policy (timeouts, permissions) into the tool body — put them on <code>tools/execute</code> and <code>tools/pre-execute</code> respectively.</li>
+      <li>An adapter dropping trailing usage after finish or emitting it out of order — buffer until the end-of-stream marker, then flush.</li>
+      <li>Passing a vendor-returned parsed arguments object straight into the stream — arguments are a bare JSON string end to end; re-serialize at block-end.</li>
+      <li>Writing <code>!!js</code> on plugin id/name metadata in cordis.yml — only config and disabled are allowed.</li>
+      <li>Mounting a new package into both the Host and Client aggregates — an ordinary package belongs to exactly one; the <code>api/remotes</code> split must not be imitated.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="24">
+    <h2>Chapter 24 Test</h2>
+
+    <div class="q" data-id="24-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — defineTool validates the model-generated arguments against the unified ParameterSchemaSpec before execute; only constraints the DSL cannot express need manual checks."
+         data-rationale="B is correct: by the time execute runs, args already match InferArgs. A pushes validation onto the model, which is unreliable. C describes the obligation of bare JSON-Schema tools (MCP-sourced) — they own their input validation. D is unrelated to validation."
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q1.</span> Inside <code>defineTool</code>'s execute(), who is responsible for argument validation?</div>
+      <label class="opt"><input type="radio" name="q-24-1" value="a"> A. The model itself guarantees valid arguments</label>
+      <label class="opt"><input type="radio" name="q-24-1" value="b"> B. defineTool validates against the schema before execute; only constraints the DSL cannot express (like positive numbers, cross-field rules) are the author's manual checks</label>
+      <label class="opt"><input type="radio" name="q-24-1" value="c"> C. Entirely hand-written by the tool author at the top of execute</label>
+      <label class="opt"><input type="radio" name="q-24-1" value="d"> D. The caller (the Code Mode program) is responsible for validation</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-2" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A/B/D are all execute() contract points: return exactly one canonical JSON value matching output.schema, a throw counts as isError, and respect exec.signal. C is wrong: content blocks do not belong in the body; rendering is the job of output.render and the UI card projections, and mixing UI formatting into the canonical value violates the hard rule."
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q2.</span> Which statements about the tool execute() contract are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="a"> A. Return exactly one canonical JSON value, which the registry snapshots, validates, and freezes</label>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="b"> B. Throwing means isError; infrastructure failures are expressed with throw</label>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="c"> C. Imperfect-but-successful domain results should return content blocks for the caller to parse</label>
+      <label class="opt"><input type="checkbox" name="q-24-2" value="d"> D. When cancellation happens, execute must respect it and abort in-flight work (exec.signal)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — presentCall/presentResult run both live and on log replay, so they must be pure functions of args (+ result)."
+         data-rationale="C is correct: replay must produce cards too, and I/O, session state, or clock/randomness would drift the replay. A is unrelated to purity. B is render's job (model-facing); cards are a different thing. D is precisely the counterexample — soft-validate keeps display from ever breaking replay, rather than giving it license to throw."
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q3.</span> Why must <code>presentCall</code> / <code>presentResult</code> be pure functions?</div>
+      <label class="opt"><input type="radio" name="q-24-3" value="a"> A. For performance; rendering happens often</label>
+      <label class="opt"><input type="radio" name="q-24-3" value="b"> B. Like <code>output.render</code>, they are part of the model-visible content</label>
+      <label class="opt"><input type="radio" name="q-24-3" value="c"> C. They run in both the live stream and session-log replay; I/O, session state, or clock/randomness would make replay irreproducible</label>
+      <label class="opt"><input type="radio" name="q-24-3" value="d"> D. Because defineTool calls them for validation at registration and a throw would break registration</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-4" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Return the typed handle { kind: 'background', jobId }; human-readable prose may exist, but Code Mode must never parse the id out of it."
+         data-rationale="D is correct. A/B both make the program find the id by parsing English, which is explicitly forbidden. C contradicts the contract — domain results like nonzero exits stay in the canonical value, interpreted by rendering, not thrown."
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q4.</span> After a tool call with a background branch succeeds, how should it expose the jobId to Code Mode?</div>
+      <label class="opt"><input type="radio" name="q-24-4" value="a"> A. Write started background job bash-1 in the output prose and let the program regex it out</label>
+      <label class="opt"><input type="radio" name="q-24-4" value="b"> B. Stuff it into the first content block of output.render</label>
+      <label class="opt"><input type="radio" name="q-24-4" value="c"> C. Background tasks always throw so the upper layer retries</label>
+      <label class="opt"><input type="radio" name="q-24-4" value="d"> D. Return a typed canonical handle such as { kind: 'background', jobId }; prose stays for humans only</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-5" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Use ctx.tools.guard() when you need a final rejection that later listeners cannot undo."
+         data-rationale="B is correct: guard is a monotonic final rejection. A is the extensible allow/deny/ask policy layer (a waterfall, influenceable by later layers). C is for wrapping the scheduling lifecycle (timeout/retry/metrics). D only observes the immutable final result and changes no decision."
+         data-review="sec-adding-tool">
+      <div class="prompt"><span class="qnum">Q5.</span> You need a final rejection that no later listener can overturn. Which extension point do you use?</div>
+      <label class="opt"><input type="radio" name="q-24-5" value="a"> A. <code>tools/pre-execute</code> returning deny</label>
+      <label class="opt"><input type="radio" name="q-24-5" value="b"> B. <code>ctx.tools.guard()</code></label>
+      <label class="opt"><input type="radio" name="q-24-5" value="c"> C. <code>tools/execute</code> wrapping the scheduling</label>
+      <label class="opt"><input type="radio" name="q-24-5" value="d"> D. <code>tools/result</code> observing</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, C."
+         data-rationale="A/B/C are all protocol obligations. D is wrong: fields you cannot honor must throw LlmError(..., 'UNSUPPORTED'); silently dropping violates the contract. Also: respect options.signal, block indexes assigned by first appearance in the stream, and exactly two error paths."
+         data-review="sec-adding-llm-adapter">
+      <div class="prompt"><span class="qnum">Q6.</span> The LLM adapter's protocol obligations include which of the following? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="a"> A. usage is emitted before finish, and nothing after finish</label>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="b"> B. Tool-call arguments are a bare JSON string end to end, with streaming fragments using argumentsDelta</label>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="c"> C. Errors have exactly two legitimate paths: throw LlmError from stream(), or end the stream with finish {kind: 'error' | 'aborted'}</label>
+      <label class="opt"><input type="checkbox" name="q-24-6" value="d"> D. GenerateOptions fields the vendor does not support are silently ignored</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-7" data-type="fill" data-accepted='["ctx.llm.registeradapter","ctx.llm","registeradapter"]'
+         data-answer="ctx.llm.registerAdapter (one adapter per provider route; duplicate registration throws)."
+         data-rationale="The adapter plugin injects ['llm'] and calls ctx.llm.registerAdapter(['my-provider'], adapter) inside apply; options.provider selects the adapter and options.model is the vendor's model id."
+         data-review="sec-adding-llm-adapter">
+      <div class="prompt"><span class="qnum">Q7.</span> Fill in the blank: the LLM adapter completes registration inside apply through <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — @deepseek-ai/cordis must be in both peerDependencies and devDependencies (same range)."
+         data-rationale="C is correct, enforced by the constraints gate. A/B violate the mirroring rule: every dsh peer dependency is mirrored in devDependencies. D is backwards: schemastery is the runtime validator and belongs in dependencies."
+         data-review="sec-adding-package">
+      <div class="prompt"><span class="qnum">Q8.</span> Which statement about a new package's package.json dependency invariants is correct?</div>
+      <label class="opt"><input type="radio" name="q-24-8" value="a"> A. <code>@deepseek-ai/cordis</code> goes in peerDependencies only</label>
+      <label class="opt"><input type="radio" name="q-24-8" value="b"> B. dsh peer dependencies go in dependencies only</label>
+      <label class="opt"><input type="radio" name="q-24-8" value="c"> C. <code>@deepseek-ai/cordis</code> appears in both peerDependencies and devDependencies (same range), and dsh peer dependencies are mirrored in devDependencies</label>
+      <label class="opt"><input type="radio" name="q-24-8" value="d"> D. <code>@deepseek-ai/schemastery</code> goes in peerDependencies</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A — An ordinary package registers into exactly one aggregate (Host or Client), never both."
+         data-rationale="A is correct: the two sides declaration-merge different Contexts under the same keys, so entering both aggregates collides in merges. The api/remotes split is a repository special case explicitly barred from imitation. B drops the second half of that rule. C is exactly what is forbidden. D is not the registration method."
+         data-review="sec-adding-package">
+      <div class="prompt"><span class="qnum">Q9.</span> How is a new Host package registered in the root configuration?</div>
+      <label class="opt"><input type="radio" name="q-24-9" value="a"> A. Add one line to tsconfig.host.json's references; an ordinary package belongs to exactly one aggregate</label>
+      <label class="opt"><input type="radio" name="q-24-9" value="b"> B. Add it to both tsconfig.host.json and tsconfig.client.json</label>
+      <label class="opt"><input type="radio" name="q-24-9" value="c"> C. Imitate api/remotes and split into two tsconfigs</label>
+      <label class="opt"><input type="radio" name="q-24-9" value="d"> D. Add an include for the package in tsconfig.base.json</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-10" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A, C."
+         data-rationale="A is correct: !!js (never !js) is allowed only under plugin config and entry disabled, with all other metadata staying literal. C is correct: web-schedule's entire file is one insert appending lines to the composition's tail. B is web-cordis's behavior — lines without insert replace the same-id target line's entire config, but that is not insert. D has no such requirement; the examples are off by default and enabled on demand with --patch."
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q10.</span> Which statements about cordis.yml and overlays are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="a"> A. <code>!!js</code> is allowed only under plugin <code>config</code> and entry <code>disabled</code></label>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="b"> B. An insert section replaces the target line's entire config with the same id</label>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="c"> C. web-schedule's insert overlay appends lines to the tail of the same include layer, and the owner observes only roots published after it</label>
+      <label class="opt"><input type="checkbox" name="q-24-10" value="d"> D. mcp-memory's three configurations are on by default and must be turned off manually</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Bare plugins in Raw/Web cordis.yml must appear in the resolver manifest's dependencies, enforced by verify-cordis-config."
+         data-rationale="B is correct. A is a different rule (the !!js boundary), not the dependencies check. C is backwards. D conflates the bundle patch layer with example wiring."
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q11.</span> Which rule does <code>verify-cordis-config</code> enforce?</div>
+      <label class="opt"><input type="radio" name="q-24-11" value="a"> A. All config values must be literals</label>
+      <label class="opt"><input type="radio" name="q-24-11" value="b"> B. Bare plugins in Raw/Web cordis.yml must appear in their resolver manifest's dependencies</label>
+      <label class="opt"><input type="radio" name="q-24-11" value="c"> C. Every plugin must explicitly declare disabled: false</label>
+      <label class="opt"><input type="radio" name="q-24-11" value="d"> D. Example configurations must mount into the bundle patch layer</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-12" data-type="mcq" data-correct='["d"]'
+         data-answer="D — examples keep only wiring, demo artifacts, and test scenarios; reusable logic is extracted into packages/ (which has the coverage and README gates)."
+         data-rationale="D is correct, straight from examples/AGENTS.md. A violates examples are not build targets. B is exactly the antipattern — test-dedicated compositions live under the example's tests/fixtures and the package must be declared in the config. C is not a requirement."
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q12.</span> What is the boundary between examples and packages?</div>
+      <label class="opt"><input type="radio" name="q-24-12" value="a"> A. examples must also produce lib/ as build targets</label>
+      <label class="opt"><input type="radio" name="q-24-12" value="b"> B. Reusable logic stays in examples because it is quicker to use</label>
+      <label class="opt"><input type="radio" name="q-24-12" value="c"> C. Every example must carry its own launch-glue bin</label>
+      <label class="opt"><input type="radio" name="q-24-12" value="d"> D. examples keep only cordis.yml wiring, demo artifacts, and e2e/snapshot scenarios; reusable logic is extracted into packages/</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-13" data-type="mcq" data-correct='["c"]'
+         data-answer="C — MCP tools register into ctx.tools under names of the form mcp__serverName__tool; one plugin per MCP server."
+         data-rationale="C is correct, matching the feature→mechanism map and the mcp-memory README. A/B/D all bypass the tool registry, the single entry point."
+         data-review="sec-out-of-tree">
+      <div class="prompt"><span class="qnum">Q13.</span> After an MCP server is connected, how do its tools enter dsh?</div>
+      <label class="opt"><input type="radio" name="q-24-13" value="a"> A. They connect to the model directly via a separate MCP tool protocol</label>
+      <label class="opt"><input type="radio" name="q-24-13" value="b"> B. Instructions are injected via a system prompt section</label>
+      <label class="opt"><input type="radio" name="q-24-13" value="c"> C. After discovery they register into <code>ctx.tools</code> as <code>mcp__&lt;serverName&gt;__&lt;tool&gt;</code> (one plugin per server)</label>
+      <label class="opt"><input type="radio" name="q-24-13" value="d"> D. Wrapped as a subagent provider</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="24-14" data-type="short"
+         data-key-points='["Presenters execute in both the live stream and log replay","Replay demands reproducibility: I/O, session state, or clock/randomness drifts the cards","Render intent is part of the design; generic/terminal/diff/locations are chosen up front","UI-only formatting stays out of the model result; output.render owns model prose, card projections own the UI"]'
+         data-answer="Because presentCall/presentResult run not only on the live stream but also during session-log replay; any I/O, session state, clock, or randomness would make the replayed cards differ from the originals. So render intent is part of the tool's design (card kinds and locations chosen up front), presenters stay pure functions, UI-only formatting stays in the card projections, and model prose stays in output.render."
+         data-rationale="Covering live plus replay, purity guarantees reproducibility, intent decided up front, and UI formatting separated from the model result meets the bar."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q14.</span> In your own words: why must a tool's render intent be decided up front and its presenters be pure functions?</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check only the points you actually covered — under-checking distorts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="25-contributing-map.html"><strong>Chapter 25 · The Contribution Map and Expert Navigation</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

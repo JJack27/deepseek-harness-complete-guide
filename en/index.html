@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The DeepSeek Harness Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">◆ The dsh Expert Path</span>
+  <span class="crumb">A DeepSeek Harness repository expert book · 25 chapters</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/index.html">→ 中文</a>
+</div>
+
+<main class="toc">
+  <div class="toc-header">
+    <div class="logo">◆</div>
+    <h1>The DeepSeek Harness Expert Path</h1>
+    <p class="subtitle">
+      A book forged for readers starting from zero on the way to mastering the
+      DeepSeek Harness (dsh) repository. It begins with what an agent harness is
+      and the Cordis plugin model, then walks through the event-sourced session log,
+      the turn/step loop, the tool execution pipeline, and capability seams, all the
+      way to the Web UI, the RPC gateway, test gates, and the contribution process.
+      By the end you can pick up any requirement in the repository and know which
+      package to read first, which extension point to hook, and which test channel to run.
+    </p>
+  </div>
+
+  <div class="dashboard">
+    <div class="progress-label">
+      <span>Your progress</span>
+      <span><strong id="progress-passed">0 / 25</strong> chapters passed · <strong id="progress-pct">0%</strong></span>
+    </div>
+    <div class="progress-bar"><div id="overall-progress" style="width:0%"></div></div>
+    <p class="small" style="margin-top:.7rem; margin-bottom:0;">
+      Progress is saved in your browser's <code>localStorage</code> and survives refreshes.
+      Every chapter ends with a test; <strong>≥ 80% means "learned enough to move forward"</strong> (a soft gate — nothing is locked).
+    </p>
+  </div>
+
+  <div class="chapter-grid"></div>
+
+  <div class="toc-footer">
+    Forged with the <a href="https://github.com/">personal-book-forger</a> skill from the real source of the deepseek-harness repository (2026-08 snapshot).
+    All diagrams are inline SVG; all demos run locally in your browser; no external requests. Double-click any chapter file to read offline.
+  </div>
+</main>
+
+<script>
+window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };
+window.CHAPTER_DESCS = {
+  1: { title: "What dsh Is: Product & Repository Panorama", desc: "agent harness layers, dsh's four product forms, and a directory map of 49 package groups holding 200+ packages." },
+  2: { title: "The Cordis Mental Model", desc: "Context, plugins, services, events, waterfall — the one framework you need to read the whole book." },
+  3: { title: "Assembling a Runtime", desc: "boot → bundle → profile → patch layers: how the plugin tree grows at dsh startup." },
+  4: { title: "Session Log: The Event-Sourced Source of Truth", desc: "The append-only SessionEvent stream and the model-visible ⟺ logged invariant." },
+  5: { title: "Persistence and Versioning", desc: "The JSONL/SQLite backends, reject-on-mismatch versioning, crash recovery, and projections." },
+  6: { title: "The Agent Abstraction and Scope", desc: "The Agent interface, ctx.agents, per-agent scope, shadowing, and the setup window." },
+  7: { title: "Agent Loop: The Turn/Step Lifecycle", desc: "Inbox admission, the turn/step hierarchy, every interception point, and the event flow." },
+  8: { title: "The Tool System and Execution Pipeline", desc: "The ctx.tools registry and its five-stage guard pipeline, parallel execution, and render intent." },
+  9: { title: "System Prompt Assembly", desc: "Sectioned assembly, tool-schema merge-in, and scoped overrides for per-session personas." },
+  10: { title: "The LLM Capability Layer", desc: "ctx.llm messages and streaming vocabulary, the DeepSeek adapter, retry, and token metering." },
+  11: { title: "The Capability Seam Pattern", desc: "The Service Definition / Provider / Consumer trio and the ripple effects of swapping a provider (reading the 56-service / 26-seam graph)." },
+  12: { title: "The Execution World", desc: "shell, subprocess, terminal, sandbox, E2B: one provider swap moves the whole execution world." },
+  13: { title: "The Filesystem Capability", desc: "ctx.fs providers, observation policy, str-replace-editor, and the sandboxed FS." },
+  14: { title: "Delegation and Subagents", desc: "Five subagent providers, the Ralph loop, lineage, and delegationDepth." },
+  15: { title: "Context Pressure Management", desc: "compaction, spill offloading, and the context-injection plugin family." },
+  16: { title: "The Human Plane", desc: "Slash commands, the one-shot permission waterfall, approvals, and ask-user." },
+  17: { title: "A Tour of the Capabilities", desc: "A one-page map of a dozen capability packages: skill/web/lsp/mcp/workflow/jobs/goal/todo/plan." },
+  18: { title: "The dsh CLI and boot, In Depth", desc: "apps/cli argument syntax, app-boot guards and the config tree, and the cmdline handoff." },
+  19: { title: "Web UI Architecture", desc: "The host half and the browser half, the __DSH_BOOT__ module graph, and ui-slots composition." },
+  20: { title: "Typert and the RPC Gateway", desc: "Type-graph generation → loading → registry, gateway and apiproxy, dual WebSocket downstream." },
+  21: { title: "ACP, SDK, and Python", desc: "Three ways to drive dsh out of process: ACP, the JSON-RPC SDK, and Python." },
+  22: { title: "The Testing System", desc: "Five vitest channels, keyless llm-replay playback, and golden snapshot fixtures." },
+  23: { title: "Quality Gates and Repository Conventions", desc: "The coverage gate, doc-sync/hygiene, and the AGENTS.md hard rules one by one." },
+  24: { title: "Extension Practice", desc: "Follow the official cookbook: add a package, add a tool, add an LLM adapter." },
+  25: { title: "The Contribution Map and Expert Navigation", desc: "Agent Notes, the bilingual doc flow, PR conventions, and the navigation map the whole book assembles." }
+};
+</script>
+<script src="assets/book.js" defer></script>
+</body>
+</html>

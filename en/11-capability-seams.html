@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 11 · The Capability Seam Pattern: A Three-Role Methodology — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 11 · Capability Seams</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/11-capability-seams.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="11">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 11 · Part III · Capability Seams in Depth</div>
+    <h1>The Capability Seam Pattern: A Three-Role Methodology</h1>
+    <p class="lede">
+      Every capability you met in the first ten chapters — <code>ctx.llm</code>, <code>ctx.tools</code>,
+      <code>ctx.systemPrompt</code> — has the same structure behind it.
+      This chapter names that structure precisely: the <strong>capability seam</strong>, a complete cut
+      through a replaceable capability, formed jointly by three roles: Service Definition, Service Provider,
+      and Consumer. Once you own this pattern, you can answer the most important engineering question in dsh:
+      which pieces do you design to add a capability, and which pieces do you touch to swap an implementation?
+      The answers are three and one.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State each role's responsibilities and boundaries, and why a Service Definition must be a Cordis Service subclass rather than a TypeScript interface</li>
+      <li>Using the <code>dsh-shell</code> family as the template, identify which package plays which role</li>
+      <li>Explain the chain reaction of swapping one provider for a whole product shape — why execution worlds migrate as a group</li>
+      <li>Consult the script-generated full map at <code>docs/capability-seams.md</code> to locate any <code>ctx.*</code> service's owner, implementations, and consumers</li>
+      <li>Given a new capability requirement, complete the design with the three-role checklist instead of writing just one plugin</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-what-is-seam">11.1 What is a capability seam</h2>
+
+  <p>
+    One convention recurs throughout the dsh repository: <strong>A capability seam comprises Service Definition /
+    Service Provider / Consumer roles. It is complete, never one role.</strong>
+    A capability seam is a <strong>complete cut through a replaceable capability</strong>: cut along this seam and
+    the capability can be swapped out whole, while neither side of the cut knows the other's concrete
+    implementation.
+  </p>
+
+  <p>
+    The <code>capability-seam</code> entry in <code>docs/glossary.md</code> gives the precise definition.
+    The three roles are:
+  </p>
+  <ul>
+    <li>
+      <strong>Service Definition</strong> — a Cordis <code>Service</code> subclass that owns its own
+      <code>ctx.&lt;key&gt;</code> service key and all the vocabulary types. It can be an abstract class
+      (such as <code>ShellExecutor</code>) or a concrete registry (such as the web capability's registry),
+      but it is <strong>never a TypeScript <code>interface</code></strong>. An interface has no declaration
+      merging, no <code>ctx.shell</code> key, no lifecycle — it cannot attach to Cordis's service graph.
+    </li>
+    <li>
+      <strong>Service Provider</strong> — the implementer. It subclasses the abstract Service or registers into
+      the registry, filling in the how. A seam can have one provider or a set of parallel providers.
+    </li>
+    <li>
+      <strong>Consumer</strong> — the user. It obtains <code>ctx.&lt;key&gt;</code> through <code>inject</code>
+      and programs only against the Definition's vocabulary. The most common Consumers are model-visible tools
+      (such as <code>dsh-tool-bash</code>), but any other plugin can be one too.
+    </li>
+  </ul>
+
+  <p>
+    Two easily missed details. First, <strong>roles usually live in separate packages, but this is not enforced</strong>:
+    when two roles evolve together, one package can hold several roles — <code>dsh-llm</code> owns both the LLM
+    capability's Service Definition (<code>ctx.llm</code>) and its Consumer (the streaming invocation logic);
+    but holding a single role does not constitute a seam — the word seam always refers to the complete cut.
+    Second, <strong>vocabulary types belong to the Definition</strong>: request, spec, result, and event-name types
+    shared across packages are defined in the Definition package; providers and consumers both import them, and
+    neither writes its own copy.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Why not an interface</div>
+    <p>
+      Cordis service discovery relies on declaration merging: a package writes
+      <code>declare module '@deepseek-ai/cordis' { interface Context { shell: ShellExecutor } }</code>, and only
+      then does the <code>ctx.shell</code> key exist. A TypeScript interface cannot express I registered a
+      service key, nor effect scoping and disposal. So the Definition must be a <code>Service</code> subclass —
+      it is a type and a runtime object at once.
+    </p>
+  </div>
+
+  <h2 id="sec-three-roles">11.2 The three-role relationship</h2>
+
+  <p>
+    Draw the dependency directions and the heart of the pattern is plain: <strong>both sides point at the
+    middle, and the two sides do not know each other</strong>. The Provider subclasses the Definition's abstract
+    service; the Consumer injects the Definition's <code>ctx.&lt;key&gt;</code>. There is no edge from Provider
+    to Consumer — that is exactly where replaceability comes from.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 620 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three-role relationship diagram">
+      <rect x="20" y="60" width="170" height="90" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="105" y="90" text-anchor="middle" style="fill:var(--accent-2)" font-size="14" font-weight="700">Service Provider</text>
+      <text x="105" y="112" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">dsh-bash-local</text>
+      <text x="105" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">dsh-bash-sandbox</text>
+
+      <rect x="225" y="45" width="170" height="120" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2.5"/>
+      <text x="310" y="75" text-anchor="middle" style="fill:var(--accent)" font-size="14" font-weight="700">Service Definition</text>
+      <text x="310" y="97" text-anchor="middle" style="fill:var(--fg)" font-size="12">dsh-shell</text>
+      <text x="310" y="117" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">ShellExecutor</text>
+      <text x="310" y="137" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">ctx.shell + vocabulary types</text>
+
+      <rect x="430" y="60" width="170" height="90" rx="10" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="515" y="90" text-anchor="middle" style="fill:var(--pass)" font-size="14" font-weight="700">Consumer</text>
+      <text x="515" y="112" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">dsh-tool-bash</text>
+      <text x="515" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">inject: bash</text>
+
+      <line x1="190" y1="90" x2="222" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="225,90 217,86 217,94" style="fill:var(--muted)"/>
+      <text x="206" y="80" text-anchor="middle" style="fill:var(--muted)" font-size="10">subclasses / registers</text>
+
+      <line x1="430" y1="90" x2="398" y2="90" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="395,90 403,86 403,94" style="fill:var(--muted)"/>
+      <text x="412" y="80" text-anchor="middle" style="fill:var(--muted)" font-size="10">injects and uses</text>
+
+      <line x1="105" y1="150" x2="105" y2="185" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <line x1="105" y1="185" x2="430" y2="185" style="stroke:var(--fail)" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <line x1="430" y1="185" x2="430" y2="150" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4 4"/>
+      <text x="267" y="205" text-anchor="middle" style="fill:var(--fail)" font-size="11">This dependency does not exist: Provider and Consumer never import each other</text>
+
+      <text x="310" y="238" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">Roles may live in separate packages or share one (dsh-llm is both Definition and Consumer), but a seam always means all three roles together</text>
+    </svg>
+    <figcaption>The capability seam's three roles: all dependencies point at the Definition; zero dependencies between the two sides.</figcaption>
+  </figure>
+
+  <p>
+    The red dashed line in the diagram is the edge most worth watching when reviewing PRs. If you find
+    <code>tool-bash</code> directly importing <code>dsh-bash-local</code>, or <code>bash-local</code> importing
+    some tool package in return, the seam has cracked — the freedom to swap providers vanishes instantly.
+  </p>
+
+  <h2 id="sec-shell-example">11.3 The template: the dsh-shell family</h2>
+
+  <p>
+    The repository's own designated template is <code>packages/shell/</code>. Here is the role table at the top
+    of <code>packages/shell/shell/README.md</code>:
+  </p>
+
+  <table>
+    <thead><tr><th>Package</th><th>Role</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><code>@deepseek-ai/dsh-shell</code></td><td>Service Definition</td><td>Abstract <code>ShellExecutor</code> + vocabulary types (<code>ShellExecRequest</code> / <code>ShellExecSpec</code> / <code>ShellRunResult</code>)</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-bash-local</code></td><td>Provider</td><td>Local subprocess implementation</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-bash-sandbox</code></td><td>Provider</td><td>Reuses bash-local's mechanism, but wraps every spawn with <code>ctx.sandbox</code> constraints</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-pwsh-local</code></td><td>Provider</td><td>Local implementation for the Windows PowerShell family</td></tr>
+      <tr><td><code>@deepseek-ai/dsh-tool-bash</code></td><td>Consumer</td><td>The model-visible <code>bash</code> tool, built on <code>ctx.shell</code></td></tr>
+      <tr><td><code>@deepseek-ai/dsh-tool-pwsh</code></td><td>Consumer</td><td>The model-visible <code>pwsh</code> tool</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    When reading this template, note three details about what the Definition owns; they demonstrate where
+    vocabulary lives:
+  </p>
+  <ul>
+    <li>
+      <strong>The capability fact <code>sandboxMode</code></strong>. On the base class it defaults to
+      <code>undefined</code> (this executor does not sandbox); <code>bash-sandbox</code> reports its constraint
+      mode at mount time. <code>tool-bash</code> reads this fact at registration and decides whether to expose
+      the <code>sandbox_permissions</code> escalation parameter to the model — <strong>probe the capability,
+      don't import the provider</strong>. A containerized or remote executor plugs in the same way, with not one
+      line changed in the tool layer.
+    </li>
+    <li>
+      <strong><code>SHELL_SETTINGS_NAMESPACE</code> (value <code>bash</code>) is exported by the Definition</strong>,
+      because it names the capability, not any implementation. The host assembles exactly one
+      <code>ctx.shell</code> provider — the Windows layer swaps the POSIX lines for pwsh lines, and mounting
+      both would fail on duplicate service registration — so every provider registers this same namespace and
+      they never collide; one <code>settings.yaml</code> stays resolvable across platforms.
+    </li>
+    <li>
+      <strong>The rendering contract <code>parseExitStatus</code></strong>. The parser for the
+      <code>[exit code: N]</code> / <code>[killed by signal: X]</code> markers lives in the Definition package,
+      so the two Consumers <code>tool-bash</code> and <code>tool-pwsh</code> can never drift apart on marker
+      format.
+    </li>
+  </ul>
+
+  <div class="box key">
+    <div class="box-title">Key point</div>
+    <p>
+      The Definition owns more than abstract methods: capability facts, the settings namespace, parsing
+      contracts shared across implementations, and the event vocabulary all belong to it. To decide which
+      package a type belongs in, one question suffices: is it part of the capability, or part of one
+      implementation?
+    </p>
+  </div>
+
+  <h2 id="sec-provider-swap">11.4 Swap one provider, move the entire execution world</h2>
+
+  <p>
+    The replaceability of a single seam is already useful, but dsh's real product-level power comes from
+    <strong>a group of seams sharing one execution world</strong>. Recall the two edges in
+    <code>docs/capability-seams.md</code>: <code>fs-e2b</code> and <code>subprocess-e2b</code> both inject
+    <code>ctx.e2b</code> — they are not two isolated providers but two local faces of the same remote Linux
+    world.
+  </p>
+
+  <p>
+    Who consumes <code>ctx.subprocess</code>? The bash executors (<code>bash-local</code>,
+    <code>bash-sandbox</code>), the PTY backends (<code>terminal-bash</code>), the LSP hosts
+    (<code>lsp-stdio</code>), and the three out-of-process subagent backends (<code>subagent-acp</code>,
+    <code>subagent-codex</code>, <code>subagent-claude-code</code>). Who consumes <code>ctx.fs</code>? The file
+    tools, <code>tool-fs</code>. This means: swap <code>fs-local</code> for <code>fs-e2b</code> and
+    <code>subprocess-local</code> for <code>subprocess-e2b</code>, and Bash, the terminal, LSP, and file
+    reads/writes move <strong>together</strong> into the remote sandbox — no tool package changes code, and no
+    provider forks an E2B-specific tool variant.
+  </p>
+
+  <div class="demo" data-demo="seamSwap">
+    <div class="demo-title">Try it — swap one provider, move the entire execution world</div>
+    <p>fs and subprocess share one execution world. Switch providers:</p>
+    <label><input type="radio" name="d11" value="local" checked> fs-local + subprocess-local</label>
+    <label><input type="radio" name="d11" value="sandbox"> fs-sandbox + the sandboxed process world</label>
+    <div class="demo-output empty">Try switching providers.</div>
+  </div>
+
+  <p>
+    The diagram below draws before and after side by side. The upper tool layer does not move at all; only a
+    few boxes in the provider layer change — this is the literal meaning of swapping a provider equals swapping
+    a product shape: local dev machine, secure sandbox machine, remote sandbox cluster — three deployments
+    share the same tool and Definition code.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 660 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Before and after swapping providers">
+      <rect x="15" y="15" width="300" height="290" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="165" y="40" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">Local execution world</text>
+
+      <rect x="40" y="60" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="165" y="88" text-anchor="middle" style="fill:var(--pass)" font-size="11">tool-bash · tool-terminal · tool-fs · tool-lsp</text>
+
+      <rect x="40" y="130" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="165" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="11">ctx.shell · ctx.terminals · ctx.fs · ctx.subprocess</text>
+
+      <rect x="40" y="200" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="165" y="228" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">bash-local · terminal-bash · fs-local · subprocess-local</text>
+
+      <text x="165" y="280" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">Your laptop: process tree and disk are both local</text>
+
+      <line x1="165" y1="106" x2="165" y2="127" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="165,130 161,122 169,122" style="fill:var(--muted)"/>
+      <line x1="165" y1="176" x2="165" y2="197" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="165,200 161,192 169,192" style="fill:var(--muted)"/>
+
+      <rect x="345" y="15" width="300" height="290" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="495" y="40" text-anchor="middle" style="fill:var(--fg)" font-size="13" font-weight="700">Remote / sandbox execution world</text>
+
+      <rect x="370" y="60" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="495" y="88" text-anchor="middle" style="fill:var(--pass)" font-size="11">tool-bash · tool-terminal · tool-fs · tool-lsp (same packages)</text>
+
+      <rect x="370" y="130" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="495" y="158" text-anchor="middle" style="fill:var(--accent)" font-size="11">ctx.shell · ctx.terminals · ctx.fs · ctx.subprocess (same seams)</text>
+
+      <rect x="370" y="200" width="250" height="46" rx="6" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="495" y="222" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">fs-e2b · subprocess-e2b (or fs-sandbox · bash-sandbox)</text>
+      <text x="495" y="238" text-anchor="middle" style="fill:var(--accent-2)" font-size="11">backed by ctx.e2b or ctx.sandbox</text>
+
+      <text x="495" y="280" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">A cloud micro-VM: processes and files are remote; the model cannot tell</text>
+
+      <line x1="495" y1="106" x2="495" y2="127" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="495,130 491,122 499,122" style="fill:var(--muted)"/>
+      <line x1="495" y1="176" x2="495" y2="197" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="495,200 491,192 499,192" style="fill:var(--muted)"/>
+
+      <text x="330" y="160" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">swap provider</text>
+      <line x1="318" y1="170" x2="342" y2="170" style="stroke:var(--warn)" stroke-width="2"/>
+      <polygon points="345,170 337,166 337,174" style="fill:var(--warn)"/>
+    </svg>
+    <figcaption>Before and after the swap: the tool layer and seam layer are identical; only the provider layer's boxes change — the execution world migrates as a group.</figcaption>
+  </figure>
+
+  <h2 id="sec-depend-on-definition">11.5 Extension plugins depend on the Definition, never import a provider</h2>
+
+  <p>
+    This rule applies not just to tool packages but to every extension plugin that wants to build on top of a
+    capability. Want to audit bash results? Listen to the seam's events and inject the seam's services; don't
+    import <code>dsh-bash-local</code>. Want to add behavior over every provider group? Write it as consumption
+    of the Definition, and all providers get it for free.
+  </p>
+
+  <p>
+    One step further: <strong>dsh-agent-loop itself is swappable</strong>. In the table in
+    <code>docs/capability-seams.md</code>, the role of <code>ctx.agentLoop</code> is <code>bundle</code> —
+    the sole concrete loop plugin; extension packages depend on dsh-agent's events and services, not on this
+    package. The turn/step loop is part of the product API spine (changing it requires updating
+    <code>docs/architecture.md</code>), but from the plugin system's point of view it is just one assembly-time
+    choice: extensions never couple directly to the loop implementation; they hook documented extension points
+    such as <code>agent/pre-step</code> and <code>tools/*</code>. Every interception point you learned in
+    Chapter 7 is a beneficiary of this decoupling.
+  </p>
+
+  <p>
+    From this we get a quick-reference table of dependency directions:
+  </p>
+  <table>
+    <thead><tr><th>When writing this code</th><th>May depend on</th><th>Must not depend on</th></tr></thead>
+    <tbody>
+      <tr><td>A new provider</td><td>The Definition package (types + base class)</td><td>Other providers, Consumer packages</td></tr>
+      <tr><td>A new Consumer (tool, bridge)</td><td>The Definition package's <code>ctx.&lt;key&gt;</code> and vocabulary</td><td>Any concrete provider</td></tr>
+      <tr><td>An extension plugin over a capability</td><td>The seam's events and services (such as the <code>fs/*</code> event gate)</td><td>The seam's concrete implementation packages</td></tr>
+      <tr><td>A loop-behavior extension</td><td><code>dsh-agent</code> events and services, documented extension points</td><td>The <code>dsh-agent-loop</code> package itself</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="sec-seam-map">11.6 Reading the map: the docs/capability-seams.md panorama</h2>
+
+  <p>
+    You don't need to memorize the dependency relations of 150 packages — the repository generates the full map
+    for you. <code>docs/capability-seams.md</code> is generated by <code>scripts/gen-doc-graphs.ts</code>
+    (rerun locally with <span class="kbd">pnpm run gen-doc-graphs</span>), and the file header reads
+    <em>do not edit by hand</em>. The current snapshot covers <strong>56 <code>ctx.*</code> services, of which
+    26 are marked <code>seam</code></strong>; the rest are <code>core</code> (spine services such as
+    <code>ctx.sessions</code>, <code>ctx.tools</code>) or <code>bundle</code> (assembly points such as
+    <code>ctx.agentLoop</code>).
+  </p>
+
+  <p>Each table row looks like this (taking <code>ctx.fs</code> as the example). How to read the seven columns:</p>
+  <table>
+    <thead><tr><th>Column</th><th>Meaning</th><th>Content of the <code>ctx.fs</code> row</th></tr></thead>
+    <tbody>
+      <tr><td><code>ctx key</code></td><td>The service key and a one-line responsibility</td><td><code>ctx.fs</code> Filesystem provider seam</td></tr>
+      <tr><td><code>Role</code></td><td><code>seam</code> / <code>core</code> / <code>bundle</code></td><td><code>seam</code></td></tr>
+      <tr><td><code>Owner</code></td><td>The package holding the Definition</td><td><code>fs</code> (<code>packages/fs/fs</code>)</td></tr>
+      <tr><td><code>Implementations</code></td><td>Known provider packages</td><td><code>fs-local</code>, <code>fs-sandbox</code>, <code>fs-e2b</code></td></tr>
+      <tr><td><code>Direct consumers</code></td><td>Packages consuming the service directly</td><td><code>tool-fs</code></td></tr>
+      <tr><td><code>Companion plugins</code></td><td>Plugins that participate through event gates rather than service injection</td><td><code>fs-observation-policy</code></td></tr>
+      <tr><td><code>Note</code></td><td>Design notes for this row</td><td>fs-sandbox fences changes by shared sandbox mode; the observation policy participates through the <code>fs/*</code> event gate</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Three typical lookups:
+  </p>
+  <ul>
+    <li>
+      <strong>Who owns this <code>ctx.foo</code>?</strong> — scan the <code>ctx key</code> column. The Owner
+      column gives the Definition package path directly; above the table there is also a mermaid diagram where
+      <code>pkg_* --&gt; svc_*</code> edges mean who implements/injects whom, and <code>svc_* --&gt; pkg_*</code>
+      edges mean who consumes whom.
+    </li>
+    <li>
+      <strong>Which packages must change to add an implementation to this capability?</strong> — look at Owner
+      and Implementations. You write exactly one new provider package and register it under the same service
+      key; the Owner and all Consumers stay untouched.
+    </li>
+    <li>
+      <strong>This plugin never injects the service — how does it participate?</strong> — check the Companion
+      plugins column and the dashed edge in the diagram
+      (<code>svc_fs -. event gate .-&gt; pkg_fs_observation_policy</code>). Companion plugins go through event
+      gates rather than method injection; Chapter 13 makes them the protagonist.
+    </li>
+  </ul>
+
+  <p>
+    Note that generating this table is <strong>guarded for completeness</strong>: the role classification lives
+    in the generation script, and if a new service is missing its implementation/consumer classification, the
+    <code>doc-sync</code> gate fails. So it is a living document you can quote as truth, not a hand-maintained
+    README that drifts out of date.
+  </p>
+
+  <h2 id="sec-design-checklist">11.7 A practical checklist: adding a capability = designing all three roles</h2>
+
+  <p>
+    Let's condense the pattern into an actionable checklist. Suppose the requirement is add a screenshot
+    capability to dsh. Design it role by role:
+  </p>
+  <ol>
+    <li>
+      <strong>Definition package <code>dsh-screenshot</code></strong>: a Cordis <code>Service</code> subclass
+      (<code>ctx.screenshot</code>), vocabulary types (request / spec / result), and any facts and error codes
+      shared across implementations. Decide up front whether it is an abstract class (single provider, like
+      <code>ShellExecutor</code>) or a named registry (multiple coexisting providers, like
+      <code>ctx.web</code>'s search/fetch or <code>ctx.subagents</code>' seven backends).
+    </li>
+    <li>
+      <strong>At least one provider</strong> (say <code>screenshot-local</code>), subclassing or registering the
+      implementation; every deployment-varying parameter goes into its validated <code>Config</code> (validated
+      by cordis.yml), never a hardcoded <code>DEFAULT_*</code>.
+    </li>
+    <li>
+      <strong>At least one Consumer</strong> (say <code>tool-screenshot</code>), injecting
+      <code>inject: ['tools', 'screenshot', 'systemPrompt']</code>, programming only against the vocabulary
+      types; the rendering intent (<code>generic</code> / <code>terminal</code> / <code>diff</code> /
+      <code>locations</code>) is decided once, up front.
+    </li>
+    <li>
+      <strong>Check the event surface</strong>: a model-visible input requires a SessionEvent (model-visible ⟺
+      logged, the invariant from Chapter 4); a companion policy means an event gate, not another service.
+    </li>
+    <li>
+      <strong>Backfill the full map</strong>: let <code>gen-doc-graphs</code> include the new service in
+      <code>docs/capability-seams.md</code>, and update the package/ctx-key tables of the group README in the
+      same PR.
+    </li>
+  </ol>
+
+  <p>
+    Every item in this checklist corresponds to a hard convention in the repository: seam completeness, a
+    configurable Config, misconfiguration fails loud, docs travel with code. Chapter 24 walks this checklist
+    again as a cookbook-level exercise.
+  </p>
+
+  <h2 id="sec-recap">11.8 Chapter recap</h2>
+  <ul>
+    <li>A capability seam = a complete cut through a replaceable capability: Service Definition (a Cordis Service subclass owning <code>ctx.&lt;key&gt;</code> and the vocabulary types) + Provider + Consumer; missing any one, there is no seam.</li>
+    <li>Dependency direction: both sides point at the Definition; Provider and Consumer never import each other; probe capabilities with capability facts (such as <code>sandboxMode</code>), not type references.</li>
+    <li><code>dsh-shell</code> is the template: shell (Definition) / bash-local, bash-sandbox, pwsh-local (Providers) / tool-bash, tool-pwsh (Consumers).</li>
+    <li>fs and subprocess share one execution world: swap in <code>fs-e2b</code> + <code>subprocess-e2b</code>, and Bash, PTY, LSP, and file tools move into the remote sandbox together.</li>
+    <li>Extension plugins depend on Definitions and events, never concrete providers; even <code>dsh-agent-loop</code> holds the swappable bundle role.</li>
+    <li><code>docs/capability-seams.md</code> is a script-generated living map (56 services, 26 seams); the owner / implementations / consumers / companion columns locate the structure of any capability.</li>
+    <li>Adding a capability = designing all three roles at once + the event surface + backfilling the full map.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Treating a seam as just an interface: writing the Definition as a TypeScript <code>interface</code> leaves <code>ctx.&lt;key&gt;</code> nonexistent — declaration merging has nothing to attach to.</li>
+      <li>A Consumer importing a concrete provider (or the reverse) — the seam cracks and the freedom to swap implementations vanishes; probe provider traits with capability facts.</li>
+      <li>Vocabulary types in the wrong package: request/result types living in a provider must be copied when the second provider arrives.</li>
+      <li>Writing one plugin and calling it a new capability — one role is not a seam; at minimum think through all three role boundaries and write them into the group README.</li>
+      <li>Hand-editing <code>docs/capability-seams.md</code> — it is a generated artifact; change <code>scripts/gen-doc-graphs.ts</code> and regenerate.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="11">
+    <h2>Chapter 11 Test</h2>
+
+    <div class="q" data-id="11-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The Service Definition must be a Cordis Service subclass that owns the ctx.&lt;key&gt; service key and the vocabulary types."
+         data-rationale="B is correct: declaration merging attaches the service key to Context; an interface cannot do that and carries no lifecycle or effect scope. A is wrong because a seam demands a Cordis runtime object, not a pure type. C mistakes the registry form for something disallowed — web is a registry-style Definition. D inverts the rule: roles may share a package (dsh-llm holds two roles), but the word seam always means the complete cut."
+         data-review="sec-what-is-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> Regarding the Service Definition, which statement is correct?</div>
+      <label class="opt"><input type="radio" name="q-11-1" value="a"> A. It can be any TypeScript interface, as long as the fields are complete</label>
+      <label class="opt"><input type="radio" name="q-11-1" value="b"> B. It is a Cordis Service subclass (abstract class or concrete registry) that owns ctx.&lt;key&gt; and the vocabulary types</label>
+      <label class="opt"><input type="radio" name="q-11-1" value="c"> C. It can only be an abstract class; concrete registries don't count as Definitions</label>
+      <label class="opt"><input type="radio" name="q-11-1" value="d"> D. It must live in the same package as the Provider, or there is no seam</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-2" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A, C, and D all hold: the capability fact, the shared settings namespace, and the cross-implementation parsing contract all belong to the Definition. B is wrong because bash's timeout default is a Config field of the provider (bash-local) — deployment variance belongs to the implementation, not the capability vocabulary."
+         data-review="sec-shell-example">
+      <div class="prompt"><span class="qnum">Q2.</span> In the dsh-shell template, which of the following are owned by the Definition package dsh-shell? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="a"> A. The capability fact <code>sandboxMode</code></label>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="b"> B. The default timeout for foreground commands (such as 120000ms)</label>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="c"> C. <code>SHELL_SETTINGS_NAMESPACE</code> (value bash)</label>
+      <label class="opt"><input type="checkbox" name="q-11-2" value="d"> D. The <code>parseExitStatus</code> exit-marker parsing contract</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — It reads the ctx.shell.sandboxMode capability fact and decides from it whether to expose the escalation parameter; it never imports a provider."
+         data-rationale="C is correct: capability probing goes through fact fields on the Definition — exactly the mechanism that keeps the seam swappable. A and B each create an import dependency on a concrete implementation, breaking the seam. D is not feasible — TypeScript cannot statically determine the concrete subclass of an injected abstract service; capabilities must be runtime facts."
+         data-review="sec-shell-example">
+      <div class="prompt"><span class="qnum">Q3.</span> How does dsh-tool-bash know the currently mounted executor supports sandbox escalation (and thus expose the sandbox_permissions parameter)?</div>
+      <label class="opt"><input type="radio" name="q-11-3" value="a"> A. It imports dsh-bash-sandbox and checks with instanceof</label>
+      <label class="opt"><input type="radio" name="q-11-3" value="b"> B. It string-matches the provider's package name in cordis.yml</label>
+      <label class="opt"><input type="radio" name="q-11-3" value="c"> C. It reads the <code>ctx.shell.sandboxMode</code> capability fact</label>
+      <label class="opt"><input type="radio" name="q-11-3" value="d"> D. Static type narrowing: declare a separate interface for the sandbox executor</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-4" data-type="fill"
+         data-accepted='["ctx.e2b","e2b","ctx.e2b (dsh-e2b)"]'
+         data-answer="ctx.e2b (the shared lifecycle service owned by dsh-e2b)."
+         data-rationale="fs-e2b and subprocess-e2b both inject ctx.e2b, sharing one remote Linux work tree and process world — that is what one execution world, two local faces means. bash or sandbox is wrong: that is the process-constraint seam, not E2B's lifecycle owner."
+         data-review="sec-provider-swap">
+      <div class="prompt"><span class="qnum">Q4.</span> Fill in the blank: fs-e2b and subprocess-e2b share the same remote execution world because they both inject the ______ service.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Extension packages depend on dsh-agent's events and services, not on the agent-loop package; in the full map ctx.agentLoop holds the bundle role."
+         data-rationale="D is correct. A directly conflicts with dsh's Plugins, not loop changes convention. B is wrong: agent-loop is part of the product spine and changes require updating docs/architecture.md — but extensions still should not couple to it. C invents a requirement: the extension points are always available; there is no need to copy the loop."
+         data-review="sec-depend-on-definition">
+      <div class="prompt"><span class="qnum">Q5.</span> When you want to add behavior to the turn/step loop, what is dsh's position?</div>
+      <label class="opt"><input type="radio" name="q-11-5" value="a"> A. Directly modify dsh-agent-loop's source to add a branch</label>
+      <label class="opt"><input type="radio" name="q-11-5" value="b"> B. agent-loop is an irreplaceable core; extensions can only work around it</label>
+      <label class="opt"><input type="radio" name="q-11-5" value="c"> C. Copy agent-loop into your own loop and bridge the events by hand</label>
+      <label class="opt"><input type="radio" name="q-11-5" value="d"> D. Hook documented extension points (agent/*, tools/* events and services) and depend on dsh-agent, not the dsh-agent-loop package</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-6" data-type="mcq" data-multiselect="true" data-correct='["b","d"]'
+         data-answer="B, D."
+         data-rationale="B and D are correct: the Companion plugins column and the dashed (event gate) edges in the mermaid diagram mark how companion plugins participate. A is wrong — companion plugins precisely do not inject the service (fs-observation-policy registers fs/* listeners, not a service). C reverses the direction: the diagram shows svc_fs -. event gate .-&gt; pkg_fs_observation_policy, the service's event vocabulary pointing at the listener."
+         data-review="sec-seam-map">
+      <div class="prompt"><span class="qnum">Q6.</span> In docs/capability-seams.md, how do you identify companion plugins like fs-observation-policy? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="a"> A. It appears in the Direct consumers column</label>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="b"> B. It appears in the Companion plugins column</label>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="c"> C. In the diagram, a solid inject edge runs from the plugin to the service</label>
+      <label class="opt"><input type="checkbox" name="q-11-6" value="d"> D. In the diagram, a dashed edge labeled event gate connects to it</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A — The Owner column gives the package holding the Definition (here packages/fs/fs)."
+         data-rationale="A is correct: the ctx key locates the row, and the Owner column gives the declaring package. B is wrong — Implementations lists providers, not the declaration site. C is wrong — Note is a design-note annotation. D describes no such mechanism: the map is discovered by script from Cordis declarations, not manual labels."
+         data-review="sec-seam-map">
+      <div class="prompt"><span class="qnum">Q7.</span> To find which package holds the Definition of the <code>ctx.fs</code> service, which column do you read?</div>
+      <label class="opt"><input type="radio" name="q-11-7" value="a"> A. Find the row by ctx key, then read the Owner column</label>
+      <label class="opt"><input type="radio" name="q-11-7" value="b"> B. The first package in the Implementations column</label>
+      <label class="opt"><input type="radio" name="q-11-7" value="c"> C. The link in the Note column</label>
+      <label class="opt"><input type="radio" name="q-11-7" value="d"> D. The Role column (seam/core/bundle)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The same execution world: the bash executors, PTY backends, and LSP hosts all spawn through ctx.subprocess, and the fs tools go through ctx.fs; swap those two seams' providers and they all migrate together."
+         data-rationale="C is correct. A is wrong — E2B is not a ctx.sandbox backend; container/micro-VM/remote executors are a provider group replacing the whole seam (the sandbox README states same-world confinement only). B is wrong — no tool was forked into a remote-specific variant, which is exactly the point of the pattern. D does not hold: subagent-acp/codex/claude-code, as consumers of ctx.subprocess, enter the new execution world too."
+         data-review="sec-provider-swap">
+      <div class="prompt"><span class="qnum">Q8.</span> After swapping subprocess-local for subprocess-e2b and fs-local for fs-e2b, what happened to the Bash, terminal, and LSP tools?</div>
+      <label class="opt"><input type="radio" name="q-11-8" value="a"> A. Each gained a dedicated E2B branch package</label>
+      <label class="opt"><input type="radio" name="q-11-8" value="b"> B. They degraded to read-only until a local provider was restored</label>
+      <label class="opt"><input type="radio" name="q-11-8" value="c"> C. Nothing needed changing: they consume the seams, and the execution world moved to the remote host wholesale</label>
+      <label class="opt"><input type="radio" name="q-11-8" value="d"> D. Only the bash tool kept working; terminal and LSP are incompatible with the remote world</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-9" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, C."
+         data-rationale="A, B, and C are all checklist items: a Cordis Service subclass, a validated Config, and a service-injecting Consumer. D is wrong — with a single provider you import no sibling provider at all; importing at least one existing provider is both unnecessary and against the decoupling direction. E (if you considered it) the event-surface check is step 4, but having a companion policy plugin is not required."
+         data-review="sec-design-checklist">
+      <div class="prompt"><span class="qnum">Q9.</span> Following this chapter's three-role checklist to add a new capability, which of the following are mandatory? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="a"> A. A Cordis Service subclass owning ctx.&lt;key&gt; and the vocabulary types</label>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="b"> B. At least one provider, with deployment variance in Config rather than hardcoded constants</label>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="c"> C. At least one Consumer, programming only against the Definition's vocabulary</label>
+      <label class="opt"><input type="checkbox" name="q-11-9" value="d"> D. The new provider must import an existing provider to reuse its mechanism</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-10" data-type="fill"
+         data-accepted='["gen-doc-graphs","pnpm run gen-doc-graphs","scripts/gen-doc-graphs.ts"]'
+         data-answer="pnpm run gen-doc-graphs (the script is scripts/gen-doc-graphs.ts)."
+         data-rationale="The file header reads Generated by scripts/gen-doc-graphs.ts - do not edit by hand; regeneration goes through pnpm run gen-doc-graphs. Hand edits are lost under the doc-sync gate."
+         data-review="sec-seam-map">
+      <div class="prompt"><span class="qnum">Q10.</span> Fill in the blank: docs/capability-seams.md is a generated file; to regenerate it you run ______.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Roles usually live in separate packages so they can evolve independently, but roles that are one concern may share a package; a single role is never a seam."
+         data-rationale="B is correct (glossary wording: a package may own multiple roles when they are one concern). A absolutizes package separation. C is wrong — dsh-llm is exactly a package holding both Definition and Consumer. D is wrong — it degrades a seam to a single role."
+         data-review="sec-what-is-seam">
+      <div class="prompt"><span class="qnum">Q11.</span> Which statement about a package holding multiple roles is correct?</div>
+      <label class="opt"><input type="radio" name="q-11-11" value="a"> A. The three roles must strictly live in three separate packages</label>
+      <label class="opt"><input type="radio" name="q-11-11" value="b"> B. Split packages when the roles evolve independently; same-concern roles may share a package (as dsh-llm does, holding both Definition and Consumer)</label>
+      <label class="opt"><input type="radio" name="q-11-11" value="c"> C. A package can hold at most two roles</label>
+      <label class="opt"><input type="radio" name="q-11-11" value="d"> D. The word seam can also refer to a single role, depending on context</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="11-12" data-type="short"
+         data-key-points='["All three roles present: Service Definition (Cordis Service subclass + ctx key + vocabulary types), Provider, Consumer","Dependency direction: both sides point to the Definition; Provider and Consumer never import each other","The chain effect of swapping a provider: seams sharing an execution world migrate as a group, with zero tool-layer changes","docs/capability-seams.md is the script-generated full map; look up owner / implementations / consumers / companion"]'
+         data-answer="Answer with four points: three roles + dependency direction + execution-world group migration + consulting the living map. The Definition is a Cordis Service owning the ctx key and the vocabulary; the Provider implements it and the Consumer injects it, and neither side depends on the other; therefore swapping providers (such as fs-e2b + subprocess-e2b) moves Bash/PTY/LSP/file tools into the remote world wholesale; the full map is docs/capability-seams.md, generated by gen-doc-graphs."
+         data-rationale="With these four points you hold the map for locating any capability in the repository; the next chapter follows this map into the largest execution world."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> In your own words: what is a capability seam, why can swapping one provider produce a whole-product chain reaction, and how will you consult the full map from now on?</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check a point only if your answer truly covers it — under-checking hurts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="12-execution-world.html"><strong>Chapter 12 · The Execution World: shell, subprocess, terminal, sandbox</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

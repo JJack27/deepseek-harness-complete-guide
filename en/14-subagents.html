@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 14 · Delegation and Subagents — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 14 · Delegation and Subagents</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/14-subagents.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="14">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 14 · Part III · Capability Seams in Depth</div>
+    <h1>Delegation and Subagents</h1>
+    <p class="lede">
+      When one agent can't keep up, dsh's answer is <strong>delegation</strong>: hand tasks to subagents, each
+      with its own session and context. <code>ctx.subagents</code> is the busiest seam in the repository —
+      unlike bash, which allows exactly one executor, it is a <strong>multi-provider registry</strong>: in-process
+      fork, fresh in-process subagents, out-of-process ACP, real Codex and Claude Code, out-of-process full dsh
+      — seven backends coexisting under one contract. This chapter covers the provider lineage, the three
+      model-facing tool families, the lineage recorded in the <code>SessionHeader</code> together with the depth
+      cap, and the Ralph loop that swaps in a fresh agent every round.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Explain why ctx.subagents is a named registry (multiple coexisting providers) rather than a single-service seam, and list the differences among the seven providers</li>
+      <li>Distinguish the seed boundaries of fork versus spawn, and name the shared machinery that in-process-driver carries</li>
+      <li>Split tool-subagent / tool-subagent-control / tool-subagent-report into their responsibilities</li>
+      <li>Explain how parentSession + delegationDepth form lineage, and what lineage is data, not visibility means</li>
+      <li>Describe the Ralph loop's strategy: fresh subagents + bounded structured handoff + the shared workspace as long-term memory</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-subagent-seam">14.1 ctx.subagents: one interface, many backends</h2>
+
+  <p>
+    <code>docs/subsystems/subagent.md</code> opens by calling out this seam's specialty: it <strong>allows
+    multiple provider implementations to coexist by name in the same context</strong> (the
+    <code>ctx.subagents</code> registry), whereas bash allows exactly one executor. The registry's shape follows
+    the LLM adapter registry (Chapter 10's <code>ctx.llm</code>), not the single-service bash executor. The
+    Service Definition is <code>dsh-subagent</code>: it owns provider registration, the shared request/result
+    contract, durable descriptors, and (optionally enabled) continuable subagent orchestration.
+  </p>
+
+  <p>
+    The core provider contract is <code>start(request): Promise&lt;SubagentRun&gt;</code> — <strong>the
+    ownership-transfer boundary</strong>. Before fulfill, the provider owns the startup process, and any failure
+    must cancel, roll back, and silently dispose unpublished resources; after fulfill, the caller owns the run
+    and must <code>dispose()</code> it on every path. <code>SubagentRun.result</code> resolves to
+    <code>{ output, structured?, stopReason }</code>: subagent-level failures resolve with a reason other than
+    <code>completed</code>, and only infrastructure failures the seam cannot express reject.
+  </p>
+
+  <p>
+    Providers advertise four startup capabilities through static <code>capabilities</code> —
+    <code>outputSchema</code> (enforce structured final results), <code>depthLimit</code> (enforce
+    <code>maxDepth</code>), <code>toolFilter</code> (subagent tool restriction), and <code>persona</code>
+    (subagent persona). The service validates the request against the capabilities <strong>before the subagent
+    is created</strong>, refusing loudly when a capability is missing (<code>UNSUPPORTED_CAPABILITY</code>) —
+    never accept first and pretend not to see it later.
+  </p>
+
+  <h2 id="sec-providers">14.2 The provider lineage: seven backends</h2>
+
+  <table>
+    <thead><tr><th>Provider (registered name)</th><th>Where the subagent runs</th><th>Does it see the parent session?</th></tr></thead>
+    <tbody>
+      <tr><td><code>subagent-spawn-in-process</code> (spawn)</td><td>A brand-new <code>Agent</code> inside the current process</td><td>No: starts from an empty conversation, but inherits cwd, lineage, and model</td></tr>
+      <tr><td><code>subagent-fork-in-process</code> (fork)</td><td>Inside the current process</td><td>Sees <strong>completed turns</strong> (the seed is the contiguous prefix of the parent log up to the last <code>turn/end</code>)</td></tr>
+      <tr><td><code>subagent-acp</code> (acp)</td><td>A brand-new subprocess, driving any Agent Client Protocol agent as an ACP client</td><td>No</td></tr>
+      <tr><td><code>subagent-codex</code> (codex)</td><td><code>codex app-server --stdio</code> in a subprocess, one ephemeral thread per run</td><td>No</td></tr>
+      <tr><td><code>subagent-claude-code</code> (claude-code)</td><td>The <code>claude</code> executable launched by the official Claude Agent SDK</td><td>No</td></tr>
+      <tr><td><code>subagent-dsh-sdk</code></td><td>A <strong>complete dsh runtime</strong> in a subprocess (the <code>dsh-jsonrpc-agent</code> bin), speaking stdio JSON-RPC through the TypeScript SDK</td><td>No</td></tr>
+      <tr><td colspan="3">There is also one shared piece that never appears in the registry: <code>subagent-in-process-driver</code> — the run driver shared by spawn and fork (next section).</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    <strong>The fork seed boundary</strong> is the most delicate part of this family. When the parent agent
+    initiates delegation, its current tool-calling turn has not ended: the log holds the assistant's tool calls
+    but not the paired tool results, and no <code>turn/end</code>. Copying the raw log verbatim would hand the
+    subagent an <strong>unbalanced, illegal session</strong>. Fork therefore takes only the contiguous prefix
+    up to the last <code>turn/end</code> — the subagent sees every completed turn and nothing of the turn in
+    progress; if the parent has completed no turn at all, the seed is empty and fork degenerates into spawn.
+    The seed transfers conversation history only: the subagent still gets a brand-new flat registration scope
+    and does <strong>not</strong> inherit the parent's tool restrictions or permissions.
+  </p>
+
+  <p>
+    The rest of the two in-process providers' machinery lives in
+    <code>subagent-in-process-driver</code>'s <code>startInProcessRun</code>: depth validation →
+    <code>ctx.agents.create</code> (with the mandatory cancellation signal) → inside the unpublished setup
+    window, install the persona / tool filter / structured-output runtime → publish the subagent → drive one
+    task with <code>child.followup(prompt)</code> + <code>child.whenIdle()</code> → read the subagent's own
+    output (the last non-empty assistant message, or accumulated assistant text). The depth check is also
+    inside the driver: parent depth + 1 is written into the subagent's header (next section).
+  </p>
+
+  <p>
+    The three out-of-process backends (acp, codex, claude-code) all spawn their subprocess through
+    <code>ctx.subprocess</code> (Chapter 12's foundation), with the working directory taken from the delegating
+    parent session's cwd — never the server process's own cwd, because one server process serves sessions of
+    many workspaces. The <code>dsh-sdk</code> backend instead makes the subagent a <strong>full peer
+    harness</strong>: its own cordis.yml composition, session persistence, model routing, and tools; it differs
+    from the ACP backend in wire and subagent contract — ACP drives any ACP agent, while the SDK drives
+    specifically a harness runtime.
+  </p>
+
+  <div class="box key">
+    <div class="box-title">The permission boundary of delegation</div>
+    <p>
+      Both in-process delegation paths fix the subagent's permission scope at the <strong>delegation
+      boundary</strong>: they snapshot the parent session's explicit sandbox overrides and pin the subagent's
+      approval policy to <code>'never'</code> (whenever the approval capability is in the composition) — the
+      delegated subagent acts only within the inherited sandbox scope, and any ask (for example a
+      <code>sandbox_permissions</code> escalation) is refused deterministically instead of waiting on a prompt
+      nobody is watching. These values are written into the subagent's own log as <code>sandbox/mode</code> /
+      <code>approval/policy</code> events with <code>source: 'delegation'</code> — the subagent's effective
+      policy is reconstructable from its own log alone. The subagent also receives a
+      <code>subagent:delegation</code> runtime-context statement: the scope is fixed, and when it needs more
+      permission it should state the limitation in its reply rather than retry.
+    </p>
+  </div>
+
+  <h2 id="sec-subagent-tools">14.3 The tool families: launch, control, report</h2>
+
+  <p>
+    The model face is shared by three packages, each pointing a different direction:
+  </p>
+  <table>
+    <thead><tr><th>Package</th><th>Direction</th><th>Tools and key points</th></tr></thead>
+    <tbody>
+      <tr><td><code>tool-subagent</code></td><td>parent → child (launch)</td><td>Each plugin instance binds <strong>one provider to one tool name</strong> (default <code>subagent</code>); the model gets no provider selector — to expose a second transport, mount another renamed instance. Foreground calls await <code>run.result</code> and always <code>run.dispose()</code> before returning; <code>backgroundMode</code> picks <code>one-shot</code> (registers a plain Task when backgrounded, returns a jobId) or <code>continuable</code> (background by default, returns a durable childId). <code>maxDepth</code> defaults to 3 (0 forbids delegation).</td></tr>
+      <tr><td><code>tool-subagent-control</code></td><td>parent → child (follow-up)</td><td><code>send_message</code> / <code>interrupt_agent</code> / <code>list_agents</code> registered once globally (the listing tool via the detachable <code>./list-agents</code> plugin). A message becomes the subagent's next FIFO turn (<code>Agent.followup()</code>) and cannot redirect the turn in progress; <code>interrupt_agent</code> stops only the current turn (<code>keepInbox</code>) — queued messages stay and published descendants keep running.</td></tr>
+      <tr><td><code>tool-subagent-report</code></td><td>child → parent (report)</td><td>The <code>report</code> tool, registered only inside a continuable subagent's scope — installed via the <code>registerContinuableSetup</code> contribution, invisible to the root session, one-shot subagents, remote providers, and sibling scopes. It takes no recipient parameter: <code>exec.agent</code> is the sender credential, and the service derives the single recipient from the subagent's durable <code>parentSession</code>. The in-scope registration deliberately survives the subagent's <code>toolFilter</code> — the delegation allowlist cannot delete the only return channel.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The continuable-subagent world adds one more thing: a settlement notification. When the subagent's
+    residence (Activation) ends, the orchestration manager tells the parent in its own turn that the subagent
+    has finished everything it was going to do — attaching the stop reason and the final assistant content.
+    This notification is <strong>delivered unconditionally</strong>: it does not depend on whether the
+    subagent ever called <code>report</code>, because the endings most in need of an account (token
+    exhaustion, model failure, cancellation, teardown) are exactly the ones where the subagent never got to
+    choose.
+  </p>
+
+  <h2 id="sec-lineage">14.4 Lineage: parentSession and delegationDepth</h2>
+
+  <p>
+    Subagents are not rootless: when publishing the child agent/session, the local run records
+    <code>request.parent.session.id</code> into the child session header's <code>parentSession</code> field;
+    the in-process driver writes <strong>parent depth + 1</strong> into the child session header's
+    <code>delegationDepth</code>. Both fields are durable — persisted with the session and still valid after a
+    cold recovery.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Subagent lineage and depth">
+      <rect x="30" y="110" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="105" y="138" text-anchor="middle" style="fill:var(--accent)" font-size="12.5" font-weight="700">Parent session</text>
+      <text x="105" y="158" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">delegationDepth = 0</text>
+
+      <rect x="240" y="60" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="315" y="88" text-anchor="middle" style="fill:var(--accent-2)" font-size="12.5" font-weight="700">Subagent A</text>
+      <text x="315" y="108" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">parentSession=parent · depth=1</text>
+
+      <rect x="240" y="175" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="315" y="203" text-anchor="middle" style="fill:var(--accent-2)" font-size="12.5" font-weight="700">Subagent B (background)</text>
+      <text x="315" y="223" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">parentSession=parent · depth=1</text>
+
+      <rect x="460" y="60" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="535" y="88" text-anchor="middle" style="fill:var(--fg)" font-size="12.5" font-weight="700">Grandchild agent</text>
+      <text x="535" y="108" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">parentSession=A · depth=2</text>
+
+      <rect x="460" y="175" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--fail)" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="535" y="200" text-anchor="middle" style="fill:var(--fail)" font-size="12" font-weight="700">depth=3: the cap</text>
+      <text x="535" y="220" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">maxDepth defaults to 3; further derivation is refused</text>
+
+      <line x1="180" y1="130" x2="237" y2="100" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,98 232,97 236,104" style="fill:var(--muted)"/>
+      <line x1="180" y1="160" x2="237" y2="203" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,205 232,204 236,197" style="fill:var(--muted)"/>
+      <line x1="390" y1="95" x2="457" y2="95" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="460,95 452,91 452,99" style="fill:var(--muted)"/>
+      <line x1="390" y1="210" x2="457" y2="210" style="stroke:var(--fail)" stroke-width="1.8" stroke-dasharray="5 4"/>
+
+      <text x="105" y="270" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">Lineage lives in the SessionHeader: depth is authoritative and monotonic — a restored subagent cannot be recounted as top-level</text>
+      <text x="420" y="292" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">Lineage is data, not visibility: parentSession doesn't let B see A's conversation; it serves delivery authorization and listings</text>
+    </svg>
+    <figcaption>Lineage diagram: each derivation writes parentSession and delegationDepth into the child session header; exceeding the depth cap is refused.</figcaption>
+  </figure>
+
+  <p>
+    Three depth semantics to memorize. First, <strong>the durable header is authoritative and monotonic</strong>:
+    runtime options may deepen the count but never shallow it — a restored subagent cannot be recounted as
+    top-level. Second, <strong>the cap is checked on every start</strong>: the tool remains visible at the cap
+    (the model sees the tool exists), but the refused derivation returns an error tool result; setting
+    <code>maxDepth</code> to 0 forbids delegation outright. Out-of-process providers may configure
+    <code>'provider-managed'</code> — the budget belongs to the harness on the subagent's side, and the parent
+    sends no cap. Third, <strong>lineage is data, not visibility</strong>: <code>inheritsParentContext</code>
+    only describes whether the subagent <strong>sees</strong> the parent session's completed conversation
+    history (fork sees it; spawn and out-of-process providers don't); it does not mean inheriting tools,
+    services, or permissions; <code>parentSession</code> grants no sibling-to-sibling visibility either — it
+    serves delivery authorization (who may message this subagent), report routing (who receives the report),
+    and <code>list_agents</code>' directory traversal.
+  </p>
+
+  <div class="demo" data-demo="lineageDepth">
+    <div class="demo-title">Try it — subagent derivation and delegationDepth</div>
+    <button data-run>Derive one level of subagent</button>
+    <div class="demo-output empty">Click to derive.</div>
+  </div>
+
+  <h2 id="sec-continuable">14.5 Continuable subagents and Activation</h2>
+
+  <p>
+    One-shot delegation is ask once, get one result; a continuable subagent is a <strong>durable conversation
+    object</strong>: one durable <code>Session</code> plus at most one process-local <strong>Activation</strong>
+    — the latter is not a request, not a Task, not a result boundary; it is one residence epoch of the
+    reconstructed child Agent. The Agent inbox is the only turn queue: every follow-up
+    (<code>send_message</code>, a wake-style report, the settlement notification) becomes the next FIFO turn
+    through <code>Agent.followup()</code>, never redirecting a turn in progress. A subagent in residence
+    receives directly (waking the waiting Activation); a subagent not in residence cold-recovers from the
+    durable <code>Session</code> — the reconstruction input is the <code>subagent/descriptor</code> event in
+    the log (recording the provider name, lifecycle mode, creation labels, model routing, and more), and cold
+    recovery goes through no provider at all.
+  </p>
+
+  <p>
+    From agent silence and its owned set of subagents, the orchestration manager derives three internal
+    residence states: running (an active turn or un-woken inbox work), waiting (silent but still owning
+    undisposed subagents), and settled (every subagent disposed, whereupon it disposes the
+    <code>AgentHandle</code> and removes the Activation). Teardown propagates cancellation top-down and
+    releases handles bottom-up (child-first) — a parent agent counts as silent only after every subagent it
+    started is truly disposed, so a runaway recursive tree has a definite closing point.
+  </p>
+
+  <h2 id="sec-ralph">14.6 The Ralph loop: a brand-new agent every round</h2>
+
+  <p>
+    The delegation lineage solves parallel division of labor; the Ralph loop solves another class of problems:
+    <strong>iterative execution toward a long objective</strong>. <code>dsh-tool-ralph</code> (workflow group)
+    provides the model-facing <code>ralph({ objective, maxRounds? })</code> tool: a fixed foreground workflow
+    that hands an immutable objective to a sequence of <strong>brand-new subagents</strong>. It demonstrates
+    that a specialized orchestration policy is just an ordinary plugin — no Ralph mode was added to
+    <code>agent-loop</code>; everything is built on the two seams <code>ctx.workflowEngine</code> and
+    <code>ctx.subagents</code> (the workflow engine's full story waits for Chapter 17).
+  </p>
+
+  <p>The loop's rules:</p>
+  <ul>
+    <li>Each round starts one subagent through the configured <code>subagentProvider</code> (default <code>spawn</code>); that provider must support structured output and report <code>inheritsParentContext: false</code> — every round is a clean mind.</li>
+    <li>Each subagent receives only: the immutable objective, the current round number and cap, the shared-workspace-is-permission instruction, and <strong>the previous round's structured handoff report</strong>. The parent conversation and earlier subagent sessions are never seeded — <strong>the workspace is the long-term memory</strong>.</li>
+    <li>Reports are structured: <code>status: continue | complete | blocked</code>, plus a non-empty summary, evidence, next steps, and a blocker statement; once serialized they are capped by <code>maxHandoffChars</code> (default 16384 characters). Invalid, missing, or over-cap reports fail the workflow rather than being truncated or misread as exhausted rounds.</li>
+    <li>The terminal outcome <code>complete</code> / <code>blocked</code> / <code>budget-limited</code> returns together with the last round's bounded report and the round count; the rendering explicitly marks it as <strong>the working agent's self-report</strong>, not an independent verification. The round cap defaults to 256 (the deployment config doubles as the ceiling for per-call overrides).</li>
+    <li>An ordinary subagent failure produces an error (naming the failed round, preserving the last successful handoff), and Ralph does not retry that round; cancellation is likewise an error, and partial output never counts as success.</li>
+  </ul>
+
+  <p>
+    Ralph closes this chapter because it strings every theme into one sentence: <strong>the unit of delegation
+    is the session, the unit of memory is the workspace, and the unit of transfer is the bounded structured
+    report</strong>. A brand-new subagent every round means the context never bloats (Chapter 15's topic gets
+    its answer early here); a bounded handoff means controllable inter-round state; lineage and depth are
+    recorded as usual — Ralph's subagents are a sequence of depth-1 siblings derived directly from the parent,
+    not an ever-deepening chain.
+  </p>
+
+  <h2 id="sec-recap">14.7 Chapter recap</h2>
+  <ul>
+    <li><code>ctx.subagents</code> is a multi-provider registry seam (modeled on <code>ctx.llm</code>, not single-service bash): six registered names — spawn / fork / acp / codex / claude-code / dsh-sdk — plus the shared in-process-driver.</li>
+    <li>The provider contract makes <code>start()</code> the ownership-transfer boundary: before fulfill the provider rolls back; after fulfill the caller must <code>dispose()</code>; the four capabilities are validated before startup, and a missing one refuses loudly.</li>
+    <li>The fork seed is the contiguous prefix up to the last <code>turn/end</code> — the subagent always gets a balanced session; the seed gives history only, no tool restrictions or permissions.</li>
+    <li>Three tool families: <code>tool-subagent</code> (per-provider launch, one-shot/continuable background modes), <code>tool-subagent-control</code> (send_message / interrupt_agent / list_agents), <code>tool-subagent-report</code> (in-scope report return, surviving toolFilter).</li>
+    <li>Lineage = <code>SessionHeader.parentSession</code> + <code>delegationDepth</code> (authoritative, monotonic, durable); the depth cap guards against runaway recursion; lineage is data, not visibility.</li>
+    <li>The delegation boundary fixes the subagent's permissions: approval pinned to 'never', sandbox overrides snapshotted into events written to the child log, and the subagent receives the <code>subagent:delegation</code> statement.</li>
+    <li>A continuable subagent = durable Session + process-local Activation; the inbox is the only FIFO, and the settlement notification is delivered unconditionally.</li>
+    <li>The Ralph loop = a sequence of brand-new subagents + bounded structured handoff + the workspace as long-term memory, all built on two existing seams.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming a subagent seam works like bash with one implementation — <code>ctx.subagents</code> is a named registry with coexisting providers, bound one tool instance at a time.</li>
+      <li>Expecting send_message to interrupt the subagent's current turn — it only queues as the next FIFO turn; to stop the current turn use <code>interrupt_agent</code>, which does not dispose the subagent.</li>
+      <li>Treating <code>parentSession</code> as visibility — lineage only serves delivery authorization and directories; sibling subagents cannot see each other, and nobody but fork sees the parent session.</li>
+      <li>Assuming <code>toolFilter</code> is a permission boundary — it is a visibility/composition restriction; the subagent's permission boundary is fixed at delegation time by the delegated policy.</li>
+      <li>Configuring a fork subagent in continuable mode — the shipped compositions all bind fork to one-shot: the in-scope report tool would break the byte-level prefix the KV cache needs.</li>
+      <li>Treating Ralph's complete as independent verification — it is the last round's working agent self-report; the renderer marks this explicitly.</li>
+      <li>Expecting an ACP subagent to appear in <code>list_agents</code> — an ACP run has no local child session and is not in the trace-enumerable directory.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="14">
+    <h2>Chapter 14 Test</h2>
+
+    <div class="q" data-id="14-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Multiple named providers coexist in the same context; the registry shape follows the LLM adapter registry, not the single-service bash executor."
+         data-rationale="B is correct. A describes ctx.shell's single-service shape. C is wrong — system-prompt assembly has nothing to do with provider registration. D is wrong — the opposite: coexistence is its defining trait (stated at the top of docs/subsystems/subagent.md)."
+         data-review="sec-subagent-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> What is the key structural difference between ctx.subagents and the bash execution seam?</div>
+      <label class="opt"><input type="radio" name="q-14-1" value="a"> A. It has no Service Definition, only tools</label>
+      <label class="opt"><input type="radio" name="q-14-1" value="b"> B. It is a named provider registry: multiple implementations coexist, while bash allows exactly one executor</label>
+      <label class="opt"><input type="radio" name="q-14-1" value="c"> C. Its provider is decided by system-prompt assembly</label>
+      <label class="opt"><input type="radio" name="q-14-1" value="d"> D. It forbids multiple coexisting providers to prevent session drift</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The contiguous prefix up to the last turn/end: the parent's in-progress turn has no paired results, and copying it verbatim would hand the subagent an unbalanced, illegal session."
+         data-rationale="C is correct. A is wrong — the raw log contains tool calls without results, which is unbalanced. B would miss completed turns. D describes no such mechanism: the seed is a one-shot snapshot, and the parent log never enters the child context afterwards."
+         data-review="sec-providers">
+      <div class="prompt"><span class="qnum">Q2.</span> What is the seed that the fork provider gives the subagent?</div>
+      <label class="opt"><input type="radio" name="q-14-2" value="a"> A. The parent session's complete raw log, including the turn in progress</label>
+      <label class="opt"><input type="radio" name="q-14-2" value="b"> B. Only a task instruction, with no history at all</label>
+      <label class="opt"><input type="radio" name="q-14-2" value="c"> C. The contiguous prefix up to the last turn/end — all completed turns, zero in-progress content</label>
+      <label class="opt"><input type="radio" name="q-14-2" value="d"> D. A live stream of the parent session: the subagent keeps seeing new parent log entries</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A, C, and D are correct: subprocess-e2b is not on the list (it replaces a ctx.subprocess provider, not a subagent provider); the other six names are all registered. B is wrong — in-process-driver is the shared run driver, not a registry member."
+         data-review="sec-providers">
+      <div class="prompt"><span class="qnum">Q3.</span> Which of the following are provider names in the ctx.subagents registry? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="a"> A. spawn and fork</label>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="b"> B. in-process-driver</label>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="c"> C. acp, codex, claude-code</label>
+      <label class="opt"><input type="checkbox" name="q-14-3" value="d"> D. dsh-sdk</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A — start() fulfillment is the ownership-transfer boundary: before it the provider must roll back unpublished resources; after it the caller owns the run and must dispose() on every path."
+         data-rationale="A is correct. B is wrong — dispose is the caller's duty, and provider unloading does not reclaim a published run either. C is wrong — subagent-level failures resolve with a stopReason other than completed. D is wrong — the opposite: capabilities are validated before startup, and a missing one refuses loudly."
+         data-review="sec-subagent-seam">
+      <div class="prompt"><span class="qnum">Q4.</span> What are the ownership semantics of the provider contract <code>start(request)</code>?</div>
+      <label class="opt"><input type="radio" name="q-14-4" value="a"> A. Before fulfill the provider rolls back; after fulfill the caller owns the run and must dispose()</label>
+      <label class="opt"><input type="radio" name="q-14-4" value="b"> B. The provider disposes automatically after the run ends; the caller need not care</label>
+      <label class="opt"><input type="radio" name="q-14-4" value="c"> C. On subagent failure the result must reject</label>
+      <label class="opt"><input type="radio" name="q-14-4" value="d"> D. With insufficient capabilities, create the subagent first and silently degrade</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-5" data-type="mcq" data-correct='["d"]'
+         data-answer="D — report takes no recipient parameter: exec.agent is the sender credential, and the service derives the single recipient (the Agent that launched it) from the subagent's durable parentSession."
+         data-rationale="D is correct. A is wrong — it is precisely not in the tool schema; the recipient is derived. B is wrong — that is send_message's direction; report goes child to parent. C describes no such mechanism and contradicts the design: the in-scope registration is meant to survive toolFilter, keeping the return channel undeletable."
+         data-review="sec-subagent-tools">
+      <div class="prompt"><span class="qnum">Q5.</span> When a continuable subagent calls <code>report</code>, who receives the report?</div>
+      <label class="opt"><input type="radio" name="q-14-5" value="a"> A. Any agent the model names in a parameter</label>
+      <label class="opt"><input type="radio" name="q-14-5" value="b"> B. The nearest arbitrary ancestor, chosen at runtime</label>
+      <label class="opt"><input type="radio" name="q-14-5" value="c"> C. toolFilter can remove report from the subagent's tool surface</label>
+      <label class="opt"><input type="radio" name="q-14-5" value="d"> D. The Agent that launched it: derived from the subagent's durable parentSession, with no recipient parameter needed or accepted</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A, B, and D are correct: depth is authoritative and monotonic (may only deepen), maxDepth defaults to 3 with 0 forbidding delegation, and refusals surface as error tool results (the tool stays visible at the cap). C is wrong — that priority ladder belongs to explicit approvals/session sandbox-mode events and has nothing to do with depth; depth comes only from parent depth plus one."
+         data-review="sec-lineage">
+      <div class="prompt"><span class="qnum">Q6.</span> About delegationDepth, which statements hold? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="a"> A. The durable SessionHeader.delegationDepth is authoritative and monotonic: runtime may only deepen, never shallow it</label>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="b"> B. tool-subagent's maxDepth defaults to 3, and 0 forbids delegation</label>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="c"> C. A subagent can lower its inherited depth if the task is simpler</label>
+      <label class="opt"><input type="checkbox" name="q-14-6" value="d"> D. At the cap the tool remains, and the refused derivation returns an error tool result</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B — It only states whether the subagent can see the parent session's completed conversation history (fork sees it, spawn doesn't); it does not mean inheriting tools, services, or permissions."
+         data-rationale="B is correct: the glossary-precise formulation. A treats a descriptive field as an enforcement mechanism. C is wrong — tool restrictions are configured explicitly via toolFilter, not derived from parentSession. D is wrong — the authorization credentials are the live Agent identity and the durable parentSession, not this field."
+         data-review="sec-lineage">
+      <div class="prompt"><span class="qnum">Q7.</span> What does lineage is data, not visibility mean?</div>
+      <label class="opt"><input type="radio" name="q-14-7" value="a"> A. parentSession lets the subagent automatically read the parent session log</label>
+      <label class="opt"><input type="radio" name="q-14-7" value="b"> B. inheritsParentContext is only descriptive: it says whether the completed parent history is visible, not that tools, services, or permissions are inherited</label>
+      <label class="opt"><input type="radio" name="q-14-7" value="c"> C. A subagent with parentSession recorded automatically gains the parent's tool allowlist</label>
+      <label class="opt"><input type="radio" name="q-14-7" value="d"> D. The lineage fields are the only authorization credentials, and the runtime no longer verifies callers</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The subagent's approval policy is pinned to never: any ask (such as a sandbox_permissions escalation) is refused deterministically instead of waiting on a prompt nobody is watching."
+         data-rationale="C is correct. A reverses the direction. B is wrong — the deployment-default sandbox is never copied: a parent that never switched writes no sandbox/mode, and the subagent dynamically follows the deployment default. D is wrong — every in-process subagent receives the subagent:delegation statement saying the scope is fixed and that needing more permission means reporting the limitation, not retrying."
+         data-review="sec-providers">
+      <div class="prompt"><span class="qnum">Q8.</span> A delegated subagent requests a sandbox_permissions escalation. What happens?</div>
+      <label class="opt"><input type="radio" name="q-14-8" value="a"> A. An approval prompt appears and waits for the user's decision</label>
+      <label class="opt"><input type="radio" name="q-14-8" value="b"> B. It inherits the parent session's current policy and retries</label>
+      <label class="opt"><input type="radio" name="q-14-8" value="c"> C. Refused deterministically: the delegation boundary pins approval to never, and the subagent should only report the limitation</label>
+      <label class="opt"><input type="radio" name="q-14-8" value="d"> D. Silently allowed once to keep the flow moving</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-9" data-type="fill"
+         data-accepted='["Activation","activation","activation 纪元"]'
+         data-answer="Activation (the process-local residence epoch of which a subagent's durable Session has at most one)."
+         data-rationale="Activation is not a request, Task, or result boundary; the Agent inbox is the only turn queue, follow-ups queue via Agent.followup(), in-residence ones receive directly, and out-of-residence ones cold-recover. Answering Task or run confuses a one-shot run with a residence epoch."
+         data-review="sec-continuable">
+      <div class="prompt"><span class="qnum">Q9.</span> Fill in the blank: a continuable subagent has a durable Session plus at most one process-local ______ — one residence epoch of the reconstructed child Agent.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-10" data-type="mcq" data-correct='["a"]'
+         data-answer="A — send_message becomes the subagent's next FIFO turn via Agent.followup(): the turn in progress is unaffected, and the message waits for it to finish."
+         data-rationale="A is correct. B is interrupt_agent's semantics (and it neither disposes the subagent nor stops published descendants from running). C is wrong — this call does not return the subagent's reply; the transcript is the source of what it did. D is wrong — a delivery failure is an error tool result stating plainly that the message was not delivered."
+         data-review="sec-subagent-tools">
+      <div class="prompt"><span class="qnum">Q10.</span> While a subagent is running a long task, the parent send_messages a new instruction. What happens?</div>
+      <label class="opt"><input type="radio" name="q-14-10" value="a"> A. The message queues as the next FIFO turn; it gets its turn only after the current one finishes</label>
+      <label class="opt"><input type="radio" name="q-14-10" value="b"> B. The current turn is aborted immediately and replaced with the new instruction</label>
+      <label class="opt"><input type="radio" name="q-14-10" value="c"> C. This call returns the subagent's reply</label>
+      <label class="opt"><input type="radio" name="q-14-10" value="d"> D. The message is silently dropped</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-11" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B, C, D."
+         data-rationale="B, C, and D are correct: Ralph is an ordinary plugin on ctx.workflowEngine + ctx.subagents, the workspace is the long-term memory, and complete is the working agent's self-report rather than a verification. A is wrong — every round is a brand-new subagent (inheritsParentContext must be false) inheriting no conversation; option A describes the opposite of the design."
+         data-review="sec-ralph">
+      <div class="prompt"><span class="qnum">Q11.</span> About the Ralph loop, which statements hold? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="a"> A. Each round's subagent inherits the parent's full conversation for continuity</label>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="b"> B. It is an ordinary plugin: built on ctx.workflowEngine and ctx.subagents, with no Ralph mode in agent-loop</label>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="c"> C. The workspace is the long-term memory; the parent conversation and earlier child sessions are never seeded</label>
+      <label class="opt"><input type="checkbox" name="q-14-11" value="d"> D. Inter-round state travels only through the bounded structured handoff (status/summary/evidence/next steps/blocker)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-12" data-type="fill"
+         data-accepted='["spawn","spawn provider","subagentProvider: spawn"]'
+         data-answer="spawn (the default value of tool-ralph's subagentProvider config)."
+         data-rationale="Ralph requires a provider that supports structured output and reports inheritsParentContext: false; spawn is the default. fork fails the latter (it carries parent history), and remote backends such as acp can be configured but are not the default."
+         data-review="sec-ralph">
+      <div class="prompt"><span class="qnum">Q12.</span> Fill in the blank: each Ralph round starts a brand-new subagent through the configured subagentProvider; the default provider is ______.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="14-13" data-type="short"
+         data-key-points='["ctx.subagents is a named provider registry with six backends coexisting under one contract","The fork/spawn seed boundary (the prefix up to the last turn/end) and the shared in-process-driver","The three tool families: launch (per-provider binding) / control (send_message and friends) / report (in-scope report)","Lineage and depth: parentSession + delegationDepth authoritative, monotonic, durable; lineage is data, not visibility","Ralph: brand-new subagents + bounded structured handoff + the workspace as long-term memory"]'
+         data-answer="Organize around three lines. Structurally, ctx.subagents is a multi-provider registry (spawn/fork/acp/codex/claude-code/dsh-sdk coexisting, sharing the in-process-driver), with three tool families handling launch, parent-to-child control, and child-to-parent reporting. As data, each derivation writes parentSession and delegationDepth=parent+1 into the child session header (authoritative, monotonic, durable); exceeding the depth cap refuses derivation, and lineage only serves delivery authorization and directories, never visibility. As policy, Ralph starts a brand-new subagent every round, passes only the bounded structured handoff, and uses the shared workspace as long-term memory."
+         data-rationale="With structure + lineage data + Ralph policy all present, you hold the full picture of the delegation world; the next chapter turns to pressure of another dimension — context."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> In your own words, summarize: the delegation seam's structure (provider lineage and tool division of labor), the semantics of the lineage data, and what the Ralph loop uses in place of conversational memory.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check a point only if your answer truly covers it — under-checking hurts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="15-context-pressure.html"><strong>Chapter 15 · Context Pressure Management</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 3 · Assembling a Runtime — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 3 · Runtime Assembly</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/03-runtime-assembly.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="3">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 3 · Part I · Landscape and Mental Models</div>
+    <h1>Assembling a Runtime: boot, profiles, bundles, patch layers</h1>
+    <p class="lede">
+      You type <code>dsh web</code>, press Enter, the browser opens — and in those few seconds a
+      plugin tree grew from nothing. This chapter traces that growth: the profile decides which
+      layers stack, a bundle is each layer's distribution format, and patches rewrite rows layer
+      by layer by id. After this chapter you can explain every plugin row running inside any dsh
+      process on your machine.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>Break one dsh launch into: pick a profile → stack bundle layers per <code>dsh.profile</code> → apply patch layers → Loader mounts</li>
+      <li>State the role of each file in a profile directory (<code>$DSH_HOME/profiles/&lt;name&gt;/</code>)</li>
+      <li>Explain what a bundle is and why <code>dsh-base</code> is the first layer of every profile</li>
+      <li>Predict a row's final config from the correct layer order (bundle → profile patch → home patch → <code>--patch</code>)</li>
+      <li>Inspect the composed result with your own eyes via <code>--dump-config</code> and write your first <code>cordis.patch.yml</code></li>
+    </ul>
+  </div>
+
+  <h2 id="sec-boot-overview">3.1 Boot is assembly</h2>
+
+  <p>
+    First, correct an assumption you might carry in: dsh is not 「one compiled big program that
+    loads all its features at startup」. The accurate statement is the architecture document's
+    first sentence: <strong>a running dsh is a plugin tree assembled at boot from ordered
+    layers</strong>. Each row in the tree is a plugin — the kind from Chapter 2, with
+    <code>inject</code>, a key in <code>ctx</code>, and events for communication.
+  </p>
+
+  <p>Break <code>dsh web</code> into steps:</p>
+
+  <ol>
+    <li><strong>Pick the profile</strong>: the launcher (<code>apps/cli</code>) parses its own flags and determines it will start the <code>web</code> profile;</li>
+    <li><strong>Resolve the layer list</strong>: read the profile's <code>dsh.profile</code> to get an ordered bundle list;</li>
+    <li><strong>Compose the entry list</strong>: start from an <strong>empty list</strong>, each bundle contributes a batch of plugin rows, then your patch layers go on top;</li>
+    <li><strong>Mount</strong>: the Cordis Loader mounts these rows according to <code>inject</code> dependencies (Chapter 2's mechanism);</li>
+    <li><strong>Assert</strong>: boot glue (<code>packages/boot/app-boot</code>) verifies that every enabled row actually activated — anything that failed to mount is named in the error.</li>
+  </ol>
+
+  <p>
+    This chapter's protagonists are steps 2 and 3: where layers come from, in what order they
+    stack, and who overrides whom. Steps 4 and 5 are covered in Chapter 18 (CLI and boot).
+  </p>
+
+  <h2 id="sec-profiles">3.2 Profiles: named compositions in the Harness home</h2>
+
+  <p>
+    <strong>A profile is a named composition stored in the Harness home.</strong> The Harness home
+    is set by the environment variable <code>$DSH_HOME</code>, defaulting to <code>~/.dsh</code>.
+    Each profile occupies one directory:
+  </p>
+
+  <pre><code>~/.dsh/                       <span class="code-comment"># Harness home ($DSH_HOME, default ~/.dsh)</span>
+├── cordis.patch.yml         <span class="code-comment"># home-level patch layer (above all profiles, global to your machine)</span>
+└── profiles/
+    └── web/                 <span class="code-comment"># one profile = one directory</span>
+        ├── package.json     <span class="code-comment"># dsh.profile (the bundle order list) + out-of-tree plugin dependencies</span>
+        └── cordis.patch.yml <span class="code-comment"># this profile's own patch layer</span></code></pre>
+
+  <p>The <code>package.json</code> in a profile directory serves two purposes:</p>
+
+  <ul>
+    <li>The <code>dsh.profile</code> field: an <strong>ordered</strong> bundle list whose order is the layer order;</li>
+    <li><code>dependencies</code>: where your own (out-of-tree) plugins get installed, managed for you by the <code>dsh plugin</code> command.</li>
+  </ul>
+
+  <p>
+    <code>web</code> and <code>headless</code> ship with the product as templates and initialize
+    automatically on first use; other names do not exist out of thin air — you must first create
+    one and install plugins with <code>dsh plugin --profile &lt;name&gt; &lt;pnpm args&gt;</code>.
+    Launching a nonexistent profile fails on the spot (fails loud, see 3.6).
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Both 「one-shot」 and 「long-lived」 start here</div>
+    <p>
+      Chapter 1's two forms line up here: <code>dsh web</code> starts the web profile (a long-lived
+      browser app); <code>dsh --profile headless "task"</code> starts the headless profile (a
+      one-shot runner that exits when done). They are not two programs but two different layer
+      stacks.
+    </p>
+  </div>
+
+  <h2 id="sec-bundles">3.3 Bundles: installable layers</h2>
+
+  <p>
+    <strong>A bundle is a distribution format: an npm package carrying a batch of Cordis
+    configuration rows plus the code those rows mount.</strong> The key is 「distribution format」 —
+    rows a bundle inserts hold no privilege; like any other row they can be rewritten by id from
+    the layers <strong>above it</strong>. That is exactly the property the architecture document
+    stresses: everything a bundle inserts stays modifiable by patches from higher layers.
+  </p>
+
+  <p>How does a package declare itself a bundle? Point at a patch file under the <code>dsh</code> field in <code>package.json</code>:</p>
+
+  <pre><code><span class="code-comment">// packages/bundle/base/package.json (illustrative)</span>
+{
+  <span class="code-str">"name"</span>: <span class="code-str">"@deepseek-ai/dsh-base"</span>,
+  <span class="code-str">"dsh"</span>: {
+    <span class="code-str">"bundle"</span>: { <span class="code-str">"patch"</span>: <span class="code-str">"./cordis.patch.yml"</span> }
+  }
+}</code></pre>
+
+  <p>The product ships three bundles, each with a distinct role:</p>
+
+  <table>
+    <thead>
+      <tr><th>bundle</th><th>Role</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@deepseek-ai/dsh-base</code></td>
+        <td><strong>The first layer of every profile</strong> (about 78 rows): model adapters (<code>llm-deepseek</code>), default model selection (<code>agent-default-model</code>), tools (including <code>tool-bash</code>), persistence (<code>session-persistence-jsonl</code>), sandbox and approval policy (<code>bash-sandbox</code> and friends), settings, credentials, telemetry. However customized a profile is, it stacks upward from this layer.</td>
+      </tr>
+      <tr>
+        <td><code>@deepseek-ai/dsh-web-app</code></td>
+        <td>Adds the browser app on top of base: the web server, API gateway, workspace, the full set of browser plugins, and the coding persona (system-prompt's persona is set in this layer, not in base).</td>
+      </tr>
+      <tr>
+        <td><code>@deepseek-ai/dsh-headless</code></td>
+        <td>Adds the one-shot runner on top of base: HMR disabled, the Code Mode worker mounted, and <strong>no</strong> Host, HTTP server, or browser plugin at all.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    Why does persona live in web-app rather than base? Because base's rows are shared by every
+    mode while persona is a mode-specific value — dsh's layering discipline: mode-specific values
+    live in the mode's bundle, and base stays neutral. The cost and payoff of that discipline
+    show up immediately in patch semantics.
+  </p>
+
+  <h2 id="sec-layer-order">3.4 Layer order: from the empty list to the final tree</h2>
+
+  <p>
+    All layers stack onto <strong>the same empty entry list</strong>, in a fixed order:
+  </p>
+
+  <ol>
+    <li>The <strong>bundles</strong> the profile lists, in the order written in <code>dsh.profile.bundles</code> (e.g. base → web-app);</li>
+    <li>The profile's own <code>cordis.patch.yml</code>;</li>
+    <li>The home-level <code>$DSH_HOME/cordis.patch.yml</code>;</li>
+    <li>The command-line <code>--patch</code> overlay (if any).</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Patch layer stacking order">
+      <rect x="90" y="300" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="310" y="319" text-anchor="middle" style="fill:var(--fg-dim)" font-size="12" font-weight="700">Empty entry list</text>
+      <text x="310" y="336" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Everything starts here</text>
+
+      <rect x="90" y="240" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="310" y="259" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Bundle layer 1: dsh-base (about 78 rows: model adapters · tools · persistence · sandbox &amp; approval · settings/credentials · telemetry)</text>
+      <text x="310" y="276" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">The first layer of every profile</text>
+
+      <rect x="90" y="180" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="310" y="199" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Bundle layer 2: dsh-web-app (Web host · API gateway · browser plugins · persona)</text>
+      <text x="310" y="216" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">In the order written in dsh.profile.bundles</text>
+
+      <rect x="90" y="120" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="310" y="139" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Profile's cordis.patch.yml (~/.dsh/profiles/web/)</text>
+      <text x="310" y="156" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">This profile's own rewrites</text>
+
+      <rect x="90" y="60" width="440" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="310" y="79" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Home-level cordis.patch.yml ($DSH_HOME/)</text>
+      <text x="310" y="96" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">Global rewrites for your machine</text>
+
+      <rect x="90" y="10" width="440" height="36" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="310" y="32" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">--patch overlay (a transient command-line layer)</text>
+
+      <line x1="560" y1="344" x2="560" y2="30" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="560,30 555,40 565,40" style="fill:var(--muted)"/>
+      <text x="578" y="200" style="fill:var(--fg-dim)" font-size="11">Later application wins</text>
+      <text x="578" y="218" style="fill:var(--fg-dim)" font-size="11">(for one id, the last writer wins)</text>
+    </svg>
+    <figcaption>Layer order: empty entry list → bundles (in the order the profile lists) → profile patch → home patch → --patch overlay. Patches locate rows by id and either replace the whole row or insert new ones; for the same row, the layer written later wins.</figcaption>
+  </figure>
+
+  <p>
+    A 「patch」 can do two things, and only two things:
+  </p>
+
+  <ul>
+    <li><strong>Replace a row's entire config by id</strong> — note this is <strong>whole-row replacement, no deep merge</strong>.
+      Fields you want to keep must be restated verbatim; omitted fields are gone. This is not laziness but intent: whole-row
+      replacement means a row's final form is determined solely by 「the last layer that touched it」, with no multi-layer
+      merge arithmetic in your head.</li>
+    <li><strong>insert adds new rows</strong> — new plugins (your own or third-party installed) enter the tree here.</li>
+  </ul>
+
+  <p>
+    A real example (<code>packages/bundle/web-app/cordis.patch.yml</code>, excerpt) — as the later
+    layer, web-app rewrites rows already present in base and inserts its own new rows:
+  </p>
+
+  <pre><code><span class="code-comment"># packages/bundle/web-app/cordis.patch.yml (excerpt)</span>
+- <span class="code-key">id</span>: <span class="code-str">system-prompt</span>          <span class="code-comment"># replaces the entire config of this row from base</span>
+  <span class="code-key">config</span>:
+    <span class="code-key">persona</span>: <span class="code-str">&gt;-
+      You are a coding agent powered by the {{model}} model.
+      Your working directory is {{cwd}}.</span>
+
+- <span class="code-key">id</span>: <span class="code-str">hmr</span>                     <span class="code-comment"># or simply disable this row</span>
+  <span class="code-key">disabled</span>: <span class="code-key">true</span>
+
+- <span class="code-key">insert</span>:                        <span class="code-comment"># insert new rows only web needs</span>
+  - <span class="code-key">id</span>: <span class="code-str">storage</span>
+    <span class="code-key">name</span>: <span class="code-str">'@deepseek-ai/dsh-storage'</span>
+  …</code></pre>
+
+  <div class="demo" data-demo="patchLayers">
+    <div class="demo-title">Try it — how patch layers stack</div>
+    <p>dsh-base already holds 3 plugin rows; click to stack the profile's cordis.patch.yml on top:</p>
+    <button data-run>Apply patch layer</button>
+    <div class="demo-output empty">Click to see the final plugin tree.</div>
+  </div>
+
+  <div class="box key">
+    <div class="box-title">How to predict a row's final config</div>
+    <p>
+      Scan the layer order bottom-up and find the <strong>last</strong> layer that touches this id:
+      if it replaced the config, the final config is exactly what it wrote (any field it did not
+      restate falls back to the plugin code's default, not to a lower layer's value); if nobody
+      touched it, the original value from the bundle's insert applies. 「Last write wins」 operates
+      per row — different rows can come from different layers.
+    </p>
+  </div>
+
+  <h2 id="sec-dump-config">3.5 See it yourself: dump your tree</h2>
+
+  <p>No need to simulate in your head. This command prints the composed result verbatim and <strong>starts nothing</strong>:</p>
+
+  <pre><code>dsh --profile web --dump-config</code></pre>
+
+  <p>
+    It composes offline with <strong>exactly the same</strong> resolution and patch algorithms as a
+    real boot (so what it prints necessarily matches what you would start), and <code>!!js</code>
+    expressions are preserved verbatim. The architecture document's next sentence is this
+    chapter's key: any row it prints can be replaced by your own patch.
+  </p>
+
+  <p>Write your first patch. In <code>~/.dsh/profiles/web/cordis.patch.yml</code> (illustrative):</p>
+
+  <pre><code><span class="code-comment"># ~/.dsh/profiles/web/cordis.patch.yml (illustrative)</span>
+- <span class="code-key">id</span>: <span class="code-str">agent-default-model</span>     <span class="code-comment"># this row in base was originally deepseek-v4-flash</span>
+  <span class="code-key">config</span>:
+    <span class="code-key">provider</span>: <span class="code-str">deepseek-official</span>
+    <span class="code-key">model</span>: <span class="code-str">deepseek-v4-pro</span>       <span class="code-comment"># whole-row replace: both fields restated</span>
+
+- <span class="code-key">insert</span>:                        <span class="code-comment"># mount one more plugin of your own</span>
+  - <span class="code-key">id</span>: <span class="code-str">my-weather</span>
+    <span class="code-key">name</span>: <span class="code-str">'@your-scope/dsh-my-weather'</span></code></pre>
+
+  <p>
+    Save it and run <code>--dump-config</code> again, then diff the outputs: the
+    <code>agent-default-model</code> row changed and <code>my-weather</code> appeared. Changing
+    the running product required forking no code — this is what Chapter 2's 「no privileged core
+    to patch」 feels like in your hands.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="patches replace whole rows by id and insert new rows">
+      <text x="110" y="30" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Before patching (dsh-base)</text>
+      <rect x="30" y="46" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="69" text-anchor="middle" style="fill:var(--fg)" font-size="11">agent-default-model</text>
+      <rect x="30" y="90" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="113" text-anchor="middle" style="fill:var(--fg)" font-size="11">tool-bash</text>
+      <rect x="30" y="134" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="110" y="157" text-anchor="middle" style="fill:var(--fg)" font-size="11">session-persistence-jsonl</text>
+      <text x="110" y="200" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">model: deepseek-v4-flash</text>
+
+      <rect x="255" y="60" width="170" height="110" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="340" y="88" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">cordis.patch.yml</text>
+      <text x="340" y="112" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">- id: agent-default-model</text>
+      <text x="340" y="128" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">    config: model: deepseek-v4-pro</text>
+      <text x="340" y="144" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">- insert: my-weather</text>
+      <line x1="195" y1="115" x2="250" y2="115" style="stroke:var(--accent)" stroke-width="2"/>
+      <polygon points="250,115 241,110 241,120" style="fill:var(--accent)"/>
+      <line x1="425" y1="115" x2="480" y2="115" style="stroke:var(--accent)" stroke-width="2"/>
+      <polygon points="480,115 471,110 471,120" style="fill:var(--accent)"/>
+
+      <text x="570" y="30" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">After patching (final tree)</text>
+      <rect x="490" y="46" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="570" y="63" text-anchor="middle" style="fill:var(--accent)" font-size="11" font-weight="700">agent-default-model</text>
+      <text x="570" y="77" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">← whole row replaced</text>
+      <rect x="490" y="90" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="570" y="113" text-anchor="middle" style="fill:var(--fg)" font-size="11">tool-bash</text>
+      <rect x="490" y="134" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="570" y="157" text-anchor="middle" style="fill:var(--fg)" font-size="11">session-persistence-jsonl</text>
+      <rect x="490" y="178" width="160" height="36" rx="6" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="570" y="195" text-anchor="middle" style="fill:var(--pass)" font-size="11" font-weight="700">my-weather</text>
+      <text x="570" y="209" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">← newly inserted</text>
+      <text x="570" y="240" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">model: deepseek-v4-pro</text>
+
+      <text x="340" y="280" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10" font-style="italic">Patches locate by id; what is replaced is the whole row's config (no deep merge), and insert adds new rows</text>
+    </svg>
+    <figcaption>A patch's two actions: whole-row replacement by id (agent-default-model) and inserting a new row (my-weather). Every other row passes through unchanged.</figcaption>
+  </figure>
+
+  <h2 id="sec-fails-loud">3.6 Fails loud; takes effect on save</h2>
+
+  <p>
+    The assembly mechanism is this flexible — what happens on error? dsh's position is a principle
+    that runs through the repository: <strong>misconfiguration fails loud</strong>. Errors provable
+    at load time are reported at load time; boot's startup glue tears down the half-mounted tree
+    and refuses to start rather than limping along crippled. Applied to this chapter's mechanisms:
+  </p>
+
+  <ul>
+    <li>The profile list names a package with <strong>no bundle declaration</strong> → resolution fails, naming it;</li>
+    <li><code>cordis.patch.yml</code> is an <strong>empty file or comments only</strong> → it throws outright (it parses as nothing-at-all rather than an empty list; to disable this layer, write <code>[]</code>);</li>
+    <li>A patch points at an <strong>id not in the tree</strong> → an stderr warning (hinting you may have mistyped the id);</li>
+    <li>A row is declared but never activates (a dependency service stays absent) → the startup assertion names every plugin that failed to mount.</li>
+  </ul>
+
+  <p>
+    One more, crucial for the development experience: every profile startup <strong>watches your
+    patch files for changes</strong> (HMR watch). Save <code>cordis.patch.yml</code> and the tree
+    re-assembles in place under the same layer order; if the new content is unreadable or
+    unparseable, <strong>the last good tree keeps running</strong> and the failure is broadcast —
+    one slip of the hand cannot crash the running session.
+  </p>
+
+  <p>
+    A real case that shows the value of failing loud: base's patch gates two shell sets with a
+    platform expression — <code>tool-bash</code>/<code>bash-sandbox</code> carry
+    <code>disabled: !!js process.platform === 'win32'</code> (bash has no Windows runner), and
+    their twin rows <code>tool-pwsh</code>/<code>pwsh-sandbox</code> the reverse. To restore bash
+    on your machine you must complete the whole recipe (disable both pwsh rows and enable both
+    bash rows); do only half and the two executor families register the same
+    <code>bash</code> service — loading fails on the spot and tells you why. Succeeding halfway
+    silently, leaving a half-crippled tree, is the worst outcome a system like this can have.
+  </p>
+
+  <h2 id="sec-recap">3.7 Chapter recap</h2>
+
+  <ul>
+    <li>A running dsh = a plugin tree assembled at boot from ordered layers: pick profile → stack bundles per <code>dsh.profile</code> → apply patches → the Loader mounts per <code>inject</code> dependencies → startup assertion.</li>
+    <li>A profile is a named composition in the Harness home (<code>$DSH_HOME</code>, default <code>~/.dsh</code>): under <code>profiles/&lt;name&gt;/</code>, a <code>package.json</code> (<code>dsh.profile</code> bundle order list + plugin dependencies) and a <code>cordis.patch.yml</code>. <code>web</code> and <code>headless</code> ship as product templates and initialize automatically on first use; other profiles are created with <code>dsh plugin</code>.</li>
+    <li>A bundle = a distribution format of Cordis config rows plus mounted code; <code>package.json</code>'s <code>dsh.bundle</code> field points at the patch file; the rows it inserts remain rewritable from layers above.</li>
+    <li><code>dsh-base</code> is the first layer of every profile: model adapters, default model, tools, persistence, sandbox and approval policy, settings, credentials, telemetry. <code>dsh-web-app</code> adds the browser app; <code>dsh-headless</code> adds the one-shot runner with no server.</li>
+    <li>Layer order: empty entry list → bundles (in the profile's listed order) → profile patch → home-level patch → <code>--patch</code> overlay. Patches locate by id and either <strong>whole-row replace</strong> (no deep merge; kept fields must be restated) or <code>insert</code> new rows; for the same row, the later layer wins.</li>
+    <li><code>dsh --profile web --dump-config</code> prints the composed result offline with the same algorithms as boot; any printed row can be replaced by your patch. HMR watches patch files: save to re-assemble; broken content keeps the last good tree.</li>
+    <li><strong>Fails loud</strong>: no bundle declaration, empty or comments-only patch files, a half-finished shell-restore recipe… all error at load time, never leaving silent damage.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Assuming patches deep-merge — an id patch replaces the <strong>entire row's</strong> config; fields you keep must be restated verbatim.</li>
+      <li>Editing <code>packages/bundle/base/cordis.patch.yml</code> to change product behavior — that is a released artifact; your rewrites belong in profile / home patch layers, which win by layer order.</li>
+      <li>Launching a profile name that was never created — only <code>web</code> and <code>headless</code> auto-initialize; everything else needs <code>dsh plugin</code> first.</li>
+      <li>Assuming <code>--dump-config</code> starts services — it purely composes and prints offline, starting not one process.</li>
+      <li>Mistyping a patch id and ignoring stderr — a patch matching no row is a warning, not an error; the tree starts as usual and silently lacks the rewrite you thought you made.</li>
+      <li>Emptying <code>cordis.patch.yml</code> to disable a patch layer — an empty or comments-only file throws; writing <code>[]</code> is the explicit disable.</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="3">
+    <h2>Chapter 3 Test</h2>
+
+    <div class="q" data-id="3-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — A plugin tree assembled at boot from ordered layers."
+         data-rationale="C is correct — this is the architecture document's own sentence. A is wrong: there is no precompiled feature container; the tree is composed at boot. B is wrong: Chapter 2 covered a single plugin's shape and communication; this chapter covers how the tree grows. D is wrong: the process merely hosts the tree, and the comparison stops there."
+         data-review="sec-boot-overview">
+      <div class="prompt"><span class="qnum">Q1.</span> After you press Enter on <code>dsh web</code>, what is a 「running dsh」, essentially?</div>
+      <label class="opt"><input type="radio" name="q-3-1" value="a"> A. A big precompiled program that loads all features into memory at startup</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="b"> B. A single Cordis plugin</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="c"> C. A plugin tree assembled at boot from ordered layers</label>
+      <label class="opt"><input type="radio" name="q-3-1" value="d"> D. A set of mutually independent OS processes</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-2" data-type="fill" data-accepted='["~/.dsh",".dsh","$DSH_HOME 默认 ~/.dsh"]'
+         data-answer="~/.dsh (overridable via $DSH_HOME)."
+         data-rationale="The Harness home is set by $DSH_HOME and defaults to ~/.dsh; every profiles/&lt;name&gt;/ lives under it. Writing ~/.dsh suffices."
+         data-review="sec-profiles">
+      <div class="prompt"><span class="qnum">Q2.</span> Fill in the blank: when <code>$DSH_HOME</code> is unset, the Harness home defaults to <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — A package.json (dsh.profile's bundle order list + out-of-tree plugin dependencies) and a cordis.patch.yml."
+         data-rationale="B is correct: those two items are the whole profile. A is wrong: cordis.patch.yml is only half — the order list lives in package.json's dsh.profile. C is wrong: databases are managed by the session persistence plugin and are unrelated to profile structure. D is wrong: node_modules is what pnpm installs from dependencies, not a profile component."
+         data-review="sec-profiles">
+      <div class="prompt"><span class="qnum">Q3.</span> What goes in a profile directory?</div>
+      <label class="opt"><input type="radio" name="q-3-3" value="a"> A. Only a cordis.patch.yml</label>
+      <label class="opt"><input type="radio" name="q-3-3" value="b"> B. A <code>package.json</code> (<code>dsh.profile</code>'s bundle order list + plugin dependencies) and a <code>cordis.patch.yml</code></label>
+      <label class="opt"><input type="radio" name="q-3-3" value="c"> C. Database files and session logs</label>
+      <label class="opt"><input type="radio" name="q-3-3" value="d"> D. Only node_modules</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The browser app (Web host, API gateway, browser plugins, persona)."
+         data-rationale="C is correct: those belong to the dsh-web-app layer. A, B, and D are all in dsh-base — the first layer of every profile, providing model adapters, tools, persistence, sandbox and approval, settings/credentials/telemetry."
+         data-review="sec-bundles">
+      <div class="prompt"><span class="qnum">Q4.</span> Which of the following is <strong>not</strong> in <code>dsh-base</code>?</div>
+      <label class="opt"><input type="radio" name="q-3-4" value="a"> A. Model adapters (e.g. llm-deepseek)</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="b"> B. Tools and persistence</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="c"> C. The browser app (Web host, API gateway, browser plugins)</label>
+      <label class="opt"><input type="radio" name="q-3-4" value="d"> D. Sandbox and approval policy, settings, credentials, telemetry</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-5" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A, B, and D are correct: bundles apply in the order dsh.profile lists them, the profile patch precedes the home patch, and patches locate rows by id. C is backwards: the --patch overlay is the last-applied, highest-priority layer."
+         data-review="sec-layer-order">
+      <div class="prompt"><span class="qnum">Q5.</span> Which statements about layer order are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="a"> A. Bundles apply in the order <code>dsh.profile.bundles</code> lists them</label>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="b"> B. The profile's <code>cordis.patch.yml</code> takes effect before the home-level one</label>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="c"> C. The <code>--patch</code> overlay applies first</label>
+      <label class="opt"><input type="checkbox" name="q-3-5" value="d"> D. Patches locate rows by id</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Whole-row replacement: the id's entire config becomes the one the patch wrote, with no deep merge."
+         data-rationale="B is correct — and it is the easiest trap: fields you keep must be restated verbatim. A is wrong: there is no deep-merge layer. C is wrong: a patch can replace or insert; both actions exist. D is wrong: a given id has exactly one row; there is nothing to load in parallel."
+         data-review="sec-layer-order">
+      <div class="prompt"><span class="qnum">Q6.</span> When a patch line <code>- id: X</code> matches a row already in the tree, what is the effect?</div>
+      <label class="opt"><input type="radio" name="q-3-6" value="a"> A. Deep-merges with the original config; unmentioned fields keep their old values</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="b"> B. Whole-row replacement: the config becomes the patch's complete copy; fields not restated fall back to plugin defaults</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="c"> C. Can only disable a row, not change its config</label>
+      <label class="opt"><input type="radio" name="q-3-6" value="d"> D. Two rows with the same id appear, each loaded independently</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-7" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Make the file's content an empty list ([])."
+         data-rationale="C is correct: [] is an explicit empty patch list. A and B are both wrong: an empty or comments-only file parses as nothing-at-all rather than an empty list and throws outright. D is wrong: renaming only makes dsh ignore a different file; the original still occupies its place in the layer order, and that is not disable semantics anyway."
+         data-review="sec-fails-loud">
+      <div class="prompt"><span class="qnum">Q7.</span> You want to temporarily disable a profile's <code>cordis.patch.yml</code> layer. What is the correct way to write it?</div>
+      <label class="opt"><input type="radio" name="q-3-7" value="a"> A. Empty the file</label>
+      <label class="opt"><input type="radio" name="q-3-7" value="b"> B. Leave only comments</label>
+      <label class="opt"><input type="radio" name="q-3-7" value="c"> C. Write the file's content as <code>[]</code></label>
+      <label class="opt"><input type="radio" name="q-3-7" value="d"> D. Rename the file to cordis.patch.yml.bak</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-8" data-type="mcq" data-correct='["a"]'
+         data-answer="A — Composes offline and prints the final plugin tree, starting nothing; every printed row can be replaced by your patch."
+         data-rationale="A is correct: the dump uses the same resolution and patch algorithms as boot. B is wrong: it starts not one process or port. C is wrong: it changes no state. D is wrong: the dump is a local offline operation, unrelated to any API key."
+         data-review="sec-dump-config">
+      <div class="prompt"><span class="qnum">Q8.</span> What does <code>dsh --profile web --dump-config</code> do?</div>
+      <label class="opt"><input type="radio" name="q-3-8" value="a"> A. Composes offline with the same algorithms as boot, prints the final plugin tree, starts nothing</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="b"> B. Starts the web service and prints startup logs</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="c"> C. Writes the current tree back into cordis.patch.yml</label>
+      <label class="opt"><input type="radio" name="q-3-8" value="d"> D. Calls the LLM API to check model connectivity</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-9" data-type="mcq" data-correct='["d"]'
+         data-answer="D — A one-shot runner: run one fresh persisted session, print the final answer, exit; mount no Host, HTTP server, or browser plugin, and disable HMR."
+         data-rationale="D is correct. A is wrong: no server is headless's defining feature. B is wrong: the runner submits the task as an ordinary user message and the session is persisted. C is wrong: no browser plugins."
+         data-review="sec-bundles">
+      <div class="prompt"><span class="qnum">Q9.</span> What characterizes the <code>dsh-headless</code> bundle?</div>
+      <label class="opt"><input type="radio" name="q-3-9" value="a"> A. A long-lived HTTP server waiting for tasks</label>
+      <label class="opt"><input type="radio" name="q-3-9" value="b"> B. Sessions never touch disk; discarded when done</label>
+      <label class="opt"><input type="radio" name="q-3-9" value="c"> C. Mounts the full browser plugin set, just without printing a URL</label>
+      <label class="opt"><input type="radio" name="q-3-9" value="d"> D. A one-shot runner: no Host, no HTTP, no browser plugins, HMR disabled, exits when done</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-10" data-type="fill" data-accepted='["dsh.bundle","dsh","dsh.bundle.patch"]'
+         data-answer="dsh.bundle (whose patch field points at the patch file, e.g. ./cordis.patch.yml)."
+         data-rationale="Bundles declare under package.json's dsh field: dsh.bundle.patch points at the patch file; the profile-side counterpart is dsh.profile. Both dsh.bundle and dsh.bundle.patch count as correct."
+         data-review="sec-bundles">
+      <div class="prompt"><span class="qnum">Q10.</span> Fill in the blank: a bundle declares its patch file in <code>package.json</code> under the <code>______</code> field.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — An stderr warning: a hint that an id may be mistyped; the tree still starts with the remaining patches."
+         data-rationale="B is correct — documented behavior (a patch matching no row goes to warn). A is wrong: it is not fully silent; stderr carries the warning, and only not looking misses it. C is wrong: it does not constitute a load failure. D is wrong: there is no mechanism that auto-creates a row — insert is how rows are added."
+         data-review="sec-fails-loud">
+      <div class="prompt"><span class="qnum">Q11.</span> Your patch points at an id that does not exist in the tree. What happens?</div>
+      <label class="opt"><input type="radio" name="q-3-11" value="a"> A. Fully silent; nothing happens</label>
+      <label class="opt"><input type="radio" name="q-3-11" value="b"> B. stderr prints a warning; the tree starts normally with the remaining patches</label>
+      <label class="opt"><input type="radio" name="q-3-11" value="c"> C. Refuses to start, throwing a load error</label>
+      <label class="opt"><input type="radio" name="q-3-11" value="d"> D. Automatically creates an empty row with that id</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-12" data-type="mcq" data-correct='["c"]'
+         data-answer="C — The HMR watcher re-assembles in place under the same layer order; if the new content is unreadable or fails to parse, the last good tree keeps running and the failure is broadcast."
+         data-rationale="C is correct: every profile startup watches patch files via watchUserPatches; saving triggers hot re-assembly, and bad content keeps the last good tree. A is wrong: no restart needed. B is wrong: it never runs with the broken tree. D is wrong: re-assembly happens in place; dependencies are not reinstalled."
+         data-review="sec-fails-loud">
+      <div class="prompt"><span class="qnum">Q12.</span> Inside a running dsh session you save the profile's <code>cordis.patch.yml</code>. What happens next?</div>
+      <label class="opt"><input type="radio" name="q-3-12" value="a"> A. Nothing happens; dsh must be restarted for it to take effect</label>
+      <label class="opt"><input type="radio" name="q-3-12" value="b"> B. The tree immediately re-assembles per the new patch; parse failures apply the bad content anyway</label>
+      <label class="opt"><input type="radio" name="q-3-12" value="c"> C. The watcher re-assembles in place under the same layer order; on unreadable or unparseable content the last good tree keeps running and broadcasts the failure</label>
+      <label class="opt"><input type="radio" name="q-3-12" value="d"> D. All profile dependencies are reinstalled automatically</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="3-13" data-type="short"
+         data-key-points='["The launcher picks the profile (e.g. web) and reads its dsh.profile","Starting from the empty entry list, bundle layers stack in order (base → web-app)","Then the profile cordis.patch.yml, the home-level cordis.patch.yml, and the --patch overlay apply","Patches whole-row replace by id or insert new rows; for the same row the later layer wins","The Cordis Loader mounts the tree per inject dependencies, and the startup assertion verifies every enabled row activated"]'
+         data-answer="Five steps: (1) the launcher parses flags and picks the profile; (2) it reads dsh.profile's bundle list and stacks the bundle layers in order from the empty entry list (base → web-app); (3) it applies the profile's cordis.patch.yml, the home-level cordis.patch.yml, and the --patch overlay — patches whole-row replace by id or insert new rows, and for the same row the later layer wins; (4) the Cordis Loader mounts the tree per the service dependencies declared by inject; (5) boot glue asserts every enabled row actually activated, naming in the error anyone absent."
+         data-rationale="Five points: profile selection, bundle stacking order, the three patch layers' order and by-id semantics, inject-driven mounting, and the startup assertion."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> From pressing Enter on <code>dsh web</code> to a ready plugin tree, describe all five steps in order.</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check the points you actually made — checking fewer hurts your calibration; checking more only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="04-session-log.html"><strong>Chapter 4 · The Session Log: Event Sourcing's Source of Truth</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

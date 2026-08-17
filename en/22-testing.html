@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 22 · The Testing System: Five vitest Channels and Replay — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 22 · The Testing System</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/22-testing.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="22">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 22 · Part V · Engineering and Contribution</div>
+    <h1>The Testing System: Five vitest Channels and Replay</h1>
+    <p class="lede">
+      The preceding twenty-one chapters had you read the dsh runtime; this chapter reads its
+      burden of proof. The repository splits testing into five vitest channels — unit, e2e,
+      snapshot, web, web-stress/perf — and each channel answers only one class of evidence
+      question: who needs a key, who runs in CI, and who produces the golden fixtures committed to
+      the repo are all clearly divided. Once you understand this system, you know what tests your
+      change must add, and why package tests can never substitute for the assembled application
+      transcript.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State each of the five vitest channels' entry command, include pattern, and evidence surface.</li>
+      <li>Explain why <code>test:coverage</code> (not <code>test</code>) is the CI coverage gate, and what per-file 100% means.</li>
+      <li>Distinguish what each of <code>DSH_SNAPSHOT</code>'s replay / record / refresh modes needs and whether it writes golden fixtures.</li>
+      <li>Describe how <code>llm-replay</code> turns a persisted session log into a keyless replay script, including grouping by <code>(turn, step)</code> and binding child sessions by first-call order.</li>
+      <li>Recite the core policies of docs/testing.md: add a keyless snapshot through a real runnable example in the same PR, fixtures must replay on macOS/Linux, and fix fixtures rather than normalizers.</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-lanes">22.1 The five channels: one matrix</h2>
+
+  <p>
+    Each channel has its own vitest configuration at the repository root:
+    <code>vitest.config.ts</code> (unit), <code>vitest.e2e.config.ts</code> (real API),
+    <code>vitest.snapshot.config.ts</code> (golden-fixture replay), <code>vitest.web.config.ts</code>
+    (browser), plus <code>vitest.web-stress.config.ts</code> and
+    <code>vitest.web.perf.config.ts</code> (stress and performance). They are not layered by
+    fast-versus-slow but by <strong>evidence surface</strong>: unit proves in-package behavior,
+    e2e proves real provider behavior, snapshot proves the complete assembled transcript, web
+    proves real rendering in the browser, and stress/perf proves how the Web interface behaves
+    under load.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 780 388" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Matrix of the five test channels">
+      <rect x="8" y="8" width="764" height="34" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">Channel</text>
+      <text x="168" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">Entry command</text>
+      <text x="428" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">Key</text>
+      <text x="528" y="30" style="fill:var(--fg-dim)" font-size="13" font-weight="700">Evidence surface</text>
+
+      <rect x="8" y="50" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="75" style="fill:var(--accent)" font-size="14" font-weight="700">unit</text>
+      <text x="24" y="95" style="fill:var(--fg-dim)" font-size="11">vitest.config.ts</text>
+      <text x="168" y="75" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test</text>
+      <text x="168" y="95" style="fill:var(--fg-dim)" font-size="11">**/*.spec.ts</text>
+      <text x="428" y="85" style="fill:var(--pass)" font-size="12" font-weight="700">Keyless</text>
+      <text x="528" y="75" style="fill:var(--fg)" font-size="12">Package-level behavior: registries,</text>
+      <text x="528" y="95" style="fill:var(--fg)" font-size="12">event order, HMR safety, contract regressions</text>
+
+      <rect x="8" y="118" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="143" style="fill:var(--accent)" font-size="14" font-weight="700">e2e</text>
+      <text x="24" y="163" style="fill:var(--fg-dim)" font-size="11">vitest.e2e.config.ts</text>
+      <text x="168" y="143" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test:e2e</text>
+      <text x="168" y="163" style="fill:var(--fg-dim)" font-size="11">**/*.e2e.ts</text>
+      <text x="428" y="143" style="fill:var(--warn)" font-size="12" font-weight="700">Key required</text>
+      <text x="428" y="163" style="fill:var(--fg-dim)" font-size="11">self-skips without one</text>
+      <text x="528" y="143" style="fill:var(--fg)" font-size="12">Real providers: DeepSeek and the</text>
+      <text x="528" y="163" style="fill:var(--fg)" font-size="12">various search/fetch vendors</text>
+
+      <rect x="8" y="186" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="1.5"/>
+      <text x="24" y="211" style="fill:var(--accent)" font-size="14" font-weight="700">snapshot</text>
+      <text x="24" y="231" style="fill:var(--fg-dim)" font-size="11">vitest.snapshot.config.ts</text>
+      <text x="168" y="211" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test:snapshot</text>
+      <text x="168" y="231" style="fill:var(--fg-dim)" font-size="11">**/*.snapshot.ts</text>
+      <text x="428" y="211" style="fill:var(--pass)" font-size="12" font-weight="700">replay is keyless</text>
+      <text x="428" y="231" style="fill:var(--warn)" font-size="11">record needs a key</text>
+      <text x="528" y="211" style="fill:var(--fg)" font-size="12">Assembled transcripts: ACP/headless</text>
+      <text x="528" y="231" style="fill:var(--fg)" font-size="12">requests, protocol output, re-persisted logs</text>
+
+      <rect x="8" y="254" width="764" height="60" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="279" style="fill:var(--accent)" font-size="14" font-weight="700">web</text>
+      <text x="24" y="299" style="fill:var(--fg-dim)" font-size="11">vitest.web.config.ts</text>
+      <text x="168" y="279" style="fill:var(--fg)" font-size="12" font-family="monospace">pnpm run test:web</text>
+      <text x="168" y="299" style="fill:var(--fg-dim)" font-size="11">apps/web/tests</text>
+      <text x="428" y="279" style="fill:var(--pass)" font-size="12" font-weight="700">replay is keyless</text>
+      <text x="428" y="299" style="fill:var(--fg-dim)" font-size="11">CI pins replay</text>
+      <text x="528" y="279" style="fill:var(--fg)" font-size="12">Chromium rendering output comparison</text>
+      <text x="528" y="299" style="fill:var(--fg)" font-size="12">apps/web/tests/snapshots/</text>
+
+      <rect x="8" y="322" width="764" height="58" rx="6" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1"/>
+      <text x="24" y="347" style="fill:var(--accent)" font-size="14" font-weight="700">stress / perf</text>
+      <text x="24" y="367" style="fill:var(--fg-dim)" font-size="11">web-stress / web.perf</text>
+      <text x="168" y="347" style="fill:var(--fg)" font-size="12" font-family="monospace">test:web:stress</text>
+      <text x="168" y="367" style="fill:var(--fg)" font-size="12" font-family="monospace">test:web:perf</text>
+      <text x="428" y="357" style="fill:var(--pass)" font-size="12" font-weight="700">replay is keyless</text>
+      <text x="528" y="347" style="fill:var(--fg)" font-size="12">Web load stress and performance baselines</text>
+      <text x="528" y="367" style="fill:var(--fg-dim)" font-size="12">(build first, then run)</text>
+    </svg>
+    <figcaption>The five vitest channels × key requirements × evidence surfaces. snapshot is the only channel that commits golden fixtures to the repo and defaults to keyless replay mode.</figcaption>
+  </figure>
+
+  <p>
+    Note one easily missed detail in the matrix: e2e's self-skip without a key is not a degraded
+    run — the whole suite simply skips. Keyless CI and keyless contributors always see green, but
+    that is not a cost signal. Real provider evidence comes only from a run with a key.
+    Conversely, snapshot's replay is <strong>complete</strong> evidence: it genuinely assembles an
+    ACP/headless example, genuinely runs the process and protocol, and only swaps the model
+    responses for a recorded script.
+  </p>
+
+  <h2 id="sec-unit-coverage">22.2 The unit channel and the coverage gate</h2>
+
+  <p>
+    The include list of <code>vitest.config.ts</code> draws the unit channel's territory:
+  </p>
+
+  <pre><code><span class="code-key">const</span> testIncludes = [
+  <span class="code-str">'packages/*/*/tests/**/*.spec.{ts,tsx}'</span>,
+  <span class="code-str">'apps/*/tests/**/*.spec.ts'</span>,
+  <span class="code-str">'examples/*/tests/**/*.spec.ts'</span>,
+  <span class="code-str">'scripts/**/*.spec.ts'</span>,
+]</code></pre>
+
+  <p>
+    Tests live next to the code under test (tests stay beside the code region they examine). The
+    configuration has two vitest projects: <code>thread-safe</code> and
+    <code>process-bound</code> — the latter houses suites that depend on process-global state or
+    timing-sensitive process I/O and cannot be reliably isolated by worker threads under
+    aggregate-gate contention (for example
+    <code>packages/session/session-persistence-jsonl/tests/jsonl.spec.ts</code> and
+    <code>packages/boot/app-boot/tests/app-boot.spec.ts</code>); both sides use a forks pool for
+    Node stability. Every suite loads the setup file <code>scripts/test-invariants.ts</code>.
+  </p>
+
+  <p>
+    docs/testing.md sets three writing disciplines for the unit channel. First, <strong>every
+    registry needs an HMR-safety test</strong>: dispose the fiber that contributes it and assert
+    the cleanup is complete — the test-side reflection of Chapter 3's registrations-are-effects.
+    Second, prioritize edge cases, error paths, event ordering, and concurrency races. Third,
+    contract regressions get permanent tests; the exemplar is
+    <code>packages/core/agent-loop/tests/contract-regressions.spec.ts</code>.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Coverage: the gate is test:coverage, not test</div>
+    <p>
+      The CI coverage gate is <span class="kbd">pnpm run test:coverage</span> (<code>vitest run
+      --coverage</code>): 100% of statements / branches / functions / lines <strong>per
+      file</strong> under <code>packages/*/*/src</code>. Per file rather than per total, so that a
+      well-covered large file cannot subsidize an uncovered small one. Every exemption in the
+      configuration (types-only files, thin bin/worker entries, the GUI debt list, Windows-only
+      sources, and so on) is explicitly listed with a justification comment; for example, on a
+      host without a real <code>pwsh</code>, the pwsh-local executor suite self-skips and the
+      configuration exempts that file accordingly, while the CI runner has pwsh and still enforces
+      the full bar.
+    </p>
+    <p>
+      There is also a reading discipline: an uncovered line is often the gate correctly
+      <strong>flagging dead code to delete</strong>, not a missing test to add. Line coverage is
+      necessary and never sufficient — it proves the line ran, not that the feature works in its
+      released form. The remaining three channels supply that other half, the sufficient one.
+    </p>
+  </div>
+
+  <h2 id="sec-e2e">22.3 e2e: real API and the with-key policy</h2>
+
+  <p>
+    <code>vitest.e2e.config.ts</code> takes only <code>**/*.e2e.ts</code>, and its scope is
+    deliberately narrow: <code>packages/*/*/tests</code>, <code>apps/cli/tests</code> (only cli,
+    not apps/* — apps/web e2e belongs to the web channel), and <code>examples/*/tests</code>. It
+    spends real money on tokens, and the configuration shows it everywhere: a 120-second
+    testTimeout, retry 2 (a shared internal key hits concurrency quotas, so transient jitter gets
+    retried), <code>DSH_E2E_MAX_WORKERS</code> (default 4) limiting parallel files, and no
+    coverage — coverage belongs to the unit channel.
+  </p>
+
+  <p>
+    The with-key policy in docs/testing.md is titled <strong>inference is cheap here</strong>: do
+    not skimp on real-API tests. Keyless tests prove only that the pipeline works; only a run with
+    a key proves the agent works against a real model. Cover prompts that write files, multi-turn
+    conversations, tool use, and mid-flight cancellation. The highest-value form is the
+    <strong>smoke test</strong>: start a real example, send one prompt, then inspect the world.
+    They specifically kill the failure class where unit is all green but the product is broken —
+    mocks cannot catch it; the postmortem is recorded at
+    <code>docs/postmortem/0001-acp-default-export-drops-inject.md</code>
+    (a default export silently dropped an inject).
+  </p>
+
+  <p>
+    The e2e channel has two more iron rules. <strong>Verify the world, not self-reporting</strong>:
+    assertions should re-run commands and re-read files outside the agent; keyword-probing the
+    agent's own output lets a cheating agent pass. Untouched files must be asserted
+    byte-identical. e2e tests own their resources: create the harness inside the test,
+    <code>afterEach</code> disposes it (also on failure, retry, and timeout); shared fixtures go
+    in an ordinary <code>tests/harness.ts</code>, never inside another <code>*.e2e.ts</code> —
+    importing a spec re-registers its describe and doubles the real API calls.
+  </p>
+
+  <div class="box key">
+    <div class="box-title">Real implementations over mocks</div>
+    <p>
+      Mock only expensive or non-deterministic boundaries — the LLM adapter, the network, the
+      clock; everything downstream of the boundary stays real. A hand-rolled stand-in can only
+      prove the bridge moves bytes, not that the released tool works as asserted. The bridged
+      tool-call tests pair a scripted mock model with real tools and executors:
+      <code>makeBridgeHarness({ withBash: true })</code> plugs in <code>dsh-bash-local</code> and
+      <code>dsh-tool-bash</code>, then genuinely runs <code>echo</code>.
+    </p>
+  </div>
+
+  <h2 id="sec-snapshot-modes">22.4 snapshot: record / refresh / replay</h2>
+
+  <p>
+    The snapshot channel's configuration file <code>vitest.snapshot.config.ts</code> takes
+    <code>scripts/**/*.snapshot.ts</code>, <code>apps/cli/tests/**/*.snapshot.ts</code>, and
+    <code>examples/*/tests/**/*.snapshot.ts</code> (plus <code>apps/web/tests</code> when
+    DSH_EXAMPLE_MODE=lib). It switches among three modes with the <code>DSH_SNAPSHOT</code>
+    environment variable:
+  </p>
+
+  <table>
+    <thead><tr><th>Mode</th><th>Command</th><th>Key</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>replay</code> (default)</td>
+        <td><code>pnpm run test:snapshot</code></td>
+        <td>Keyless</td>
+        <td>Replays model responses from committed golden fixtures, runs the full assembly path, and compares the assembled requests, normalized protocol/transcript output, and re-persisted logs. It <strong>never writes</strong> the committed expected outputs.</td>
+      </tr>
+      <tr>
+        <td><code>record</code></td>
+        <td><code>pnpm run test:snapshot:record</code></td>
+        <td>Requires <code>DEEPSEEK_API_KEY</code></td>
+        <td>Calls the real API, reruns scenarios, and writes model responses and expected outputs back to the fixtures and expected files (quoting the config comment: only record reads the key from the environment or the root <code>.env</code>; replay/refresh never load .env). Use it to re-record when the model transcript changes.</td>
+      </tr>
+      <tr>
+        <td><code>refresh</code></td>
+        <td><code>pnpm run test:snapshot:refresh</code></td>
+        <td>Keyless</td>
+        <td>Replays the committed scripts but <strong>updates the current expected outputs</strong> — for when the replay inputs are still valid and only the output side needs refreshing. Every JSONL and expected diff must be reviewed by a human.</td>
+      </tr>
+    </tbody>
+  </table>
+
+<div class="demo" data-demo="snapshotModes">
+  <div class="demo-title">Try it — the record / replay snapshot modes</div>
+  <label><input type="radio" name="d22" value="record"> DSH_SNAPSHOT=record</label>
+  <label><input type="radio" name="d22" value="replay" checked> DSH_SNAPSHOT=replay</label>
+  <div class="demo-output empty">Switch modes.</div>
+</div>
+
+  <p>
+    The parallelism strategy also differs by mode: replay writes no golden fixtures and each
+    scenario holds its own mutable runtime state, so it parallelizes at file level, with
+    <code>DSH_SNAPSHOT_MAX_CONCURRENCY</code> (default 5) limiting concurrency within a file —
+    the value 1 restores fully serial execution on constrained machines; record and refresh stay
+    serial — every record scenario spends real API quota, and refresh's write-back harvests
+    volatile values from fixtures already on disk, where concurrent writers would destroy the
+    golden fixtures.
+  </p>
+
+  <p>
+    The golden fixtures have clear ownership: ACP automation scenarios live in
+    <code>examples/&lt;name&gt;/tests/snapshots/</code> (<code>examples/acp-agent</code> is the
+    main venue); <code>examples/headless-agent</code> owns internal canonical-event JSONL
+    snapshots and replay fixtures; <code>apps/cli</code> alone owns the product-grade
+    <code>dsh --profile headless</code> acceptance; completed interactive terminal journeys use
+    JSONL-driven scenarios under <code>apps/cli/tests/snapshots/</code>; browser-rendered Web GUI
+    journeys are in <code>apps/web/tests/snapshots/</code>. There is also one famous piece of
+    fine-grained design: only a single ACP scenario (<code>text-turn</code>) pins the full
+    system-prompt/tool-schema content; the other fixtures tokenize it, so a single edit only
+    churns one line.
+  </p>
+
+  <h2 id="sec-llm-replay">22.5 llm-replay: the session log is the fixture</h2>
+
+  <p>
+    <code>packages/test-support/llm-replay</code> (package
+    <code>@deepseek-ai/dsh-llm-replay</code>) is the engine of replay mode. Its core insight:
+    <strong>the fixture is the persisted session log itself</strong> —
+    <code>&lt;scenario&gt;/session.jsonl</code>. In Chapter 4 you learned that
+    <code>assistant/chunk</code> events carry every <code>StreamChunk</code>; grouping them by
+    <code>(turn, step)</code> reconstructs the chunk sequence of every <code>stream()</code> call
+    the agent-loop makes. Recording is therefore just run the real agent once and harvest the
+    .jsonl — this plugin does no recording of its own.
+  </p>
+
+  <pre><code><span class="code-comment">// ACP / headless snapshot suites mount it via the Loader, replacing the real LLM adapter</span>
+- id: llm-replay
+  name: <span class="code-str">'@deepseek-ai/dsh-llm-replay'</span>
+  config:
+    providers:
+      - id: deepseek-official
+        name: DeepSeek
+        models:
+          - id: deepseek-v4-flash
+            contextWindow: <span class="code-key">128000</span>
+  <span class="code-comment"># file / overrideFile / childFiles default to $DSH_SNAPSHOT_FILE and similar</span>
+  <span class="code-comment"># environment variables, injected per scenario by the snapshot harness</span></code></pre>
+
+  <p>
+    Log derivation cannot cover two failure shapes: a pure throw before any chunk (for example
+    HTTP 401, where the log holds only <code>turn/end {error}</code>) and cancellation/hang (a
+    timing matter, not chunk content). Scenarios that need them provide an optional sidecar
+    <code>&lt;scenario&gt;/replay.override.json</code>: it either replaces the derived script
+    wholesale (a bare <code>ReplayEntry[]</code>) or patches by 0-based call index
+    (<code>{ patches: [{ at, entry }] }</code>; when <code>at</code> equals the derived length, a
+    retry attempt is appended after an injected one-shot transient throw). The sidecar document,
+    every patch, every entry, and every chunk discriminant tag are validated at file load —
+    misconfiguration fails loud is just as much an iron law here.
+  </p>
+
+  <p>
+    Nested agents are the second subtlety. A scenario where the parent delegates to in-process
+    subagents records multiple logs: <code>session.jsonl</code> (the parent) plus
+    <code>session.1.jsonl</code>, <code>session.2.jsonl</code>, and so on — each agent is its own
+    <code>Session</code> on the same context. A live session id is a fresh random value on every
+    run and never equals the recorded one, so replay binds by <strong>first-call order</strong>:
+    scripts are sorted by the header's <code>createdAt</code> (the parent first — it must stream
+    before it can delegate), the first live session to make any call claims the first script, the
+    next new session claims the next, and each advances its own cursor. More live sessions than
+    recorded scripts fails loud.
+  </p>
+
+  <p>
+    The programmatic entry point is <code>installLlmReplay(ctx, config)</code>, which returns a
+    <code>ReplayHandle</code>: <code>dispose()</code> keeps HMR safety, and
+    <code>assertConsumed()</code> asserts at teardown that every recorded script was bound to a
+    live session and that every binding cursor is exhausted — turning the scenario quietly drove
+    the model fewer times than expected into a clear diagnosis. The web browser e2e channel
+    bypasses the Loader and installs it directly precisely to keep this teardown consumption
+    handle.
+  </p>
+
+  <h2 id="sec-test-support">22.6 The six-piece test infrastructure</h2>
+
+  <p>
+    Besides llm-replay, <code>packages/test-support/</code> holds five more support packages.
+    They are test-tier infrastructure, not product APIs:
+  </p>
+
+  <table>
+    <thead><tr><th>Package</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>llm-replay</code></td>
+        <td>The keyless replay plugin that rebuilds model streams from recorded session logs (Section 22.5).</td>
+      </tr>
+      <tr>
+        <td><code>llm-mock-server</code></td>
+        <td>A scriptable OpenAI-compatible HTTP/SSE server for exercising <strong>real</strong> LLM adapters, the agent loop, and recovery strategies without a provider key. <code>--sequence</code> is a FIFO behavior table: <code>connection_reset</code>, <code>partial_disconnect</code>, <code>stall</code>, <code>rate_limit</code>, <code>success</code>, <code>tool_call_success</code>, and more. Start it with <span class="kbd">pnpm run mock:llm</span> and point the released DeepSeek adapter at it (<code>DEEPSEEK_BASE_URL</code>).</td>
+      </tr>
+      <tr>
+        <td><code>acp-snapshot</code></td>
+        <td>The ACP snapshot suite toolbox, four layers importable separately: <code>launchAcpTestAgent</code> (the process launcher), <code>runScenario</code> (the scenario harness), the normalization pure functions (stdout/session log/cwd tokenization/system-prompt and tool-schema scrubbing), and <code>defineAcpSnapshotSuite</code> (the factory that registers a whole describe/it tree from one scenario table).</td>
+      </tr>
+      <tr>
+        <td><code>agent-loop-testkit</code></td>
+        <td><code>mountAgentLoopTestDependencies(ctx)</code> installs the LLM, session, system-prompt, tool, and agent services in dependency order; the adapter, optional plugins, the <code>AgentLoop</code> itself, and Context teardown stay with the caller, keeping scenario-specific ordering visible.</td>
+      </tr>
+      <tr>
+        <td><code>client-runtime</code></td>
+        <td>The jsdom slot-test runtime: a real Cordis <code>Context</code>, the production <code>SlotRegistry</code> and web-react renderer, paired with typed doubles implementing the same outward-facing surface. When the production surface changes, the test bench breaks at compile time — instead of drifting silently.</td>
+      </tr>
+      <tr>
+        <td><code>loader-smoke</code></td>
+        <td>The shared subprocess harness that boots apps and <code>cordis.yml</code> through the Cordis Loader: <code>resolveExampleLaunch</code> chooses between local src mode (tsx) and CI lib mode (plain Node + package exports); <code>runLoaderSmoke</code> owns the isolated cwd, DSH homes, deadline, and cleanup; <code>runFixtureTurn</code> drives one task and returns the final answer and usage.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    The reason this infrastructure exists is written in the first paragraph of acp-snapshot's
+    README: all comparison/guard mechanisms are concentrated in one package under the per-file
+    coverage gate, rather than each example rolling its own copy. A consumer's
+    <code>*.snapshot.ts</code> is usually just one scenario table plus one factory call.
+  </p>
+
+  <h2 id="sec-policy">22.7 The core policy: why snapshots are irreplaceable</h2>
+
+  <p>
+    The <strong>When a snapshot test is required</strong> section of docs/testing.md is the
+    constitution of the whole system: <strong>every non-trivial model-visible, protocol-visible,
+    or human-visible behavior change must add or update a keyless scenario through a real
+    runnable example's snapshot suite in the same PR.</strong> Package tests, e2e assertions,
+    mock/test-only compositions, PR descriptions — none can substitute for the assembled
+    application transcript; extend the harness first when needed. AGENTS.md lists the same rule
+    as a repository-level convention and adds two more: fixtures must replay on macOS/Linux (fix
+    fixtures, not normalizers); and a new capability seam, lifecycle variant, or transcript
+    surface must name its coverage at every layer at planning time, and you must verify the
+    harness can express it before implementing.
+  </p>
+
+  <p>
+    Why are package tests not enough? Return to the postmortem-0001 class of failure: a default
+    export drops an inject, unit-level composition stays green, and the product only breaks under
+    a real Loader composition. So the policy also demands testing the real entry path:
+    product-visible plugins must have a non-unit real-composition test; a hand-assembled
+    <code>ctx.plugin(...)</code> suite does not count — it must boot a test-dedicated
+    <code>cordis.yml</code> through the Loader and the app/process. The real entry path also
+    means released artifacts: a package's bin runs the built <code>lib/bin.js</code> under plain
+    <code>node</code>, exposing failures tsx would mask (settle races, module resolution,
+    swallowed load failures); built-artifact smokes must stay green
+    (<code>packages/examples/*/tests/built-bin.e2e.ts</code> and the like) and must assert a
+    nonzero exit when config is genuinely missing.
+  </p>
+
+  <p>
+    The resolution side has its own discipline: <strong>test resolution stays on the source
+    plane</strong> — every vitest config points vite-tsconfig-paths at
+    <code>tsconfig.base.json</code>, so bare workspace imports resolve to <code>src</code> and
+    never fall through package exports to the built <code>lib/</code> (where stale artifacts
+    would install a second module singleton). Built artifacts are consumed only in explicitly
+    declared settings: lib-mode subprocesses and built smokes.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Test subprocess launch modes</div>
+    <p>
+      CI and the build-carrying test channels run every example or Cordis-config subprocess from
+      the built <code>lib/</code> through a shared dual-mode launcher — do not hand-write
+      <code>--import tsx</code> for these subprocesses. Protocol/OS fixtures that load no Cordis
+      run plain Node directly on erasable <code>.ts</code> files, without tsx and without the
+      root paths mapping. Choosing <code>src</code> is optional only when the thing under test is
+      itself source-path resolution, and the test must state that contract. AGENTS.md's one-line
+      summary: config subprocesses run the built <code>lib/</code> under plain Node; source
+      regressions use their declared launcher.
+    </p>
+  </div>
+
+  <h2 id="sec-recap">22.8 Chapter recap</h2>
+  <ul>
+    <li>The five channels divide by evidence surface: unit (package-level behavior), e2e (real providers), snapshot (assembled transcripts), web (Chromium rendering), stress/perf (load).</li>
+    <li><code>test:coverage</code>, not <code>test</code>, is the CI coverage gate: per-file 100% on <code>packages/*/*/src</code>; an uncovered line is often dead code to delete.</li>
+    <li>e2e self-skipping without a key is not a cost signal; smoke tests (start a real example, send one prompt, inspect the world) specifically kill the unit-all-green-product-broken class.</li>
+    <li><code>DSH_SNAPSHOT</code>: replay is keyless, writes no golden fixtures (the CI default); record needs a key to re-record fixtures; refresh is keyless and refreshes expected outputs; every diff must be human-reviewed.</li>
+    <li>llm-replay's fixture is <code>session.jsonl</code>: <code>assistant/chunk</code> grouped by <code>(turn, step)</code> rebuilds streams; the override sidecar supplies pure throws/cancellations; child sessions bind by first-call order; <code>assertConsumed()</code> is the backstop.</li>
+    <li>The constitutional clause: a non-trivial model/user-visible change must add a keyless snapshot through a real runnable example in the same PR; fixtures replay on macOS/Linux, and you fix fixtures, not normalizers.</li>
+    <li>Test resolution stays on the source plane; config subprocesses use the built <code>lib/</code> plus the shared dual-mode launcher — never hand-written <code>--import tsx</code>.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common misconceptions</div>
+    <ul style="margin:0;">
+      <li>Assuming a green <code>pnpm run test</code> satisfies coverage — the gate is <code>test:coverage</code>, per-file 100%.</li>
+      <li>Reading e2e's self-skip as e2e running keyless too — a skipped suite produces no provider evidence at all.</li>
+      <li>Calling package tests or a PR description enough after a model-visible change — the constitution requires a keyless snapshot scenario in the same PR.</li>
+      <li>Editing the normalizer when a snapshot diff looks wrong — fix the fixture first; normalizers are shared pure functions, and changing one affects every scenario.</li>
+      <li>Hand-writing <code>--import tsx</code> for example subprocesses — use the shared dual-mode launcher; CI runs from the built <code>lib/</code>.</li>
+      <li>Importing shared fixtures between <code>*.e2e.ts</code> files — importing a spec re-registers its describe and doubles real API calls; shared code goes in <code>tests/harness.ts</code>.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="22">
+    <h2>Chapter 22 Test</h2>
+
+    <div class="q" data-id="22-1" data-type="mcq" data-correct='["c"]'
+         data-answer="C — test:coverage (vitest run --coverage) is the CI coverage gate, 100% per file on packages/*/*/src."
+         data-rationale="C is correct. pnpm run test is just the unit run; the gate is test:coverage, measured per file rather than in aggregate. A confuses a run with a gate. B is not a command (that is a channel-selection environment variable). D has it backwards: per-file is precisely so a large file cannot subsidize a small one."
+         data-review="sec-unit-coverage">
+      <div class="prompt"><span class="qnum">Q1.</span> Which command is the CI coverage gate, and how does it measure?</div>
+      <label class="opt"><input type="radio" name="q-22-1" value="a"> A. <code>pnpm run test</code>, by aggregate coverage</label>
+      <label class="opt"><input type="radio" name="q-22-1" value="b"> B. <code>DSH_SNAPSHOT=coverage</code>, by scenario count</label>
+      <label class="opt"><input type="radio" name="q-22-1" value="c"> C. <code>pnpm run test:coverage</code>, 100% per file on <code>packages/*/*/src</code> (statements/branches/functions/lines)</label>
+      <label class="opt"><input type="radio" name="q-22-1" value="d"> D. <code>pnpm run hygiene</code>, by per-package average coverage</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-2" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A/C/D all produce complete evidence without a key: unit is keyless to begin with; snapshot's replay re-runs the full assembly path with recorded responses; the web channel's CI pins DSH_SNAPSHOT=replay for read-only comparison. B is wrong: without a key the entire e2e suite self-skips and produces no provider evidence."
+         data-review="sec-lanes">
+      <div class="prompt"><span class="qnum">Q2.</span> Which channels can still produce complete evidence on a machine <strong>without</strong> DEEPSEEK_API_KEY? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="a"> A. unit (<code>pnpm run test</code>)</label>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="b"> B. e2e (<code>pnpm run test:e2e</code>)</label>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="c"> C. snapshot in replay mode (<code>pnpm run test:snapshot</code>)</label>
+      <label class="opt"><input type="checkbox" name="q-22-2" value="d"> D. the web channel's CI replay (Chromium comparing <code>apps/web/tests/snapshots/</code>)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-3" data-type="mcq" data-correct='["b"]'
+         data-answer="B — record calls the real API and writes model responses and expected outputs back to the fixtures and expected files."
+         data-rationale="B is correct: when the model transcript changes, re-record with test:snapshot:record, which needs a key (read from the environment or the root .env; replay/refresh never load .env). A misdescribes record: it is exactly the mode that writes golden fixtures. C describes refresh — replaying committed scripts and updating only the expected outputs, keyless. D is not a distinction: unit coverage belongs to test:coverage and has nothing to do with record."
+         data-review="sec-snapshot-modes">
+      <div class="prompt"><span class="qnum">Q3.</span> What does <code>DSH_SNAPSHOT=record</code> do, and what does it need?</div>
+      <label class="opt"><input type="radio" name="q-22-3" value="a"> A. Keyless replay of committed fixtures, comparing only and writing nothing</label>
+      <label class="opt"><input type="radio" name="q-22-3" value="b"> B. Requires DEEPSEEK_API_KEY, calls the real API, and writes model responses and expected outputs back to the golden fixtures</label>
+      <label class="opt"><input type="radio" name="q-22-3" value="c"> C. Keyless replay of committed scripts that updates the current expected outputs</label>
+      <label class="opt"><input type="radio" name="q-22-3" value="d"> D. Requires the mock:llm server and only serves coverage statistics</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-4" data-type="mcq" data-correct='["c"]'
+         data-answer="C — refresh replays committed recorded scripts, calls no API, writes back only the current expected outputs, and every diff must be human-reviewed."
+         data-rationale="C is correct: use refresh when the replay inputs are still valid and only the output side needs refreshing; it is keyless and serial. A is record. B is not a mode combination that exists. D has it backwards: record spends quota and is therefore serial, while replay is the parallel one (bounded by DSH_SNAPSHOT_MAX_CONCURRENCY)."
+         data-review="sec-snapshot-modes">
+      <div class="prompt"><span class="qnum">Q4.</span> What is the difference between refresh and record?</div>
+      <label class="opt"><input type="radio" name="q-22-4" value="a"> A. refresh calls the real API to re-record model responses; record does not</label>
+      <label class="opt"><input type="radio" name="q-22-4" value="b"> B. Both need a key; only the parallelism differs</label>
+      <label class="opt"><input type="radio" name="q-22-4" value="c"> C. refresh keylessly replays committed scripts and updates the current expected outputs; record needs a key to re-record the fixtures themselves</label>
+      <label class="opt"><input type="radio" name="q-22-4" value="d"> D. refresh is parallel and record serial, and otherwise they are identical</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-5" data-type="fill" data-accepted='["session.jsonl"]'
+         data-answer="session.jsonl."
+         data-rationale="llm-replay's fixture is the persisted session log (session.jsonl in the scenario directory); grouping assistant/chunk events by (turn, step) rebuilds each stream() call's chunk sequence; child sessions in nested scenarios are sibling files like session.1.jsonl."
+         data-review="sec-llm-replay">
+      <div class="prompt"><span class="qnum">Q5.</span> Fill in the blank: llm-replay's primary fixture is the persisted session log itself, named <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-6" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, D."
+         data-rationale="A is correct: grouping assistant/chunk by (turn, step) rebuilds the streams. B is correct: pure throws and cancellation/hang are not derivable from the log; replay.override.json replaces wholesale or patches by call index. D is correct: assertConsumed asserts every script is bound and every cursor exhausted. C is wrong: the live session id is a fresh random value each run; binding is by first-call order, not id equality."
+         data-review="sec-llm-replay">
+      <div class="prompt"><span class="qnum">Q6.</span> Which statements about llm-replay's mechanism are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="a"> A. Groups <code>assistant/chunk</code> events by <code>(turn, step)</code> to rebuild each <code>stream()</code> call's chunk sequence</label>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="b"> B. Failure shapes not derivable from the log (pure throws, cancellation/hang) are supplied by the <code>replay.override.json</code> sidecar</label>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="c"> C. Child sessions bind scripts by live session id equaling the recorded id</label>
+      <label class="opt"><input type="checkbox" name="q-22-6" value="d"> D. <code>assertConsumed()</code> turns the scenario quietly driving fewer model calls into a clear diagnosis</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-7" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Keyless tests prove only the pipeline; only a run with a key proves the agent works against a real model, and self-skip is not a cost signal."
+         data-rationale="D is correct and is docs/testing.md's intent: do not skimp on real-API tests; self-skip keeps keyless CI and contributors from being blocked. A is backwards. B is wrong: smoke is the highest-value form of e2e. C is a mechanism, not the reason."
+         data-review="sec-e2e">
+      <div class="prompt"><span class="qnum">Q7.</span> What is the core claim of the with-key policy (inference is cheap here)?</div>
+      <label class="opt"><input type="radio" name="q-22-7" value="a"> A. Real-API tests are too expensive; mock wherever possible</label>
+      <label class="opt"><input type="radio" name="q-22-7" value="b"> B. Smoke tests do not matter; unit coverage is the focus</label>
+      <label class="opt"><input type="radio" name="q-22-7" value="c"> C. self-skip exists to remove e2e from CI entirely</label>
+      <label class="opt"><input type="radio" name="q-22-7" value="d"> D. Keyless tests prove only the pipeline; only a run with a key proves the agent works against a real model, and self-skip merely keeps keyless contributors unblocked</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-8" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Re-execute commands and re-read files outside the agent; keyword probing lets a cheating agent pass."
+         data-rationale="B is correct: verify the world, not self-reporting. A/C/D all probe the agent's own output, and a cheating agent can pass by printing the keyword. Additionally, untouched files must be asserted byte-identical."
+         data-review="sec-e2e">
+      <div class="prompt"><span class="qnum">Q8.</span> What does verify the world, not self-reporting mean in e2e assertions?</div>
+      <label class="opt"><input type="radio" name="q-22-8" value="a"> A. Check whether the agent's final answer contains a success keyword</label>
+      <label class="opt"><input type="radio" name="q-22-8" value="b"> B. Re-run commands and re-read files outside the agent and assert the world's state; untouched files must be byte-identical</label>
+      <label class="opt"><input type="radio" name="q-22-8" value="c"> C. Have the agent report what it did, then assert the report format</label>
+      <label class="opt"><input type="radio" name="q-22-8" value="d"> D. Keyword-probe the agent's stderr</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-9" data-type="mcq" data-correct='["a"]'
+         data-answer="A — Add/update a keyless scenario through a real runnable example's snapshot suite in the same PR."
+         data-rationale="A is correct; this is the constitutional clause: package tests, e2e assertions, mock compositions, and PR descriptions cannot substitute for the assembled transcript. B/C/D respectively try to get by with package tests, e2e, or a description — all named non-substitutable by the policy."
+         data-review="sec-policy">
+      <div class="prompt"><span class="qnum">Q9.</span> You changed a model-visible behavior (say, a new system-prompt section). What is your testing obligation?</div>
+      <label class="opt"><input type="radio" name="q-22-9" value="a"> A. Within the same PR, add/update a keyless scenario through a real runnable example's snapshot suite</label>
+      <label class="opt"><input type="radio" name="q-22-9" value="b"> B. Adding unit tests in the relevant package is enough</label>
+      <label class="opt"><input type="radio" name="q-22-9" value="c"> C. Run a keyed e2e once and paste the results in the PR</label>
+      <label class="opt"><input type="radio" name="q-22-9" value="d"> D. Describing the behavior change in the PR is enough; snapshots can come in the next PR</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-10" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Run from the built lib/ through the shared dual-mode launcher under plain Node; never hand-write --import tsx."
+         data-rationale="C is correct; these are the test subprocess launch modes: the real entry path means released artifacts, and lib mode exposes failures tsx would mask. A/B violate the never hand-write --import tsx rule; D is backwards — src is optional only when the thing under test is source-path resolution, and the contract must be stated in the test."
+         data-review="sec-policy">
+      <div class="prompt"><span class="qnum">Q10.</span> On CI, how should example / config subprocesses that load Cordis run?</div>
+      <label class="opt"><input type="radio" name="q-22-10" value="a"> A. Hand-written <code>node --import tsx</code> running from src</label>
+      <label class="opt"><input type="radio" name="q-22-10" value="b"> B. Each suite decides tsx versus lib on its own and implements it separately</label>
+      <label class="opt"><input type="radio" name="q-22-10" value="c"> C. From the built <code>lib/</code> through the shared dual-mode launcher under plain Node</label>
+      <label class="opt"><input type="radio" name="q-22-10" value="d"> D. Always choose src mode, because source always runs</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-11" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Mock only expensive or non-deterministic boundaries (LLM adapter, network, clock); everything downstream stays real."
+         data-rationale="B is correct: hand-rolled stand-ins prove only that the bridge moves bytes. The exemplar is makeBridgeHarness({ withBash: true }) — a scripted mock model plus real tools and executors, genuinely running echo. A/C/D each replace real tools/executors/the adapter with stand-ins."
+         data-review="sec-e2e">
+      <div class="prompt"><span class="qnum">Q11.</span> Where does real implementations over mocks draw the line?</div>
+      <label class="opt"><input type="radio" name="q-22-11" value="a"> A. Mock the tools and executors too and test only the bridge's scheduling logic</label>
+      <label class="opt"><input type="radio" name="q-22-11" value="b"> B. Mock only expensive or non-deterministic boundaries (LLM adapter, network, clock); everything downstream stays real</label>
+      <label class="opt"><input type="radio" name="q-22-11" value="c"> C. Mock down to the HTTP layer; tool execution stays real but the adapter becomes a hand-written stub</label>
+      <label class="opt"><input type="radio" name="q-22-11" value="d"> D. Decide how much to mock by test speed; the faster the better</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-12" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Suspect dead code first: delete it, or give an explicit exemption with a reason; line coverage by itself does not prove the feature works."
+         data-rationale="D is correct; this is the reading discipline of the per-file 100% gate: an uncovered line is often dead code to delete, and exemptions must be explicitly listed with reasons. A casually bypasses, violating the rule that every v8 ignore comment carries a reason. B/C treat line coverage as sufficient evidence, while testing.md explicitly calls it necessary but not sufficient."
+         data-review="sec-unit-coverage">
+      <div class="prompt"><span class="qnum">Q12.</span> Under the per-file 100% gate you find an uncovered line. What should your first reaction be?</div>
+      <label class="opt"><input type="radio" name="q-22-12" value="a"> A. Casually ignore the line in a v8 coverage comment</label>
+      <label class="opt"><input type="radio" name="q-22-12" value="b"> B. Write a test to cover it so coverage goes green</label>
+      <label class="opt"><input type="radio" name="q-22-12" value="c"> C. Line coverage already proves the feature works; ignore it</label>
+      <label class="opt"><input type="radio" name="q-22-12" value="d"> D. Suspect first that it is dead code to delete; exemptions must be explicitly listed with reasons, and line coverage never proves correctness</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="22-13" data-type="short"
+         data-key-points='["The fixture is the persisted session log session.jsonl (assistant/chunk grouped by turn/step rebuilds the stream)","replay is keyless and never writes golden fixtures, the CI and local default; record needs a key to re-record, refresh keylessly updates expected outputs","Replay still runs the full assembly path: real process, Loader, protocol, and persistence, with only the model responses swapped","The constitutional clause: non-trivial model/user-visible changes must add a keyless snapshot in the same PR; fixtures must replay on macOS/Linux"]'
+         data-answer="Key points: the fixture is the session log; the replay/record/refresh modes and their key requirements; replay still runs the full assembly path and therefore proves the assembled transcript; and the same-PR keyless-snapshot policy plus fixture portability."
+         data-rationale="With those four points (the log as fixture, the three modes' division of labor, the full assembly path, the same-PR snapshot obligation), you understand why the snapshot channel can serve as release evidence."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q13.</span> In your own words: why can snapshot's replay mode serve as keyless complete evidence while unit tests cannot?</div>
+      <textarea class="short" placeholder="Write your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check only the points you actually covered — under-checking distorts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="23-gates-and-conventions.html"><strong>Chapter 23 · Quality Gates and Repository Conventions</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

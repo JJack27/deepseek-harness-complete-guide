@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 13 · The Filesystem Capability: the fs seam and the observation policy — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 13 · The Filesystem Capability</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/13-fs-capability.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="13">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 13 · Part III · Capability Seams in Depth</div>
+    <h1>The Filesystem Capability: the fs seam and the observation policy</h1>
+    <p class="lede">
+      Every file change the model makes passes through one and the same seam: <code>ctx.fs</code>. It is the
+      file half of the execution world — twelve storage primitives, three replaceable providers (local /
+      sandbox / E2B), a set of observation policies hanging on event gates, and a cleanly four-layered tool
+      stack. Beyond explaining the seam itself, this chapter answers a subtler question: why is a
+      <strong>policy</strong> like read-before-write not built as a service but as a companion plugin on the
+      <code>fs/*</code> events. By the end you will be able to follow a single <code>edit</code> call from the
+      tool schema all the way down to the provider's atomic commit.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>List <code>FileSystem</code>'s primitive groups (identity resolution / execution-world coordinates / reads / atomic changes) and explain why the version guard is optional</li>
+      <li>Compare the three providers: fs-local, fs-sandbox (fences writes only, reads pass), fs-e2b (remote world)</li>
+      <li>Explain the division of labor among the three <code>fs/*</code> events and how fs-observation-policy implements read-before-write with single-slot decisions that don't call <code>next()</code></li>
+      <li>Explain why tool-fs goes through <code>ctx.fs</code> while tool-fs-search goes through ripgrep under <code>ctx.subprocess</code></li>
+      <li>Describe str_replace_editor's editing model: view/create/str_replace/insert, unique literal match, no replace_all</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-fs-seam">13.1 ctx.fs: twelve primitives and an optional version guard</h2>
+
+  <p>
+    <code>FileSystem</code> (<code>ctx.fs</code>, package <code>dsh-fs</code>) defines the storage primitives
+    within one execution world, without saying how. Backends subclass it and implement <strong>twelve
+    primitives</strong>. Grouping them by responsibility is the fastest way to remember:
+  </p>
+  <table>
+    <thead><tr><th>Group</th><th>Primitives</th><th>Key points</th></tr></thead>
+    <tbody>
+      <tr><td>Identity resolution</td><td><code>resolve(path, opts?)</code></td><td>Resolves a path into a stable <code>FsTarget</code> (opaque <code>targetKey</code> + <code>displayPath</code>); the same file reached through different paths must yield the same <code>targetKey</code>. <code>opts.cwd</code> is the base for relative paths (callers pass the session workspace).</td></tr>
+      <tr><td>Execution-world coordinates</td><td><code>processPath</code> / <code>fileUrl</code> / <code>contains</code></td><td>Gives the canonical absolute path a subprocess in this world can open, the file: URI of this world, and containment judgments — consumers never interpret a <code>targetKey</code>.</td></tr>
+      <tr><td>Metadata</td><td><code>stat</code> / <code>lstat</code> / <code>listDir</code></td><td><code>stat</code> returns metadata only, never content; <code>lstat</code> does not follow the final symlink (a consumer can reject repo-bundled symlinks up front); <code>listDir</code> is one level, in stable name order, and never reads content.</td></tr>
+      <tr><td>Reads</td><td><code>readText</code> / <code>streamText</code> / <code>readBytes</code></td><td>Text reads own UTF-8 decoding and binary/NUL rejection (<code>FS_NOT_TEXT</code>); streaming reads keep cross-chunk decoding in the provider; <code>readBytes</code> requires <code>maxBytes</code> — a known or discovered overrun raises <code>FS_TOO_LARGE</code> immediately, never buffering unboundedly.</td></tr>
+      <tr><td>Atomic changes</td><td><code>writeText</code> / <code>editText</code></td><td>Atomic create/replace and literal edits; the <code>expected</code> guard is <strong>optional</strong> — omitted means unconditional; provided means CAS by <code>createIfAbsent</code> / <code>replaceIfVersion</code> / <code>{ version }</code>. Changes always run inside the backend's per-target lock; unconditional only drops the version precondition, not the atomicity.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The same package also owns the <code>fs/*</code> policy event vocabulary — expanded in 13.3. The README
+    sums up the seam's stance as fsspec-style storage primitives, half a level above byte-level
+    <code>cat</code>/<code>open</code>: <strong>mounted alone, <code>ctx.fs</code> is a complete, unconstrained
+    storage seam</strong>; policy is a layer stacked on afterwards.
+  </p>
+
+  <div class="box key">
+    <div class="box-title">Why the version guard is optional</div>
+    <p>
+      Because a bare, policy-less provider is a legal shape. The absence of the guard parameter is not an
+      oversight but part of the contract: omitted = create or overwrite unconditionally. The policy plugin
+      (13.3) has exactly the job of <strong>filling the guard in</strong> — it translates what version this
+      agent has observed into the provider's CAS precondition. The layering follows: the provider owns
+      atomicity and consistency; the policy owns authorization logic.
+    </p>
+  </div>
+
+  <h2 id="sec-fs-providers">13.2 Three providers: local, sandbox, e2b</h2>
+
+  <p>
+    <code>fs-local</code> (<code>LocalFileSystem</code>) is the local implementation and the base of the other
+    two:
+  </p>
+  <ul>
+    <li><strong>Identity</strong>: the <code>targetKey</code> is the file's <code>realpath</code> — two paths reaching the same file through symlinks are the same identity, and writes land on the link target (links are preserved). The version is an opaque token derived from <code>dev:ino:size:mtimeNs:ctimeNs</code>.</li>
+    <li><strong>Atomic writes</strong>: a temp file is created exclusively with <code>wx</code> (<code>0o600</code>) inside a private staging directory next to the target, fsynced, then published; an existing file's mode is preserved, and on Windows replacement goes through <code>ReplaceFileW</code> to keep the original DACL. <code>createIfAbsent</code> uses a hard link for an atomic publish-without-replace — a file that appears concurrently after the initial probe is preserved and refused with <code>FS_NOT_OBSERVED</code>.</li>
+    <li><strong>Literal edits</strong>: an atomic read-modify-write on the same primitive, serialized per target; matching normalizes LF and writes back in the file's dominant CRLF/LF style; empty <code>oldString</code>, zero matches (<code>FS_EDIT_NOT_FOUND</code>), and multiple matches without <code>replace_all</code> (<code>FS_AMBIGUOUS_EDIT</code>) are all rejected.</li>
+  </ul>
+
+  <p>
+    <code>fs-sandbox</code> (<code>SandboxedFileSystem</code>) inherits <strong>all</strong> of local's
+    mechanism and adds only a per-call mode fence on <code>writeText</code>/<code>editText</code>:
+    <code>read-only</code> rejects every change (structured <code>FS_SANDBOX_DENIED</code>);
+    <code>workspace-write</code> allows only targets whose normalized path falls inside the writable roots —
+    the workspace root plus the platform temp area, derived by <strong>the same
+    <code>writableRoots</code> function</strong> as the Seatbelt profile, so the fs fence and the bash runner
+    cannot drift apart; <code>danger-full-access</code> passes everything through. <strong>Reads always
+    pass</strong> — every mode allows reading. Swapping it in at load time replaces fs-local and completes the
+    switch, with not one line of the model tools changed.
+  </p>
+
+  <p>
+    <code>fs-e2b</code> lands the same contract in Chapter 12's remote world: relative paths resolve against
+    <code>ctx.e2b.cwd</code>, GNU <code>realpath -mz</code> supplies canonical identity, and writes publish
+    through a staging directory + same-filesystem atomic rename. It copies nothing, mounts nothing, and syncs
+    nothing from the host workspace — handing <code>cwd</code> a host path only creates a remote directory of
+    the same name.
+  </p>
+
+  <div class="box note">
+    <div class="box-title">Threat model: a policy fence, not a kernel boundary</div>
+    <p>
+      The fs-sandbox README states it deliberately: this fence is <strong>a check inside trusted code,
+      checking model-controlled paths</strong>. The operations themselves (open, rename) belong to the seam;
+      only the target paths are untrusted, so normalize-then-test-containment is the complete answer;
+      re-normalizing in place right before the write narrows residual TOCTOU. Kernel-level isolation of
+      adversarial code is the job of the <code>ctx.shell</code> sandbox route (Chapter 12) — the two share the
+      same <code>sandboxPolicy</code>, but the mechanism and threat model differ.
+    </p>
+  </div>
+
+  <h2 id="sec-observation-policy">13.3 The observation policy: hanging on the fs/* event gates</h2>
+
+  <p>
+    Who reads and writes what, and whether it was read before writing — that is product policy, not a storage
+    primitive. dsh's answer is a <strong>four-layer stack</strong>: tools/executor (<code>tool-fs</code>) →
+    policy (<code>fs-observation-policy</code>) → provider contract (<code>dsh-fs</code>) → provider
+    (<code>fs-local</code> and friends). The policy layer <strong>has no service</strong>: it registers no
+    <code>ctx.fsPolicy</code>, and tools don't inject it — it only registers three listeners on the
+    <code>fs/*</code> events, and the event vocabulary belongs to the Definition.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The fs seam and event gates">
+      <rect x="20" y="15" width="660" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="1.5"/>
+      <text x="350" y="36" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Tool layer (Consumers)</text>
+      <text x="350" y="54" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">tool-fs (read · write · edit · read_image) · tool-str-replace-editor · tool-fs-search</text>
+
+      <line x1="240" y1="63" x2="240" y2="88" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,91 236,83 244,83" style="fill:var(--muted)"/>
+
+      <rect x="90" y="95" width="300" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="240" y="118" text-anchor="middle" style="fill:var(--accent)" font-size="12.5" font-weight="700">ctx.fs (Service Definition)</text>
+      <text x="240" y="138" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">owner of the twelve primitives + the fs/* event vocabulary</text>
+
+      <rect x="430" y="95" width="250" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="1.5"/>
+      <text x="555" y="118" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">fs-observation-policy</text>
+      <text x="555" y="138" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">companion plugin: registers only fs/* listeners, no service</text>
+
+      <line x1="393" y1="124" x2="427" y2="124" style="stroke:var(--warn)" stroke-width="1.8" stroke-dasharray="5 4"/>
+      <polygon points="430,124 422,120 422,128" style="fill:var(--warn)"/>
+      <text x="410" y="112" text-anchor="middle" style="fill:var(--warn)" font-size="10">fs/* event gate</text>
+
+      <line x1="240" y1="153" x2="240" y2="178" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="240,181 236,173 244,173" style="fill:var(--muted)"/>
+
+      <rect x="20" y="185" width="660" height="48" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="1.5"/>
+      <text x="350" y="206" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Providers (implementing ctx.fs)</text>
+      <text x="350" y="224" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11">fs-local (local) · fs-sandbox (write fence, inherits local) · fs-e2b (remote, shares ctx.e2b)</text>
+
+      <line x1="555" y1="63" x2="555" y2="88" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="555,91 551,83 559,83" style="fill:var(--muted)"/>
+      <text x="555" y="80" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">bypassing ctx.fs: the bundled rg spawned via ctx.subprocess</text>
+
+      <text x="350" y="262" text-anchor="middle" style="fill:var(--fg-dim)" font-size="11" font-style="italic">Unmount the policy plugin: tools don't break, they fall back to the unconstrained bare provider; mount it again and the policy takes effect once more — that is the point of the event gate</text>
+    </svg>
+    <figcaption>The fs four-layer stack: the policy injects no service, it hangs on the Definition-owned fs/* event gates; the search tool bypasses ctx.fs and goes straight to subprocess.</figcaption>
+  </figure>
+
+  <p>The three events (declared by <code>dsh-fs</code>, dispatched by <code>tool-fs</code>, heard by the policy plugin):</p>
+  <table>
+    <thead><tr><th>Event</th><th>Shape</th><th>What fs-observation-policy's listener does</th></tr></thead>
+    <tbody>
+      <tr><td><code>fs/write-intent</code></td><td>single-slot decision waterfall</td><td>Unobserved/observed-absent → <code>{ kind: 'createIfAbsent' }</code>; observed-present → <code>{ kind: 'replaceIfVersion', version }</code>. <strong>Decides fully, never calls <code>next()</code></strong>.</td></tr>
+      <tr><td><code>fs/edit-intent</code></td><td>single-slot decision waterfall</td><td>Unobserved → <code>FS_NOT_OBSERVED</code>; observed-absent → <code>FS_NOT_FOUND</code>; observed-present → <code>{ version }</code> as the CAS baseline. Likewise no <code>next()</code>.</td></tr>
+      <tr><td><code>fs/observed</code></td><td>fire-and-forget recording</td><td>Records <code>{ kind: 'present', version }</code> or <code>{ kind: 'absent' }</code> — synchronous, side-effect-only <code>WeakMap.set</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Observation state is a record of prior observations: a weak map from owner to target with three states
+    (unobserved / confirmed absent / present at some version). A successful read or change records present;
+    when <code>read</code> or <code>str_replace_editor</code>'s <code>view</code>/<code>str_replace</code>/<code>insert</code>
+    hits a metadata miss, it first records absent and then returns <code>FS_NOT_FOUND</code>. The policy itself
+    does <strong>no file I/O</strong> — it only converts observation state into provider guards: present means
+    supply the version; absent means allow only <code>createIfAbsent</code>; an edit without a version baseline
+    is <code>FS_NOT_FOUND</code> outright. A windowed read observes the version of the <strong>whole
+    file</strong>, so a later targeted edit is allowed only while the file is unchanged.
+  </p>
+
+  <div class="demo" data-demo="fsPolicyGate">
+    <div class="demo-title">Try it — the fs policy gate</div>
+    <p>Enter a path (try /repo/src/a.ts, /repo/.env, /etc/passwd):</p>
+    <input type="text" placeholder="/repo/src/a.ts">
+    <div class="demo-output empty">Enter a path.</div>
+  </div>
+
+  <p>
+    Single-slot, first-registered-wins is deliberate: the <code>fs/write-intent</code>/<code>fs/edit-intent</code>
+    slots hold exactly one decision-maker, and this plugin occupying the seat is a default-deployment
+    convention, not a hard invariant enforced by the events. It is <strong>not</strong> a composable
+    authorization chain — layered permissions, auditing, and sandbox interception belong to the
+    <code>tools/execute</code> pipeline (Chapter 8). The biggest dividend the event gate pays is <strong>graceful
+    mounting and unmounting</strong>: the policy influences the world only through events, so removing it never
+    breaks <code>tool-fs</code> at a service-injection boundary — the tools fall back to the bare provider
+    (unconditional writes/edits, no observation state), and remounting stacks the policy back on. Deployments
+    that mount <code>tool-fs</code> are <strong>expected</strong> to mount it too, so the default behavior is
+    read-before-write.
+  </p>
+
+  <h2 id="sec-fs-tools">13.4 The tool family: tool-fs and tool-fs-search</h2>
+
+  <p>
+    <code>tool-fs</code> is the model-facing read/write layer: the four tools <code>read</code> /
+    <code>read_image</code> / <code>write</code> / <code>edit</code> <strong>plus the executor itself</strong>.
+    It owns the tool names, schemas, parameter validation, prompt sections, read windowing
+    (<code>readLimit</code> default 2000 lines, <code>readMaxLineLength</code> 2000 characters per line,
+    <code>readMaxBytes</code> 51200 bytes), and result formatting. The execution sequence per call (the README
+    counts the stats):
+  </p>
+  <ul>
+    <li><code>read</code>: <code>resolve</code> (passing the session cwd) → one <code>stat</code> (type, size routing, version) → <code>readText</code>/<code>streamText</code> → line windowing → <code>ctx.emit('fs/observed')</code>.</li>
+    <li><code>write</code>: <code>resolve</code> → <code>ctx.waterfall('fs/write-intent', …)</code> to get the optional guard → <code>writeText(target, content, intent)</code> → <code>fs/observed</code>. (0 stats.)</li>
+    <li><code>edit</code>: <code>resolve</code> → <code>ctx.waterfall('fs/edit-intent', …)</code> → <code>editText(target, edit, intent)</code> → <code>fs/observed</code>. (0 stats.)</li>
+    <li><code>read_image</code>: registered only when a persistent <code>ctx.attachments</code> is mounted and the currently routed model declares image input; reads PNG/JPEG/WebP/GIF through bounded <code>readBytes</code>, commits via <code>attachments.saveImage</code>, and returns an image block.</li>
+  </ul>
+
+  <p>
+    The tool passes the <code>exec</code> (tool execution context) along as an opaque <code>actor</code> with
+    every dispatch — the events carry only the <code>dsh-fs</code> vocabulary plus the opaque actor, with no
+    model-facing concepts and no agent/session ownership structure. When a fencing provider is mounted
+    (<code>ctx.fs.sandboxMode</code> reports constraints), write/edit likewise advertise the
+    <code>sandbox_permissions</code> + <code>justification</code> escalation surface, mechanically identical to
+    bash in Chapter 12.
+  </p>
+
+  <p>
+    <code>tool-fs-search</code> is a deliberate <strong>exception</strong>: the two discovery tools
+    <code>glob</code> / <code>grep</code> don't go through <code>ctx.fs</code> primitives; instead they spawn
+    the bundled <code>@vscode/ripgrep</code> binary through <code>ctx.subprocess</code> (a <code>--no-config</code>
+    prefix guards against the host's <code>RIPGREP_CONFIG_PATH</code> injecting <code>--pre</code>;
+    model-controlled values are all plain argv elements, and with no shell layer there are no quoting
+    problems). The rationale is in the README: local workspace discovery is inherently a process-based
+    <code>rg</code> workflow, and putting search on <code>ctx.fs</code> would force <strong>every</strong>
+    filesystem backend to grow a search API. Note that it injects <code>subprocess</code> and not
+    <code>fs</code> — under a remote execution world, search only means something to the model when it is
+    co-located with the workspace.
+  </p>
+
+  <h2 id="sec-str-replace-editor">13.5 str_replace_editor: the model's primary file editor</h2>
+
+  <p>
+    <code>dsh-tool-str-replace-editor</code> provides a standalone <code>str_replace_editor</code> tool —
+    freely composable with persistent bash, one-shot bash, sandbox bash, or other terminal surfaces. Its
+    schema is four commands:
+  </p>
+  <table>
+    <thead><tr><th>Command</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td><code>view</code></td><td>File views use one-based line numbers and <strong>preserve tabs verbatim</strong> — the text shown is legal input for a literal replacement; directory views omit hidden, dependency, and Python cache entries and go two levels down.</td></tr>
+      <tr><td><code>create</code></td><td>Creates a new file.</td></tr>
+      <tr><td><code>str_replace</code></td><td>Replaces one literal text span: requires <strong>exactly one unique match</strong>; zero or multiple matches are errors, and the errors speak only in the public <code>old_str</code> vocabulary. <strong>There is no <code>replace_all</code> parameter</strong>.</td></tr>
+      <tr><td><code>insert</code></td><td>Inserts at the chosen zero-based insertion boundary, adding no implicit trailing newline.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The editing model's orientation is clear: <strong>precise beats lenient</strong>. No regex, no replace-all,
+    tabs outside the edited span preserved verbatim, matching defined over the displayed text — together these
+    constraints guarantee that what the model sees is what it can replace, and one <code>view</code>'s output
+    is legal input for the next <code>str_replace</code>. A metadata miss first records confirmed-absent and
+    then returns <code>FS_NOT_FOUND</code>, so a path deleted externally can be restored with
+    <code>create</code> through the mounted policy's guarded file creation; but absence does
+    <strong>not</strong> authorize <code>str_replace</code> or <code>insert</code>.
+  </p>
+
+  <p>
+    It is not a bypass: every change goes through <code>fs/write-intent</code> or <code>fs/edit-intent</code>,
+    resolves the current session sandbox policy, and delegates enforcement to the mounted filesystem and
+    policy plugin. Put differently, str_replace_editor owns the editing model, while atomicity, version
+    guards, and the sandbox fence all come from the machinery of 13.1–13.3 — exactly the payoff of seam
+    layering: swap the editor and the policy keeps working; swap the provider and the editor keeps working.
+  </p>
+
+  <h2 id="sec-recap">13.6 Chapter recap</h2>
+  <ul>
+    <li><code>ctx.fs</code>'s twelve primitives fall into five groups: identity resolution, execution-world coordinates, metadata, reads, atomic changes; the version guard is optional — omitted means unconditional, atomicity is always there.</li>
+    <li>Three providers: fs-local (realpath identity, staging + atomic publish, DACL preservation), fs-sandbox (fences writes only, reads pass, <code>FS_SANDBOX_DENIED</code>, shares <code>writableRoots</code> with Seatbelt), fs-e2b (remote world, no host sync).</li>
+    <li>Policy is not a service: <code>fs-observation-policy</code> hangs only on the <code>fs/*</code> event gates — two single-slot decision waterfalls (no <code>next()</code> calls) + one fire-and-forget recording event; mounting and unmounting are graceful, and tools never break at an injection boundary.</li>
+    <li>Observation state = a record of prior observations; windowed reads observe the whole-file version; read-before-write converts observation records into provider CAS guards.</li>
+    <li><code>tool-fs</code> is tools and executor in one (read/write/edit/read_image + windowing + <code>fs/*</code> dispatch); <code>tool-fs-search</code> deliberately bypasses ctx.fs and runs bundled ripgrep through <code>ctx.subprocess</code>.</li>
+    <li><code>str_replace_editor</code>: view/create/str_replace/insert, unique literal match, no replace-all, tabs preserved, with every change going through the <code>fs/*</code> gates.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Adding a search method to <code>ctx.fs</code> — search is an rg workflow; putting it into the provider contract would force every backend to implement it.</li>
+      <li>Stacking another decision-maker on <code>fs/*</code> as an authorization chain — the slot is single-slot, first-registered-wins; layered interception belongs to <code>tools/execute</code>.</li>
+      <li>Expecting observation state to survive across sessions — the <code>WeakMap</code> is an in-process weak reference; after a resume you must <code>read</code> again.</li>
+      <li>Assuming fs-sandbox fences reads — every mode passes reads; the fence sits only on <code>writeText</code>/<code>editText</code>.</li>
+      <li>Looking for replace_all in str_replace_editor — it is deliberately absent; multiple matches are an error and the model should pick a longer anchor text.</li>
+      <li>Assuming <code>readBytes</code> truncates — <code>maxBytes</code> is required; an overrun raises <code>FS_TOO_LARGE</code> immediately, and buffering is never unbounded.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="13">
+    <h2>Chapter 13 Test</h2>
+
+    <div class="q" data-id="13-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — resolve returns a stable FsTarget (opaque targetKey + displayPath); the same file through different paths must yield the same targetKey."
+         data-rationale="B is correct. A is wrong — there is no path field on the spec; the path resolves into a target before execution. C is wrong — processPath is what gives the subprocess-openable canonical path; targetKey is deliberately opaque. D is wrong — lstat does not follow the final symlink precisely so consumers can reject symlinks."
+         data-review="sec-fs-seam">
+      <div class="prompt"><span class="qnum">Q1.</span> What does <code>ctx.fs.resolve(path, opts)</code> produce, and what is the identity rule?</div>
+      <label class="opt"><input type="radio" name="q-13-1" value="a"> A. A string path, used directly as spec.path</label>
+      <label class="opt"><input type="radio" name="q-13-1" value="b"> B. A stable FsTarget: opaque targetKey + displayPath; the same file through different paths yields the same key</label>
+      <label class="opt"><input type="radio" name="q-13-1" value="c"> C. An absolute path a subprocess can open directly</label>
+      <label class="opt"><input type="radio" name="q-13-1" value="d"> D. A list of resolved symlink targets</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — A write/edit with expected omitted still runs inside the backend's per-target lock as an unconditional atomic change; what the optional removal drops is the version precondition."
+         data-rationale="C is correct. A is wrong — guard absence is a contract-defined legal shape (the bare provider). B is wrong — without a guard, both create and overwrite are allowed. D is wrong — atomicity never depends on the guard."
+         data-review="sec-fs-seam">
+      <div class="prompt"><span class="qnum">Q2.</span> What does omitting the expected guard on writeText/editText mean?</div>
+      <label class="opt"><input type="radio" name="q-13-2" value="a"> A. The call is rejected: the guard is a required parameter</label>
+      <label class="opt"><input type="radio" name="q-13-2" value="b"> B. Only creating new files is allowed, not overwriting</label>
+      <label class="opt"><input type="radio" name="q-13-2" value="c"> C. An unconditional atomic change — what is removed is the version precondition, not the atomicity</label>
+      <label class="opt"><input type="radio" name="q-13-2" value="d"> D. Commits are deferred and flushed in batch at dispose time</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-3" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D."
+         data-rationale="A, C, and D are correct: fs-sandbox adds a mode fence only on writeText/editText while all reads pass; the writable roots come from the same writableRoots function as the Seatbelt profile. B is wrong — the denial is a structured FsError (FS_SANDBOX_DENIED); an in-process fence knows what it denied and needs no stderr-dialect inference like bash."
+         data-review="sec-fs-providers">
+      <div class="prompt"><span class="qnum">Q3.</span> About fs-sandbox, which statements hold? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="a"> A. It inherits all of LocalFileSystem's mechanism and adds a per-call fence on only the two change primitives</label>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="b"> B. Under read-only mode, reads must also pass the fence check first</label>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="c"> C. The writable root set comes from the same writableRoots function as the Seatbelt profile, so fs and bash cannot fence to different roots</label>
+      <label class="opt"><input type="checkbox" name="q-13-3" value="d"> D. Denials are reported as structured FS_SANDBOX_DENIED, with no stderr text inference</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-4" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Because the policy participates through event gates rather than method injection: removing it just drops the tools back to the unconstrained bare provider instead of breaking them at an injection boundary."
+         data-rationale="B is correct: that is the point of event gates over a mandatory method service (README: graceful add/remove is the whole point). A is wrong — the tools keep working, just with unconditional writes/edits. C is wrong — exactly the opposite. D is wrong — read windowing and rendering are the tool's own responsibility, unrelated to the policy."
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q4.</span> You unmount fs-observation-policy from the composition (keeping tool-fs and fs-local). What happens?</div>
+      <label class="opt"><input type="radio" name="q-13-4" value="a"> A. tool-fs fails to register and the tools disappear</label>
+      <label class="opt"><input type="radio" name="q-13-4" value="b"> B. The tools keep working, falling back to the bare provider: unconditional writes/edits, no observation state</label>
+      <label class="opt"><input type="radio" name="q-13-4" value="c"> C. All write operations are rejected until the policy is remounted</label>
+      <label class="opt"><input type="radio" name="q-13-4" value="d"> D. The read tool loses its line-windowing capability</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-5" data-type="fill"
+         data-accepted='["FS_NOT_OBSERVED","fs_not_observed","not_observed"]'
+         data-answer="FS_NOT_OBSERVED (edit requires reading … first)."
+         data-rationale="The edit-intent slot throws FS_NOT_OBSERVED for an unobserved target; the tool-layer error wrapper appends the recovery hint — read the file, then retry. Observed-absent reports FS_NOT_FOUND — the two codes differ in meaning, corresponding to never read versus read but confirmed missing."
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q5.</span> Fill in the blank: the model fires an edit at a file it never read; the error code thrown by the fs/edit-intent decision-maker is ______.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-6" data-type="mcq" data-correct='["d"]'
+         data-answer="D — fs/write-intent and fs/edit-intent are single-slot decision waterfalls whose listener decides fully and never calls next(); fs/observed is fire-and-forget."
+         data-rationale="D is correct. A is wrong — quite the opposite: waterfall listeners must call next() under Chapter 2's general rule, and the single-slot decision is the exceptional shape here (a full decider). B is wrong — the event vocabulary belongs to dsh-fs; tool-fs only dispatches. C is wrong — fs/observed fires after the operation succeeds, as a synchronous side-effect-only recording."
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q6.</span> What is special about the waterfall semantics of fs/write-intent and fs/edit-intent?</div>
+      <label class="opt"><input type="radio" name="q-13-6" value="a"> A. They are ordinary waterfalls: listeners must call next() to delegate to the next one</label>
+      <label class="opt"><input type="radio" name="q-13-6" value="b"> B. They are declared by fs-observation-policy and heard by tool-fs</label>
+      <label class="opt"><input type="radio" name="q-13-6" value="c"> C. They must emit fs/observed before they can decide</label>
+      <label class="opt"><input type="radio" name="q-13-6" value="d"> D. Single-slot decision: the listener decides fully without calling next(), and the slot is first-registered-wins</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A — Search spawns the bundled @vscode/ripgrep through ctx.subprocess; putting search on ctx.fs would force every backend to grow a search API."
+         data-rationale="A is correct and the reasoning is verbatim from the README. B is wrong — it injects subprocess (and tools/systemPrompt), deliberately not fs. C is wrong — the binary is bundled as an npm dependency; registration is unconditional with no availability probing. D is wrong — timeoutMs is a cooperative budget enforced via exec.signal by the tool-call-timeout-policy; the subprocess terminate escalation is the hard kill."
+         data-review="sec-fs-tools">
+      <div class="prompt"><span class="qnum">Q7.</span> Why don't glob/grep go through ctx.fs primitives?</div>
+      <label class="opt"><input type="radio" name="q-13-7" value="a"> A. Local discovery is inherently a process-based rg workflow; putting it on the provider contract would force every filesystem backend to implement a search API</label>
+      <label class="opt"><input type="radio" name="q-13-7" value="b"> B. Because ctx.fs has no directory-listing primitive</label>
+      <label class="opt"><input type="radio" name="q-13-7" value="c"> C. Because ripgrep needs a host install and load-time probing</label>
+      <label class="opt"><input type="radio" name="q-13-7" value="d"> D. Because search has no timeout protection and can only be done at the tool layer</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-8" data-type="mcq" data-multiselect="true" data-correct='["b","c","d"]'
+         data-answer="B, C, D."
+         data-rationale="B, C, and D are correct: read_image requires ctx.attachments and a routed model declaring image input; tool-fs's fields are snake_case; read defaults to and caps at 2000 lines. A is wrong — write/edit do zero stats; the guard comes from the event gate's observation records, no on-the-spot probing needed."
+         data-review="sec-fs-tools">
+      <div class="prompt"><span class="qnum">Q8.</span> About the tool-fs executor, which statements hold? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="a"> A. write and edit do one stat first each time to probe the version</label>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="b"> B. read_image registers only when ctx.attachments is mounted and the routed model declares image input</label>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="c"> C. Tool parameter field names use snake_case (file_path and friends) to align with existing tool schemas</label>
+      <label class="opt"><input type="checkbox" name="q-13-8" value="d"> D. A single read returns at most 2000 lines by default (readLimit doubles as the cap)</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — It requires a unique literal match, rejects zero/multiple matches, and has no replace_all; view's output is legal replacement input."
+         data-rationale="C is correct: that is the editing model's deliberate orientation. A is wrong — there is no replace_all; multiple matches are an error. B is wrong — view preserves tabs so the displayed text is the literal input. D is wrong — changes still go through fs/write-intent / fs/edit-intent, with policy and fence fully in effect."
+         data-review="sec-str-replace-editor">
+      <div class="prompt"><span class="qnum">Q9.</span> What is the core of str_replace_editor's editing model?</div>
+      <label class="opt"><input type="radio" name="q-13-9" value="a"> A. Regex replacement with replace_all for batches</label>
+      <label class="opt"><input type="radio" name="q-13-9" value="b"> B. view output expands tabs into spaces to ease matching</label>
+      <label class="opt"><input type="radio" name="q-13-9" value="c"> C. Unique literal match: zero/multiple matches are errors, no replace_all, and one view's text is legal input for the next replacement</label>
+      <label class="opt"><input type="radio" name="q-13-9" value="d"> D. It bypasses the fs/* gates and calls the provider directly for speed</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Observation state is an in-process WeakMap, not persisted across sessions; a resumed session must read again to earn its guard baseline."
+         data-rationale="B is correct (README: Observed state does not survive a session resume — persistence is explicitly deferred). A is backwards: a windowed read observes the whole-file version and authorizes later targeted edits. C is wrong: a direct ctx.fs read dispatches no fs/observed, so a guarded edit afterwards is still FS_NOT_OBSERVED. D is wrong: what is authorized is version freshness, not view completeness — any windowed read authorizes overwriting the whole file (if unchanged)."
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q10.</span> After a session is restored from persistence, the model fires an edit at a file it read yesterday. What happens?</div>
+      <label class="opt"><input type="radio" name="q-13-10" value="a"> A. It executes normally: observation records persist in the session log</label>
+      <label class="opt"><input type="radio" name="q-13-10" value="b"> B. FS_NOT_OBSERVED: observation state is an in-process weak map; after a resume it must read again first</label>
+      <label class="opt"><input type="radio" name="q-13-10" value="c"> C. It executes normally: a windowed read authorizes the whole file, regardless of process boundaries</label>
+      <label class="opt"><input type="radio" name="q-13-10" value="d"> D. FS_STALE_VERSION: the version token necessarily expires after a restart</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-11" data-type="fill"
+         data-accepted='["createIfAbsent","createifabsent","create_if_absent"]'
+         data-answer="createIfAbsent (atomic file creation published without replacement)."
+         data-rationale="For an unobserved or confirmed-absent target, the write-intent decision-maker resolves to createIfAbsent: publication takes the atomic no-replace path (local uses a hard-linked staging file), and a file appearing concurrently after the initial probe is preserved rather than overwritten. replaceIfVersion is the choice when presence has been observed."
+         data-review="sec-observation-policy">
+      <div class="prompt"><span class="qnum">Q11.</span> Fill in the blank: a write aimed at a never-observed (or confirmed-absent) target has its guard resolved by the policy to { kind: ______ }.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="13-12" data-type="short"
+         data-key-points='["Four-layer stack: tool-fs (tools + executor) → fs-observation-policy (policy) → dsh-fs (contract + event vocabulary) → provider (local/sandbox/e2b)","The policy has no service: it hangs only on the fs/* event gates (two single-slot decisions + one fire-and-forget recording), mounting and unmounting gracefully","The version guard is optional: observation state converts into provider CAS preconditions, which is how read-before-write is implemented","The search exception: tool-fs-search spawns bundled ripgrep through ctx.subprocess, adding no search API to providers","the unique-literal-match editing model of str_replace_editor, with changes still going through the fs/* gates"]'
+         data-answer="Answer with the four-layer stack: the tool layer owns the schemas and read windowing and dispatches the fs/* events; the policy layer has no service and hangs only on the event gates, converting observation records (unobserved/absent/present-at-version) into createIfAbsent, replaceIfVersion, or rejection; the contract layer owns the twelve primitives and the event vocabulary; the provider layer is swappable among local/sandbox/e2b. The search tool is the exception, going through subprocess + ripgrep. str_replace_editor provides a unique-literal-match editing model, likewise through the gates."
+         data-rationale="The four-layer stack + event gates + optional guards are this chapter's spine; recite them and Chapter 12's execution world plus this chapter's file world form one complete plane."
+         data-review="sec-recap">
+      <div class="prompt"><span class="qnum">Q12.</span> In your own words, walk through the four-layer division of labor in the file stack, and how read-before-write is achieved without adding policy methods to the provider.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Check a point only if your answer truly covers it — under-checking hurts your calibration; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="14-subagents.html"><strong>Chapter 14 · Delegation and Subagents</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 18 · dsh CLI and boot in depth — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 18 · CLI and boot</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/18-cli-and-boot.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="18">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 18 · Part IV · Product Front Ends and Protocols</div>
+    <h1>dsh CLI and boot in depth</h1>
+    <p class="lede">
+      Through seventeen chapters you have been working inside an already-assembled runtime. This
+      chapter returns to the starting point: the <span class="kbd">dsh</span> command itself. Who
+      parses the arguments, who loads the plugins, and whose hands the remaining argv finally
+      lands in — this boot chain is the territory of the two package groups <code>apps/cli</code>
+      and <code>packages/boot</code>. Read it through and you can answer the two most common field
+      questions: “why didn't my flag take effect” and “how exactly does a profile's plugin tree
+      grow”.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">Learning objectives</div>
+    <ul>
+      <li>State the division of labor between <code>bin</code> and <code>args</code> in <code>apps/cli</code>, and why <code>bin.ts</code> dynamically imports per mode.</li>
+      <li>Recite dsh's entry modes (profile, one-shot headless, the web alias, plugin management) and which arguments belong to each.</li>
+      <li>Draw the profile's layered configuration tree: bundle patch → profile patch → home patch → <code>--patch</code> overlay.</li>
+      <li>Describe <code>dsh-app-boot</code>'s boot guards (layered env, fail-loud, watchUserPatches) and its signal semantics.</li>
+      <li>Explain how the remaining argv is handed back to app plugins via <code>ctx.cmdlineArgs</code>, and the ESM contract of the source launch.</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-entry-and-grammar">18.1 Entry and argument grammar: the bin/args split</h2>
+
+  <p>
+    <code>dsh</code>'s npm entry is a single line in <code>apps/cli/package.json</code>:
+    <code>"bin": { "dsh": "lib/bin.js" }</code>. In the installed form it starts the build
+    artifact; in the repository's source form it is <code>apps/cli/src/bin.ts</code>. This file is
+    deliberately kept “thin”: read its own version once, call <code>parseDshArgs</code> to parse
+    argv, then <strong>dynamically import</strong> the runner for the parsed mode —
+    <code>profile-boot.ts</code>, <code>plugin.ts</code>, or <code>dump-config.ts</code>.
+  </p>
+
+  <pre><code><span class="code-key">const</span> invocation = <span class="code-fn">parseDshArgs</span>(process.argv.<span class="code-fn">slice</span>(<span class="code-key">2</span>), <span class="code-fn">readVersion</span>())
+
+<span class="code-key">switch</span> (invocation.mode) {
+  <span class="code-key">case</span> <span class="code-str">'profile'</span>: {
+    <span class="code-key">const</span> { runProfile } = <span class="code-key">await</span> <span class="code-key">import</span>(<span class="code-str">'./profile-boot.ts'</span>)
+    <span class="code-key">await</span> <span class="code-fn">runProfile</span>({ environment: <span class="code-fn">loadLayeredEnv</span>(<span class="code-str">'dsh'</span>), <span class="code-comment">/* … */</span> })
+    <span class="code-key">break</span>
+  }
+  <span class="code-comment">// plugin and dump-config likewise only dynamically import the selected runner</span>
+}</code></pre>
+
+  <p>
+    Dynamic import is not a style preference but load-surface control: when running
+    <code>dsh plugin</code> to manage dependencies, the process has no need at all to pull in the
+    profile boot chain (the Cordis Loader, bundle resolution, the HMR watcher). Each dispatch path
+    loads only the plugin surface it uses — exactly the echo of “everything is a plugin” at the
+    process entry point.
+  </p>
+
+  <p>
+    The sole owner of the argument grammar is <code>parseDshArgs</code> in
+    <code>apps/cli/src/args.ts</code>. It is built on commander but configured with restraint:
+    <code>helpOption(false)</code> (the launcher does not own <span class="kbd">-h</span>),
+    <code>allowUnknownOption()</code> plus <code>passThroughOptions()</code> plus
+    <code>enablePositionalOptions()</code>. Together the three express one positional rule:
+    <strong>launcher flags come first, and the first token it does not recognize is the start of
+    the app arguments</strong>. So in <code>dsh --profile web --port 8080</code>,
+    <code>--port</code> belongs to the web app, and <code>dsh --profile web --help</code> prints
+    the web app's help; only a bare <code>dsh --help</code> without a profile prints the
+    launcher's own help. One more detail: <code>--patch</code> is implemented as a repeatable
+    single-value collector and never as a variadic argument — a variadic <code>--patch</code>
+    would swallow every app argument after it.
+  </p>
+
+  <h2 id="sec-modes">18.2 Four entry modes</h2>
+
+  <p>
+    <code>args.ts</code> parses an invocation into three kinds (profile / dump-config / plugin);
+    add the hardcoded <code>web</code> alias and you get the four entry modes of the product
+    documentation:
+  </p>
+
+  <table>
+    <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>dsh --profile &lt;name&gt;</code></td><td>Starts the profile under <code>$DSH_HOME/profiles/&lt;name&gt;</code>; the part of argv after the launcher flags is handed to the app unchanged.</td></tr>
+      <tr><td><code>dsh --profile headless "task"</code></td><td>One-shot execution: creates a brand-new persistent Agent, submits the task, waits for quiescence, flushes the session, prints the final answer, and exits; exit code 0 if the turn ends <code>completed</code>, otherwise 1.</td></tr>
+      <tr><td><code>dsh web</code></td><td>A hardcoded alias for <code>--profile web</code>; the following flags belong to the web app (<code>--host</code>, <code>--port</code>, repeatable <code>--trusted-host</code>).</td></tr>
+      <tr><td><code>dsh plugin --profile &lt;name&gt; &lt;pnpm args&gt;</code></td><td>Forwards the arguments unchanged to pnpm inside the profile directory: install, uninstall, and query external plugins.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Two details are worth remembering. First, the <code>web</code> and <code>headless</code>
+    profiles auto-initialize from product-bundled templates on first use (web is base + web-app,
+    headless is base + headless); a missing profile with any other name fails loud and tells you
+    to run <code>dsh plugin --profile &lt;name&gt; add …</code> first. Second, the headless
+    one-shot run is a “pure core” path: it mounts no ApiProxy, no Host, opens no HTTP port, and
+    loads no Web runtime or browser client — a successful run writes not one character to stderr.
+  </p>
+
+  <p>
+    The <code>dsh plugin</code> subcommand itself deserves a look: <code>add</code> resolves
+    relative paths (such as <span class="kbd">.</span> or <code>../plugin</code>) against the
+    calling directory first, so inside a plugin source checkout,
+    <code>dsh plugin --profile tui add .</code> installs this checkout rather than something
+    already in the profile. After every successful run, <code>dsh.profile.bundles</code> is
+    reconciled with the actual install state: an installed package that declares
+    <code>"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }</code> enters the layering stack,
+    and uninstalled dependencies leave it.
+  </p>
+
+  <p>
+    Finally, two “view the tree without starting” diagnostic modes: <code>--dump-config</code>
+    prints the fully composed configuration tree (including user layers and <code>--patch</code>),
+    while <code>--dump-default-config</code> prints only the bundle layer. dump runs no app
+    command-line provider, so what it shows is the tree from <strong>before</strong> app arguments
+    are parsed — which is also why it refuses to carry app arguments: printing a tree that would
+    not match an actual launch with the same arguments would only mislead.
+  </p>
+
+  <h2 id="sec-profile-layers">18.3 Profiles and the layered configuration tree</h2>
+
+  <p>
+    A profile is a directory: <code>$DSH_HOME/profiles/&lt;name&gt;</code>
+    (<code>~/.dsh</code> when <code>$DSH_HOME</code> is unset). Three things in the directory
+    each have their own job:
+  </p>
+
+  <ul>
+    <li><code>package.json</code> — out-of-tree plugin dependencies, plus the profile manifest <code>dsh.profile</code> with its ordered <code>bundles</code> list;</li>
+    <li><code>cordis.patch.yml</code> — your own patch layer;</li>
+    <li><code>cordis.yml</code> — the root configuration, holding an empty entry list that is rewritten on every launch.</li>
+  </ul>
+
+  <p>
+    The entire plugin tree is <strong>patched into existence</strong> on an empty root. The
+    application order is fixed:
+  </p>
+
+  <ol>
+    <li>each bundle's patch in <code>dsh.profile.bundles</code>, in list order (the boxed bundles
+        <code>@deepseek-ai/dsh-base</code>, <code>@deepseek-ai/dsh-web-app</code>,
+        <code>@deepseek-ai/dsh-headless</code> resolve first from the dsh installation, then from
+        the profile's own node_modules);</li>
+    <li>the profile's own <code>cordis.patch.yml</code>;</li>
+    <li>the home-level <code>$DSH_HOME/cordis.patch.yml</code> (machine-level preferences that apply to every profile, hence above the per-profile layer);</li>
+    <li>each <code>--patch</code> overlay, in argv order.</li>
+  </ol>
+
+  <p>
+    Later layers win per line, and “winning” means <strong>whole-value replacement</strong> of the
+    target line's <code>config</code>, not a deep merge — fields you want to keep must be restated
+    in the patch. A patch pointing at a nonexistent line id is only a stderr warning; an empty
+    file or a comment-only file throws (it parses to no list at all; write <code>[]</code> to
+    disable the layer). There is also one environment switch that becomes the topmost patch: any
+    non-empty <code>DSH_TELEMETRY_DISABLED</code> (even <code>0</code> or <code>false</code>)
+    generates a patch that disables the telemetry line — the privacy switch errs toward off,
+    never on.
+  </p>
+
+  <p>
+    There are also two infrastructure artifacts that let out-of-tree plugins resolve by bare
+    name: <code>healProfilesModuleFallback</code> maintains the flat
+    <code>$DSH_HOME/profiles/node_modules</code> directory on every launch (one symlink per
+    package the installation depends on), so a bare plugin name in any profile resolves through
+    Node's ordinary parent-directory lookup.
+  </p>
+
+  <h2 id="sec-app-boot">18.4 app-boot: the boot chain and fail-loud guards</h2>
+
+  <p>
+    <code>packages/boot/app-boot</code> (<code>@deepseek-ai/dsh-app-boot</code>) is the shared
+    boot glue; both bins, <code>dsh</code> and <code>dsh-acp-demo</code>, rely on it so that
+    loader failure behavior has exactly one owner. The key sequence of one
+    <code>runProfile</code>:
+  </p>
+
+  <ol>
+    <li><code>loadLayeredEnv('dsh')</code> freezes an environment snapshot: inherited environment &gt; the calling directory's <code>.env</code> &gt; the Harness home's <code>.env</code>, rejecting bootstrap-only file variables, with accepted values landing in <code>process.env</code>;</li>
+    <li><code>composeProfile</code> stacks the patch list in the previous section's order (each layer cloned with <code>structuredClone</code> — insert lines from patches are pushed into the tree by reference, so reusing the same parsed object would bake user overrides onto in-memory bundle lines);</li>
+    <li><code>installFailLoud</code> installs the guard: a Loader rejection during boot or later becomes one labeled stderr line plus <code>exit(1)</code>, awaiting one bounded release cleanup before exiting (a surface holding the terminal restores the terminal before dying);</li>
+    <li><code>boot()</code> creates the root context, exposes <code>dshHomePath()</code> to the Loader's <code>!!js</code> expressions, installs the vendored Cordis Loader, runs prepare hooks <strong>before any configuration-tree entry mounts</strong> — the launcher provides the environment-snapshot service and <code>provideCmdline</code> here — then mounts and awaits the entire include tree, asserting every enabled entry is both loaded and activated; on failure it destroys half the context and throws an error carrying the bin name.</li>
+  </ol>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 880 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="dsh boot sequence diagram">
+      <rect x="10" y="30" width="120" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="70" y="58" text-anchor="middle" style="fill:var(--accent)" font-size="13" font-weight="700">argv</text>
+      <text x="70" y="76" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">dsh --profile web --port 8080</text>
+
+      <line x1="130" y1="65" x2="165" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="165,65 157,61 157,69" style="fill:var(--muted)"/>
+
+      <rect x="165" y="30" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="2"/>
+      <text x="240" y="53" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">launcher</text>
+      <text x="240" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">args.ts parses only</text>
+      <text x="240" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">--profile/--patch/dump</text>
+
+      <line x1="315" y1="65" x2="350" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="350,65 342,61 342,69" style="fill:var(--muted)"/>
+
+      <rect x="350" y="30" width="150" height="70" rx="8" style="fill:var(--surface-2);stroke:var(--fg)" stroke-width="2"/>
+      <text x="425" y="53" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">bin.ts</text>
+      <text x="425" y="70" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">dynamic import of</text>
+      <text x="425" y="84" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">the selected mode runner</text>
+
+      <line x1="500" y1="65" x2="535" y2="65" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="535,65 527,61 527,69" style="fill:var(--muted)"/>
+
+      <rect x="535" y="16" width="335" height="98" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="702" y="36" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">Layered config tree (patches applied in order onto an empty root)</text>
+      <rect x="700" y="44" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--muted)"/>
+      <text x="776" y="55" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">--patch overlays</text>
+      <rect x="700" y="61" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--muted)"/>
+      <text x="776" y="72" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">$DSH_HOME/cordis.patch.yml</text>
+      <rect x="700" y="78" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--muted)"/>
+      <text x="776" y="89" text-anchor="middle" style="fill:var(--fg-dim)" font-size="9">profile/cordis.patch.yml</text>
+      <rect x="700" y="95" width="152" height="14" rx="3" style="fill:var(--surface-2);stroke:var(--pass)"/>
+      <text x="776" y="106" text-anchor="middle" style="fill:var(--pass)" font-size="9">bundle patches (bundles order)</text>
+
+      <line x1="425" y1="100" x2="425" y2="140" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="425,140 421,132 429,132" style="fill:var(--muted)"/>
+
+      <rect x="290" y="140" width="270" height="58" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="425" y="163" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">app-boot: boot()</text>
+      <text x="425" y="181" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">loadLayeredEnv · installFailLoud · vendored Loader</text>
+
+      <line x1="425" y1="198" x2="425" y2="238" style="stroke:var(--muted)" stroke-width="2"/>
+      <polygon points="425,238 421,230 429,230" style="fill:var(--muted)"/>
+
+      <rect x="290" y="238" width="270" height="66" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="425" y="261" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">Cordis plugin tree (root ctx)</text>
+      <text x="425" y="279" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">prepare hooks provide first:</text>
+      <text x="425" y="293" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">env snapshot + provideCmdline</text>
+
+      <rect x="610" y="238" width="260" height="66" rx="8" style="fill:var(--surface-2);stroke:var(--warn)" stroke-width="2"/>
+      <text x="740" y="261" text-anchor="middle" style="fill:var(--warn)" font-size="12" font-weight="700">app plugins claim the remaining argv</text>
+      <text x="740" y="279" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">ctx.cmdlineArgs snapshot → own service</text>
+      <text x="740" y="293" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">['--port','8080'] → webStartup</text>
+
+      <line x1="560" y1="271" x2="610" y2="271" style="stroke:var(--muted)" stroke-width="2" stroke-dasharray="5,4"/>
+      <polygon points="610,271 602,267 602,275" style="fill:var(--muted)"/>
+
+      <text x="70" y="180" style="fill:var(--fg-dim)" font-size="10" font-style="italic">watchUserPatches:</text>
+      <text x="70" y="194" style="fill:var(--fg-dim)" font-size="10" font-style="italic">both cordis.patch.yml layers</text>
+      <text x="70" y="208" style="fill:var(--fg-dim)" font-size="10" font-style="italic">re-composed transactionally on edit</text>
+      <line x1="170" y1="180" x2="288" y2="169" style="stroke:var(--muted)" stroke-width="1.5" stroke-dasharray="4,4"/>
+      <polygon points="288,169 279,167 281,175" style="fill:var(--muted)"/>
+    </svg>
+    <figcaption>The chain of one dsh profile launch: the launcher recognizes only its own flags, the configuration tree is patched in layers onto an empty root, the Cordis Loader mounts the plugin tree, and the remaining argv is handed back to the app plugins via ctx.cmdlineArgs.</figcaption>
+  </figure>
+
+  <p>
+    Two resident matters remain after boot. First, <strong>config-only HMR</strong>:
+    <code>watchUserPatches</code> registers the profile-layer and home-layer
+    <code>cordis.patch.yml</code> with the HMR service, and every edit transactionally
+    re-composes the whole patch list — during re-composition the bundle layer always stays at the
+    bottom and the overlays always on top, so user edits can never squeeze them aside; if a read
+    or parse fails, the last good tree keeps running. One-shot surfaces (headless) destroy the
+    watcher through their own bounded shutdown. Second, <strong>signal semantics</strong>:
+    SIGTERM is a supervisor's ordinary stop request with exit code 0 on all surfaces; SIGINT is a
+    user interrupt with exit code 130; plugin-tree cleanup gets a five-second budget, and a
+    second signal force-exits immediately.
+  </p>
+
+  <h2 id="sec-cmdline">18.5 Where the remaining argv goes: cmdlineArgs and slash commands</h2>
+
+  <p>
+    The launcher's entire responsibility for app arguments ends at the <code>provideCmdline</code>
+    step. It provides two things to the tree (<code>packages/boot/cmdline</code>,
+    <code>@deepseek-ai/dsh-cmdline</code>): <code>ctx.cmdlineArgs</code> — the invocation's
+    internal arguments, whose <code>get()</code> returns an immutable snapshot
+    (<code>dsh --profile tui --resume abc</code> yields <code>['--resume','abc']</code>) — and
+    <code>ctx.appExit</code> — a bounded process-exit request wired to the launcher's shutdown
+    controller.
+  </p>
+
+  <p>
+    From there it is <strong>the app plugins' business</strong>. Any plugin can inject
+    <code>cmdlineArgs</code>, parse it, and publish an ordinary service;
+    <code>parseCmdline(ctx, program)</code> is merely a commander adapter. The key ordering
+    mechanism sits on the Loader side: a line's <code>!!js</code> interpolation is deferred until
+    every injection the line declares has <strong>activated</strong>, so the web bundle can write:
+  </p>
+
+  <pre><code>- id: webserver
+  name: <span class="code-str">'@deepseek-ai/dsh-host-webserver'</span>
+  inject: [webStartup]
+  config:
+    port: <span class="code-str">!!js</span> ctx.webStartup.port ?? <span class="code-key">3080</span></code></pre>
+
+  <p>
+    Cordis has already populated <code>webStartup</code> before the Loader asks for the
+    webserver config, so <strong>the flag beats the value written beside it</strong>. Note that
+    this precedence depends on keeping that expression in the line: if a user patch replaces the
+    whole <code>config</code> with a literal, the runtime read is gone (the whole-value
+    replacement semantics of Section 18.3). The snapshot is shared and read-only: multiple
+    plugins can each parse the same argv without interfering, and a profile with no readers
+    simply ignores its own app arguments.
+  </p>
+
+  <p>
+    Do not confuse argv with <strong>slash commands</strong>. The latter happen inside a session:
+    the user types <span class="kbd">/compact</span> into the input box, and the Web front end
+    hands it to the host's <code>ctx.commands</code> registry through the
+    <code>command.execute</code> RPC — that is the human collaboration plane from Chapter 16,
+    unrelated to process launch arguments.
+  </p>
+
+  <h2 id="sec-source-launch">18.6 The source-launch contract: tsx's ESM hook</h2>
+
+  <p>
+    <code>pnpm dsh &lt;args…&gt;</code> at the repository root goes through no build: the
+    <code>package.json</code> script starts <code>apps/cli/src/bin.ts</code> directly with
+    <code>node --import tsx/esm</code> and forwards all arguments. This brings one contract you
+    must honor: every module the CLI source-launch path reaches must be ESM — CJS-only exports
+    are not acceptable. The reason is that Node's native TypeScript modes are unavailable across
+    the supported engine range, and tsx's ESM-only hook is the only bridge; the full decision is
+    recorded in
+    <code>.agents/notes/implemented/architecture/2026-07-29-dsh-source-launch-tsx-esm.md</code>.
+  </p>
+
+  <p>
+    In practice this contract affects two things for you: when adding a dependency to a package
+    the CLI will reach, confirm it loads under ESM; when debugging a module-resolution error from
+    <code>pnpm dsh</code>, first ask “is it the Typert host artifact or a front-end artifact
+    that's missing” — a missing Typert artifact blows up profile boot as a module-resolution
+    error with no build hint, while a missing front-end or client-plugin bundle produces an
+    explicit prompt at boot to run <code>pnpm run build</code>. The installed form has none of
+    this: it starts the built <code>apps/cli/lib/bin.js</code> directly.
+  </p>
+
+  <h2 id="sec-recap">18.7 Chapter recap</h2>
+  <ul>
+    <li>In <code>apps/cli</code>, <code>args.ts</code> owns the argument grammar and <code>bin.ts</code> dynamically imports the runner per mode; launcher flags come first, and from the first unrecognized token on it is app arguments.</li>
+    <li>Four modes: <code>--profile</code> launch, headless one-shot, the <code>web</code> alias, and <code>plugin</code> forwarding to pnpm; <code>--dump-config</code> views the tree without starting.</li>
+    <li>The profile tree is patched in layers onto an empty root: bundle layer (bundles order) → profile layer → home layer → <code>--patch</code>; later layers whole-value-replace the target line's config, no deep merge.</li>
+    <li><code>dsh-app-boot</code> owns the env snapshot, the fail-loud guard, the vendored-Loader boot, and config-only HMR for the two user patch layers; SIGTERM exits 0, SIGINT exits 130.</li>
+    <li>The remaining argv is handed back to app plugins via <code>ctx.cmdlineArgs</code> (an immutable snapshot); the Loader interpolates <code>!!js</code> only after the declared injections activate, so flags beat hardcoded values; slash commands go through <code>ctx.commands</code> and have nothing to do with argv.</li>
+    <li>The source launch goes through tsx's ESM hook (<code>node --import tsx/esm</code>); every module it reaches must be ESM.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>Treating <code>--port</code> or <code>--resume</code> as launcher flags — they belong to the app being started; the launcher recognizes only <code>--profile</code>, <code>--patch</code>, and the two dumps.</li>
+      <li>Assuming patches deep-merge — they whole-value-replace the target line's <code>config</code>, kept fields must be restated; replacing a config containing a <code>!!js</code> expression with a literal breaks the flag.</li>
+      <li>Writing only comments in an empty <code>cordis.patch.yml</code> — parsing to nothing throws; write <code>[]</code> to disable the layer.</li>
+      <li>Expecting <code>dsh --profile web --help</code> to print launcher help — only a bare <code>dsh --help</code> with no profile to take over is the launcher's.</li>
+      <li>Introducing a CJS-only module into the CLI source path — it simply will not load under the tsx ESM hook.</li>
+    </ul>
+  </div>
+
+  <form class="test" data-chapter="18">
+    <h2>Chapter 18 Test</h2>
+
+    <div class="q" data-id="18-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — Arguments after the first token the launcher does not recognize are handed unchanged to the app being started; --port is the web app's flag."
+         data-rationale="B is correct: the launcher recognizes only --profile/--patch/dump, and the rest of argv goes to the app plugins via ctx.cmdlineArgs. A is wrong — the launcher knows no app flags. C is wrong — this is designed ownership, not an error. D is wrong — dump mode is what refuses app arguments; profile mode starts as usual."
+         data-review="sec-cmdline">
+      <div class="prompt"><span class="qnum">Q1.</span> In <code>dsh --profile web --port 8080</code>, who parses <code>--port</code>?</div>
+      <label class="opt"><input type="radio" name="q-18-1" value="a"> A. The launcher's args.ts</label>
+      <label class="opt"><input type="radio" name="q-18-1" value="b"> B. The web app plugin that injects <code>cmdlineArgs</code></label>
+      <label class="opt"><input type="radio" name="q-18-1" value="c"> C. Nobody — the command fails with a usage error</label>
+      <label class="opt"><input type="radio" name="q-18-1" value="d"> D. It is only parsed when combined with --dump-config</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-2" data-type="mcq" data-correct='["c"]'
+         data-answer="C — Each dispatch path dynamically imports only the selected mode runner, without pulling unused plugin surfaces into the process."
+         data-rationale="C is correct: bin.ts awaits import of profile-boot/plugin/dump-config one at a time — load-surface control. A is wrong — commander is already a static dependency. B is wrong — module load failures also fail loud. D is wrong — parsing once is args.ts's job and unrelated to dynamic import."
+         data-review="sec-entry-and-grammar">
+      <div class="prompt"><span class="qnum">Q2.</span> Why does bin.ts dynamically import each runner by mode?</div>
+      <label class="opt"><input type="radio" name="q-18-2" value="a"> A. To lazy-load commander and speed up --help</label>
+      <label class="opt"><input type="radio" name="q-18-2" value="b"> B. So parse errors can be retried silently</label>
+      <label class="opt"><input type="radio" name="q-18-2" value="c"> C. So each mode loads only the plugin surface it needs</label>
+      <label class="opt"><input type="radio" name="q-18-2" value="d"> D. To defer argument parsing to a second pass inside the runner</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-3" data-type="mcq" data-multiselect="true" data-correct='["a","b","c"]'
+         data-answer="A, B, and C."
+         data-rationale="A/B/C are all the launcher's own flags. D's --port belongs to the web app; E's --trusted-host is likewise a web app flag (repeated --trusted-host feeds trustedHosts)."
+         data-review="sec-entry-and-grammar">
+      <div class="prompt"><span class="qnum">Q3.</span> Which of the following flags does the launcher itself own? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="a"> A. <code>--profile &lt;name&gt;</code></label>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="b"> B. <code>--patch &lt;path&gt;</code> (repeatable)</label>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="c"> C. <code>--dump-config</code></label>
+      <label class="opt"><input type="checkbox" name="q-18-3" value="d"> D. <code>--port</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-4" data-type="mcq" data-correct='["d"]'
+         data-answer="D — Bundle patches in bundles order, then the profile layer, the home layer, and --patch overlays apply in sequence; later layers win per line."
+         data-rationale="D is correct: this is the profile tree's fixed layering. A puts the home layer lowest — wrong, machine-level preferences must outrank the per-profile layer. B puts the user layers under the bundle layer, so user edits could not change bundle defaults. C moves overlays ahead of the user layers, so --patch is no longer topmost."
+         data-review="sec-profile-layers">
+      <div class="prompt"><span class="qnum">Q4.</span> In what order are a profile's patch layers applied?</div>
+      <label class="opt"><input type="radio" name="q-18-4" value="a"> A. home layer → bundle layer → profile layer → --patch</label>
+      <label class="opt"><input type="radio" name="q-18-4" value="b"> B. profile layer → bundle layer → home layer → --patch</label>
+      <label class="opt"><input type="radio" name="q-18-4" value="c"> C. --patch → home layer → profile layer → bundle layer</label>
+      <label class="opt"><input type="radio" name="q-18-4" value="d"> D. bundle layer (bundles order) → profile layer → home layer → --patch</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-5" data-type="fill" data-accepted='["dsh.profile","dsh.profile 文件"]'
+         data-answer="dsh.profile (the manifest field/file inside the profile's package.json)."
+         data-rationale="The profile directory's package.json carries the dsh.profile manifest with its ordered bundles list; bundle names resolve first from the dsh installation, then from the profile's own node_modules."
+         data-review="sec-profile-layers">
+      <div class="prompt"><span class="qnum">Q5.</span> Fill in the blank: a profile directory holds plugin dependencies plus a manifest — the manifest with the ordered <code>bundles</code> list is <code>______</code>.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-6" data-type="mcq" data-correct='["b"]'
+         data-answer="B — An id-targeted patch whole-value-replaces the target line's config; fields to keep must be restated in the patch."
+         data-rationale="B is correct: the replacement is wholesale, not key-by-key merging. A is wrong — deep merge is precisely the semantics ruled out. C is wrong — pointing at an unknown id is only a stderr warning. D is wrong — patches can insert new lines and can carry !!js expressions."
+         data-review="sec-profile-layers">
+      <div class="prompt"><span class="qnum">Q6.</span> When an id-targeted patch hits an existing line, what is the granularity of the replacement?</div>
+      <label class="opt"><input type="radio" name="q-18-6" value="a"> A. Deep merge: only the keys present are overridden</label>
+      <label class="opt"><input type="radio" name="q-18-6" value="b"> B. The line's config is replaced wholesale; kept fields must be restated</label>
+      <label class="opt"><input type="radio" name="q-18-6" value="c"> C. It throws, unless the line also appears in bundles</label>
+      <label class="opt"><input type="radio" name="q-18-6" value="d"> D. Only inserting new lines is allowed; existing lines cannot change</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-7" data-type="mcq" data-correct='["a"]'
+         data-answer="A — Valid edits to the two user-layer cordis.patch.yml files are transactionally re-composed, with the bundle layer below and overlays above; user edits cannot squeeze them aside."
+         data-rationale="A is correct: watchUserPatches provides config-only HMR. B is wrong — both user-layer files are watched. C is wrong — module-level hot reload is a different thing (client-side HMR belongs to Chapter 19). D is wrong — re-composition preserves the application order above the user layers; it is not a simple replay."
+         data-review="sec-app-boot">
+      <div class="prompt"><span class="qnum">Q7.</span> What capability does <code>watchUserPatches</code> provide?</div>
+      <label class="opt"><input type="radio" name="q-18-7" value="a"> A. Config-only hot reload of the profile and home <code>cordis.patch.yml</code> files</label>
+      <label class="opt"><input type="radio" name="q-18-7" value="b"> B. Hot reload of the home-layer file only</label>
+      <label class="opt"><input type="radio" name="q-18-7" value="c"> C. Module hot replacement of the browser client plugins</label>
+      <label class="opt"><input type="radio" name="q-18-7" value="d"> D. Replays user edits as the bottom-most patch</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-8" data-type="mcq" data-correct='["c"]'
+         data-answer="C — SIGTERM is a supervisor's ordinary stop request with exit code 0 on every surface; SIGINT is a user interrupt with exit code 130."
+         data-rationale="C is correct. A/D swap the two signals or treat both as 0. B is wrong — SIGINT reports 130. Note that only a second signal forces an immediate exit; the first gives the plugin tree up to five seconds of cleanup."
+         data-review="sec-app-boot">
+      <div class="prompt"><span class="qnum">Q8.</span> What are the exit codes for SIGTERM and SIGINT, respectively?</div>
+      <label class="opt"><input type="radio" name="q-18-8" value="a"> A. 130 and 0</label>
+      <label class="opt"><input type="radio" name="q-18-8" value="b"> B. 0 and 0</label>
+      <label class="opt"><input type="radio" name="q-18-8" value="c"> C. 0 and 130</label>
+      <label class="opt"><input type="radio" name="q-18-8" value="d"> D. 1 and 130</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-9" data-type="mcq" data-multiselect="true" data-correct='["a","b","d"]'
+         data-answer="A, B, and D."
+         data-rationale="A/B/D are correct: dumps are boot-free, run no app command-line provider, and therefore refuse app arguments; the two dumps are mutually exclusive; the default dump contains only the bundle layer. C is wrong — precisely because no provider runs, a dump shows the tree from before app arguments are parsed and cannot show a flag's effect."
+         data-review="sec-modes">
+      <div class="prompt"><span class="qnum">Q9.</span> Which statements about configuration dumps are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="a"> A. <code>--dump-config</code> and <code>--dump-default-config</code> are mutually exclusive</label>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="b"> B. Dumps accept no app arguments; including one is an error</label>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="c"> C. Dumps run the app command-line provider, so they show values after flags take effect</label>
+      <label class="opt"><input type="checkbox" name="q-18-9" value="d"> D. <code>--dump-default-config</code> prints only the bundle layer and does not accept --patch</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — The line's !!js interpolation is deferred by the Loader until all its declared injections activate, so the flag value beats the literal written beside it."
+         data-rationale="B is correct: the webStartup service is in place before the Loader evaluates the webserver line's config. A is wrong — the file write is still owned by the configuration layer. C is wrong — flags are not concatenated with YAML values. D is wrong — injection is an activation-ordering matter, not a boot-order bug."
+         data-review="sec-cmdline">
+      <div class="prompt"><span class="qnum">Q10.</span> Why does the flag beat the 3080 beside it in <code>port: !!js ctx.webStartup.port ?? 3080</code>?</div>
+      <label class="opt"><input type="radio" name="q-18-10" value="a"> A. Because the 3080 in YAML is only a comment</label>
+      <label class="opt"><input type="radio" name="q-18-10" value="b"> B. Because the Loader interpolates the expression only after the line's declared injections activate</label>
+      <label class="opt"><input type="radio" name="q-18-10" value="c"> C. Because the flag is string-concatenated with 3080</label>
+      <label class="opt"><input type="radio" name="q-18-10" value="d"> D. Because app plugins always start after all configuration lines</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-11" data-type="mcq" data-correct='["c"]'
+         data-answer="C — node --import tsx/esm runs apps/cli/src/bin.ts directly; every module this path reaches must be ESM (no CJS-only exports)."
+         data-rationale="C is correct: Node's native TS modes are unavailable across the engine range, and tsx's ESM-only hook is the only bridge. A/B are the installed and built forms. D is wrong — the source path likewise fails with a module-resolution error when the Typert host artifact is missing."
+         data-review="sec-source-launch">
+      <div class="prompt"><span class="qnum">Q11.</span> How does <code>pnpm dsh</code> at the repository root start the CLI?</div>
+      <label class="opt"><input type="radio" name="q-18-11" value="a"> A. It starts the built apps/cli/lib/bin.js</label>
+      <label class="opt"><input type="radio" name="q-18-11" value="b"> B. It runs a full pnpm run build first, then starts</label>
+      <label class="opt"><input type="radio" name="q-18-11" value="c"> C. It runs apps/cli/src/bin.ts directly with tsx's ESM hook (node --import tsx/esm)</label>
+      <label class="opt"><input type="radio" name="q-18-11" value="d"> D. It uses Node's native TypeScript strip mode</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="18-12" data-type="short"
+         data-key-points='["Launcher flags come first; from the first unrecognized token on it is app arguments, preserved unchanged","ctx.cmdlineArgs is a shared immutable snapshot that multiple plugins can each parse","App plugins parse and publish an ordinary service; line config reads it via inject with a !!js expression, and the Loader interpolates only after the injections activate","The flag beating the written value depends on keeping the expression in the line; replacing the config wholesale with a literal loses that effect","Slash commands go through the in-session ctx.commands, unrelated to process argv"]'
+         data-answer="The launcher parses only --profile/--patch/dump and hands the rest of argv to the tree unchanged: provideCmdline supplies ctx.cmdlineArgs (an immutable snapshot) and ctx.appExit; app plugins inject cmdlineArgs, parse out their own flag families, and publish services; configuration lines read that service through inject plus a !!js expression, and the Loader interpolates only after the injections activate, so a flag beats a value hardcoded beside it. Slash commands live entirely outside the argv world and go through the in-session ctx.commands."
+         data-rationale="Grasp the three things — the positional boundary, the immutable snapshot, and injection-driven interpolation ordering — and this chain clicks into place."
+         data-review="sec-cmdline">
+      <div class="prompt"><span class="qnum">Q12.</span> In your own words, explain how the design principle “the launcher parses only its own flags” lets app plugins in any profile have their own command line.</div>
+      <textarea class="short" placeholder="Your answer…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a key point you actually covered — under-checking hurts your calibration; over-checking just fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="19-web-ui.html"><strong>Chapter 19 · Web UI Architecture</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>

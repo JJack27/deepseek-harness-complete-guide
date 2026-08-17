@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 6 · The Agent Abstraction and the Scope Mechanism — The dsh Expert Path</title>
+<script>(function(){try{var t=localStorage.getItem("pbf:theme");if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark";}document.documentElement.setAttribute("data-theme",t);}catch(e){document.documentElement.setAttribute("data-theme","dark");}})();</script>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="index.html" class="brand">◆ The dsh Expert Path</a>
+  <span class="crumb">Chapter 6 · Agent &amp; Scope</span>
+  <span class="spacer"></span>
+  <a class="lang-toggle" href="../zh/06-agent-and-scope.html">→ 中文</a>
+  <nav class="chapter-nav"></nav>
+</div>
+
+<main class="chapter" data-chapter-n="6">
+<script>window.BOOK_CONFIG = { slug: "dsh-expert", lang: "en", chapters: [{n:1,slug:"01-dsh-overview"},{n:2,slug:"02-cordis-mind-model"},{n:3,slug:"03-runtime-assembly"},{n:4,slug:"04-session-log"},{n:5,slug:"05-persistence"},{n:6,slug:"06-agent-and-scope"},{n:7,slug:"07-agent-loop"},{n:8,slug:"08-tools-pipeline"},{n:9,slug:"09-system-prompt"},{n:10,slug:"10-llm-layer"},{n:11,slug:"11-capability-seams"},{n:12,slug:"12-execution-world"},{n:13,slug:"13-fs-capability"},{n:14,slug:"14-subagents"},{n:15,slug:"15-context-pressure"},{n:16,slug:"16-human-plane"},{n:17,slug:"17-capability-tour"},{n:18,slug:"18-cli-and-boot"},{n:19,slug:"19-web-ui"},{n:20,slug:"20-typert-rpc"},{n:21,slug:"21-acp-sdk-python"},{n:22,slug:"22-testing"},{n:23,slug:"23-gates-and-conventions"},{n:24,slug:"24-extension-practice"},{n:25,slug:"25-contributing-map"}] };</script>
+
+  <div class="chapter-header">
+    <div class="eyebrow">Chapter 6 · Part II · The Core Spine</div>
+    <h1>The Agent Abstraction and the Scope Mechanism</h1>
+    <p class="lede">
+      At the end of the last chapter the session could already be persisted to disk, but
+      'who drives the session' had not yet appeared. This chapter introduces
+      <code>Agent</code> — dsh's public interface for 'an agent at work' — together with the
+      <strong>scope mechanism</strong> that makes 'each agent has its own set of tools and prompts'
+      possible: a live agent is the key of its own scope, and the most specific registration wins
+      (shadowing). This is the shared foundation of per-session personas, agent presets, and
+      subagent composition. The concrete driving loop (turn/step) is left for the next chapter.
+    </p>
+  </div>
+
+  <div class="box objectives">
+    <div class="box-title">What you'll be able to do</div>
+    <ul>
+      <li>State what each member of the <code>Agent</code> interface and each <code>ctx.agents</code> registry operation (get/list/roots/isOwnedBy) answers</li>
+      <li>Classify <code>agent/*</code> events as observation versus interception, and identify which are waterfalls (must call <code>next()</code>)</li>
+      <li>Explain the point of routing create/resume through the <code>AgentFactory</code> seam: interface separated from driver, so the loop is replaceable wholesale</li>
+      <li>Describe the setup window's ordering: assemble the agent's scoped world before publication; roll the whole thing back on failure</li>
+      <li>Use the shadowing rule (most specific scope wins) to work out which same-name registration takes effect across multiple agents</li>
+      <li>Distinguish 'lineage is data' from 'runtime ownership': parentSession is recorded in the header, and a parent does not automatically see its children</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-agent-interface">6.1 Agent: interface and registry</h2>
+
+  <p>
+    The <code>Session</code> of Chapter 4 is 'what happened'; <code>Agent</code> is 'the actor doing
+    the work right now'. It is a pure interface (<code>packages/core/agent/src/runtime-types.ts</code>);
+    <strong>the concrete implementation is private to the <code>agent-loop</code> package</strong> —
+    plugins never import <code>agent-loop</code>; they depend only on this interface. Members are
+    grouped by purpose:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Member</th><th>Purpose</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>id</code> / <code>session</code></td><td>the agent and its session <strong>share the same id</strong> (<code>SessionId</code>); <code>session</code> is the live session it drives, whose log is the durable truth</td></tr>
+      <tr><td><code>options</code></td><td>per-agent options such as provider routing and model (the merge-extensible <code>AgentOptions</code>)</td></tr>
+      <tr><td><code>inbox</code></td><td>durable pending-work projection: two ordered queues, next-turn and next-step</td></tr>
+      <tr><td><code>status</code></td><td><code>idle</code> ⇄ <code>running</code> (each transition emits <code>agent/status</code>; dispose is not a third state)</td></tr>
+      <tr><td><code>ctx</code></td><td><strong>agent-scoped context</strong>: contributions registered through it are agent-local; once dispose unwinds, further registration is rejected (protagonist of section 6.5)</td></tr>
+      <tr><td><code>send</code> / <code>followup</code> / <code>steer</code> / <code>inject</code></td><td>four ways to deliver input: <code>send</code> is the unified primitive (target + whether to wake); the other three are fixed presets (append a turn / steer the nearest step / context injection without waking)</td></tr>
+      <tr><td><code>cancel</code> / <code>whenIdle</code> / <code>runMaintenance</code></td><td>cancel (first reason wins; <code>keepInbox</code> can preserve the queues) / wait for quiescence / run a non-turn maintenance task from true idle</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The registry <code>ctx.agents</code> (<code>AgentRegistry</code>) tracks who is alive:
+    <code>get(id)</code> looks up a live agent, <code>list()</code> lists all in registration order,
+    <code>roots()</code> lists only top-level agents with no runtime parent, and
+    <code>isOwnedBy(id, owner)</code> asks whether 'this child was created through a specific
+    parent's scoped context' — note this is a <strong>runtime relationship</strong>, unrelated to
+    durable lineage (expanded in section 6.7).
+  </p>
+
+  <p>
+    The consumer that creates an agent receives an <code>AgentHandle</code>
+    (<code>{ agent, dispose() }</code>). <code>dispose</code> is a <strong>capability</strong>:
+    within the consumer, only the holder can tear down this agent. The other structural owner is
+    the provider that registered the factory (its scoped agents depend on its service API;
+    unloading the provider stops and drains every live handle it created). The teardown order is
+    fixed: stop the loop → await exit → unregister the agent → remove the session from the session
+    store → finally unwind its scoped world. Agents created from configuration (the loop's own
+    startup entries) are owned by the loop fiber and never need a handle.
+  </p>
+
+  <h2 id="sec-agent-events">6.2 agent/* events: observing and intercepting in-flight work</h2>
+
+  <p>
+    All <code>agent/*</code> events carry the live <code>Agent</code> (in the payload) and are
+    dispatched through scope filtering (the <code>Scoped&lt;Agent&gt;</code> this carrier from the
+    previous section; section 6.6 explains what that means). Remember them in three groups by
+    purpose:
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Group</th><th>Event</th><th>Mode</th><th>In one line</th></tr>
+    </thead>
+    <tbody>
+      <tr><td rowspan="4">Lifecycle (observation)</td><td><code>agent/created</code> / <code>agent/disposed</code></td><td>emit</td><td>published to / removed from the registry; a synchronous throw from created can veto publication</td></tr>
+      <tr><td><code>agent/status</code></td><td>emit</td><td>mirror of idle ⇄ running transitions</td></tr>
+      <tr><td><code>agent/inbox/inserted</code> / <code>claimed</code> / <code>discarded</code></td><td>emit</td><td>traffic in and out of the live inbox; a message claimed and then rejected stops here</td></tr>
+      <tr><td><code>agent/session-start</code></td><td>emit</td><td>the session lifecycle begins (once per session, before the first turn) — the standard moment for <code>agent.inject()</code> to seed context</td></tr>
+      <tr><td rowspan="3">Interception (extension points)</td><td><code>agent/pre-step</code></td><td><strong>waterfall</strong></td><td>reject the proposed step, or rewrite the messages entering it (call <code>next()</code> to keep it)</td></tr>
+      <tr><td><code>agent/request</code></td><td><strong>waterfall</strong></td><td>replace the frozen call configuration; cannot change messages (model-visible content goes through the log channel)</td></tr>
+      <tr><td><code>agent/request-error</code></td><td><strong>waterfall</strong></td><td>claim a failed request's recovery (return retry without calling next), or delegate</td></tr>
+      <tr><td>Stop boundary</td><td><code>agent/turn-stopping</code></td><td>serial (no next)</td><td>the turn is about to close; objection happens through data — <code>steer()</code> injects a new steer and the machine re-reads the inbox</td></tr>
+      <tr><td>Error notification</td><td><code>agent/error</code></td><td>emit</td><td>an on-the-scene report of step/turn failures (even when the error has no durable place in the turn)</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    The contrast with Chapter 4 is worth repeating: <strong>session events are durable facts;
+    agent events are live extension points</strong>. Facts must survive a restart, so they go to
+    the log; in-flight work (inbox changes, request rewrites, turn stopping) matters only right
+    now, so it travels over the Cordis event bus. The first question when choosing a mechanism is
+    always: does this fact need to still exist after a reload?
+  </p>
+
+  <p>
+    The listeners of the three waterfalls (<code>agent/pre-step</code>, <code>agent/request</code>,
+    and <code>agent/request-error</code>) <strong>must call <code>next()</code></strong> to delegate
+    to the layer below — returning without it short-circuits the whole chain; these are the three
+    most important landings in dsh of the Cordis waterfall semantics you learned in Chapter 2.
+    <code>agent/turn-stopping</code> is deliberately serial with no <code>next()</code>: it is not
+    a veto point but a last-look point; objection happens through data (steer), not return values.
+  </p>
+
+  <h2 id="sec-factory-seam">6.3 create/resume: the factory seam</h2>
+
+  <p>
+    <code>AgentRegistry</code> does not construct agents itself. It holds at most one
+    <code>AgentFactory</code> (the two methods <code>createAgent</code> + <code>resume</code>),
+    registered by the <strong>driving plugin</strong> at construction time via
+    <code>ctx.agents.setFactory()</code> — the shipped implementation comes from
+    <code>agent-loop</code>. Calling create/resume with none registered yields a plain error:
+    'no agent factory registered (load an agent-loop plugin)'.
+  </p>
+
+  <pre><code><span class="code-comment">// Consumer view: knows only ctx.agents, never agent-loop</span>
+<span class="code-key">const</span> handle = <span class="code-key">await</span> ctx.agents.<span class="code-fn">create</span>({
+  sessionId,              <span class="code-comment">// shared identity: agent and session share one id</span>
+  meta: { cwd, parentSession, delegationDepth, agentPreset, ... },
+  seed,                   <span class="code-comment">// optional: balanced prefix for a fork</span>
+  agentOptions: { provider, model, maxTokens },
+  setup,                  <span class="code-comment">// the protagonist of section 6.4</span>
+})
+<span class="code-comment">// resume is the persistent variant: it goes through ctx.sessionPersistence.prepare(id) first</span>
+<span class="code-key">const</span> resumed = <span class="code-key">await</span> ctx.agents.<span class="code-fn">resume</span>({ resumeSessionId, agentOptions, setup })</code></pre>
+
+  <p>
+    The point of this seam is <strong>interface separated from driver</strong>: the ACP bridge,
+    test tooling, and any consumer program against <code>ctx.agents</code>, none of them knowing
+    who the driver is. To swap the entire loop for another implementation (say, a special driver
+    that does no tool loop), register your own factory and the plugin ecosystem stays untouched.
+    The factory's internal transaction order (detailed next chapter): mint the scoped context →
+    await setup → insert and announce the session and agent in order → emit
+    <code>agent/session-start</code> → start the loop. Every step is covered by rollback: an
+    already-announced creation is paired with a matching disposed notification.
+  </p>
+
+  <p>
+    The registry also provides the <strong>initiator scope</strong>: causal attribution along
+    in-process async chains. <code>withInitiator(agent, fn)</code> carries the agent through the
+    entire lifetime of <code>fn</code>'s return value; <code>currentInitiator()</code> reads it
+    (optional form, for logging/tracing/metrics), <code>requireInitiator()</code> demands it, and
+    <code>withoutInitiator(fn)</code> explicitly clears it (for lazily shared timers or queue
+    pumps that should not inherit whichever agent happened to initialize them). Note the contract:
+    the presence of an initiator is <strong>neither proof of liveness nor authorization</strong> —
+    it is only an in-process causal annotation; principals and owners are always passed explicitly.
+  </p>
+
+  <h2 id="sec-setup-window">6.4 The setup window: assembling the scoped world before publication</h2>
+
+  <p>
+    <code>CreateAgentOptions.setup</code> / <code>ResumeAgentOptions.setup</code>
+    is a callback with the signature
+    <code>(agentCtx: Context) =&gt; commit | Promise&lt;commit | void&gt; | void</code>.
+    It is the most important assembly window; the ordering contract in one sentence:
+    <strong>the factory awaits it after minting agentCtx and before inserting or announcing the
+    session and agent</strong>. The consequence is that observers never see a half-configured
+    world: everything registered through <code>agentCtx</code> (scoped tools, prompt sections /
+    variables, <code>restrict()</code>, listeners, awaited sub-plugins) is fully in place before
+    <code>session/created</code>, <code>agent/created</code>, <code>agent/session-start</code>,
+    and the first prompt assembly.
+  </p>
+
+  <ul>
+    <li><strong>setup only assembles, never drives</strong>: the callback receives the full scoped
+      context (trusted same-process code); this is a contract, not a runtime restriction — the
+      agent can be driven only after creation resolves.</li>
+    <li>setup may return a synchronous <code>AgentSetupCommit</code> whose <code>commit()</code>
+      is invoked after all setup awaits have settled, at the last moment before publication —
+      letting mutable configuration revalidate at the exact publication boundary.</li>
+    <li>A throw from setup, a throw from commit, or an owner dispose <strong>rolls the whole thing
+      back</strong>: neither id (session and agent) is published.</li>
+    <li>resume's setup is isomorphic: load persistence first, then mint agentCtx and await setup;
+      the session and agent rebuilt during that window are both unpublished.</li>
+  </ul>
+
+  <p>
+    The preset system grows directly out of this window: the only supported call site of
+    <code>ctx.agentPresets.mount(agentCtx, id)</code> is the factory's
+    <code>setup(agentCtx)</code> hook — joining there is what guarantees
+    'composition failure → the whole creation rolls back' instead of leaving a half-assembled
+    session (both the Chapter 3 assembly and the Chapter 14 subagents come back to this).
+  </p>
+
+  <h2 id="sec-scope-mechanism">6.5 The scope mechanism: an agent is the key of its own scope</h2>
+
+  <p>
+    The machinery behind 'things registered through <code>agentCtx</code> are agent-local' lives
+    in <code>packages/core/scope</code>. Start with three identity facts:
+  </p>
+  <ul>
+    <li>It is a <strong>library, not a Cordis service</strong> — no ctx key; in the module graph
+      it sits <strong>below</strong> session and system-prompt so they can afford to use it
+      without forming a cycle.</li>
+    <li><code>ScopeKey</code> is <strong>opaque object identity</strong>
+      (<code>type ScopeKey = object</code>, compared by identity). The primitives never inspect
+      object contents.</li>
+    <li>In the shipped loop, <strong>the live <code>Agent</code> object is its own scope key</strong>:
+      in <code>agent-loop/src/agent.ts</code>, <code>this.scope = createScope(loopCtx, this)</code>,
+      then <code>this.ctx = this.scope.ctx.extend({ agent: this })</code> —
+      the <code>agent.ctx</code> you read is exactly this context, carrying the scope tag plus the
+      <code>ctx.agent</code> DX accessor.</li>
+  </ul>
+
+  <p>
+    <code>createScope(ctx, key, options?)</code> mints a scope:
+    it hangs a shared empty plugin under <code>ctx</code> (owning the lifecycle of all
+    registrations), writes the key into the derived context's tag slot (readable back via
+    <code>scopeOf(ctx)</code>), and returns <code>{ ctx, rawDispose, dispose }</code> —
+    <code>rawDispose</code> preserves the exact Cordis disposer identity (for ordered composition
+    of effect nesting), while <code>dispose()</code> is the shared quiescent teardown boundary.
+  </p>
+
+  <p>
+    A pair of opposite-direction capabilities is driven by the same <strong>parent chain</strong>
+    (<code>bindScopeParent</code>, cycle-proof):
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Scope chain: views inherit down, events flow up">
+      <rect x="290" y="14" width="180" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="380" y="34" text-anchor="middle" style="fill:var(--accent)" font-size="12" font-weight="700">Global layer (no scope)</text>
+      <text x="380" y="50" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">deployment registrations and listeners</text>
+
+      <rect x="270" y="100" width="220" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="380" y="120" text-anchor="middle" style="fill:var(--accent-2)" font-size="12" font-weight="700">preset standing mount</text>
+      <text x="380" y="136" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">mounted once per process, shared along the chain</text>
+
+      <rect x="180" y="186" width="180" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="270" y="206" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">agent A (its own key)</text>
+      <text x="270" y="222" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">scoped layer: lenient write</text>
+
+      <rect x="420" y="186" width="180" height="44" rx="8" style="fill:var(--surface-2);stroke:var(--pass)" stroke-width="2"/>
+      <text x="510" y="206" text-anchor="middle" style="fill:var(--pass)" font-size="12" font-weight="700">agent B (same preset)</text>
+      <text x="510" y="222" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10">no write registration of its own</text>
+
+      <line x1="380" y1="58" x2="380" y2="96" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="330" y1="144" x2="278" y2="182" style="stroke:var(--muted)" stroke-width="2"/>
+      <line x1="430" y1="144" x2="482" y2="182" style="stroke:var(--muted)" stroke-width="2"/>
+      <text x="352" y="82" style="fill:var(--fg-dim)" font-size="10">parent-child chain (bindScopeParent)</text>
+
+      <line x1="600" y1="120" x2="600" y2="170" style="stroke:var(--accent)" stroke-width="2.5"/>
+      <polygon points="600,176 595,166 605,166" style="fill:var(--accent)"/>
+      <text x="612" y="148" style="fill:var(--accent)" font-size="10.5">registration views inherit downward</text>
+      <text x="612" y="162" style="fill:var(--fg-dim)" font-size="10">agent A sees: A → preset → global</text>
+
+      <line x1="700" y1="170" x2="700" y2="124" style="stroke:var(--accent-2)" stroke-width="2.5" stroke-dasharray="6,4"/>
+      <polygon points="700,118 695,128 705,128" style="fill:var(--accent-2)"/>
+      <text x="712" y="148" style="fill:var(--accent-2)" font-size="10.5">event admission passes upward</text>
+      <text x="712" y="162" style="fill:var(--fg-dim)" font-size="10">the preset's listeners receive A's and B's events</text>
+
+      <line x1="540" y1="208" x2="410" y2="208" style="stroke:var(--fail)" stroke-width="1.5" stroke-dasharray="4,4"/>
+      <polygon points="404,208 414,203 414,213" style="fill:var(--fail)"/>
+      <text x="475" y="200" text-anchor="middle" style="fill:var(--fail)" font-size="9.5">siblings invisible to each other</text>
+
+      <text x="380" y="246" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">One parent chain drives both directions: views stack downward along the chain (nearest wins), events pass upward along the chain (ancestors observe descendants)</text>
+    </svg>
+    <figcaption>Figure 6-2 · The two-directional semantics of the scope parent chain: the views of agents A and B inherit downward along the chain (A → preset → global), and events pass upward along the chain (the preset's listeners receive both agents' events); siblings are invisible to each other.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Registration views inherit downward along the chain</strong>: a child scope sees
+      its ancestors' layers
+      (<code>ScopedLayers.chainLayers</code> — the basis of the shadowing in the next section).</li>
+    <li><strong>Event admission passes upward along the chain</strong>:
+      <code>scopeTarget(base, key)</code> builds the routing carrier; untagged listeners are
+      admitted globally, while tagged listeners receive events only when they match the key or one
+      of its ancestors — listeners in an ancestor scope receive every descendant scope's events;
+      <strong>events flow up the chain, never down</strong>. That is why a standing composition
+      (say, a preset's standing mount) can observe every agent assembled beneath it.</li>
+  </ul>
+
+  <h2 id="sec-shadowing">6.6 Shadowing: the most specific scope wins</h2>
+
+  <p>
+    Now the registry side. Scope-aware registries (<code>ctx.tools</code>,
+    <code>ctx.systemPrompt</code>, ...) store two layers in <code>ScopedLayers&lt;L&gt;</code>:
+    an <strong>eagerly constructed global layer</strong> plus an <strong>override layer</strong>
+    created lazily per scope. Reads use <code>merge()</code>:
+  </p>
+
+  <pre><code><span class="code-comment">// What ScopedLayers.merge does (illustrative)</span>
+merged = <span class="code-key">new Map</span>(named entries of the global layer)
+<span class="code-key">for</span> (layer <span class="code-key">of</span> scope layers along the parent chain, farthest to nearest)
+  <span class="code-key">for</span> ([name, value] <span class="code-key">of</span> layer) merged.set(name, value)
+<span class="code-comment">// On the same name, the later write overwrites the earlier one → the nearest scope on the chain has the final say</span></code></pre>
+
+  <p>
+    The rule is one sentence: <strong>the most specific scope wins</strong>. A same-name
+    registration appearing in the agent layer shadows the one in the global layer — the shadowed
+    registration is <strong>not unregistered</strong>: it is still in the global layer and other
+    agents resolve to it as usual; only in this agent's view does the same-name entry on its own
+    layer cover it. Registration and teardown are symmetric: owned via <code>ctx.effect()</code>;
+    after undo, if the whole layer is empty, the layer itself is reclaimed.
+  </p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Global vs agent-scoped shadowing">
+      <rect x="10" y="20" width="560" height="120" rx="10" style="fill:var(--surface-2);stroke:var(--accent)" stroke-width="2"/>
+      <text x="30" y="44" style="fill:var(--accent)" font-size="12" font-weight="700">Global layer (deployment registrations, shared by all agents)</text>
+      <g font-size="10.5">
+        <rect x="30" y="58" width="150" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="105" y="77" text-anchor="middle" style="fill:var(--fg)">write (strict)</text>
+        <rect x="190" y="58" width="130" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="255" y="77" text-anchor="middle" style="fill:var(--fg)">read</text>
+        <rect x="330" y="58" width="130" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="395" y="77" text-anchor="middle" style="fill:var(--fg)">bash</text>
+        <rect x="470" y="58" width="80" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--pass)"/>
+        <text x="510" y="77" text-anchor="middle" style="fill:var(--fg)">grep</text>
+      </g>
+
+      <rect x="60" y="160" width="300" height="110" rx="10" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2"/>
+      <text x="80" y="184" style="fill:var(--accent-2)" font-size="12" font-weight="700">Persona agent's scoped layer (registered by the persona plugin)</text>
+      <g font-size="10.5">
+        <rect x="80" y="198" width="150" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2.5"/>
+        <text x="155" y="217" text-anchor="middle" style="fill:var(--fg)">write (lenient)</text>
+        <rect x="240" y="198" width="100" height="30" rx="5" style="fill:var(--surface-2);stroke:var(--accent-2)" stroke-width="2.5"/>
+        <text x="290" y="217" text-anchor="middle" style="fill:var(--fg)">persona copy</text>
+      </g>
+      <text x="210" y="254" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">registrations via agent.ctx land in this layer</text>
+
+      <line x1="155" y1="88" x2="155" y2="196" style="stroke:var(--fail)" stroke-width="2"/>
+      <text x="163" y="140" style="fill:var(--fail)" font-size="10">same-name shadowing</text>
+
+      <rect x="400" y="160" width="170" height="110" rx="10" style="fill:var(--surface-2);stroke:var(--muted)" stroke-width="1.5"/>
+      <text x="485" y="184" text-anchor="middle" style="fill:var(--fg)" font-size="12" font-weight="700">Another agent (no scoped layer)</text>
+      <text x="485" y="212" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">view = global layer as-is</text>
+      <text x="485" y="232" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">write → strict</text>
+      <text x="485" y="252" text-anchor="middle" style="fill:var(--fg-dim)" font-size="10.5">(shadowed ≠ unregistered)</text>
+
+      <text x="600" y="80" style="fill:var(--fg-dim)" font-size="10.5">merge order:</text>
+      <text x="600" y="98" style="fill:var(--fg-dim)" font-size="10.5">global → preset layer</text>
+      <text x="600" y="116" style="fill:var(--fg-dim)" font-size="10.5">→ agent layer</text>
+      <text x="600" y="134" style="fill:var(--fg-dim)" font-size="10.5">(if a preset layer exists)</text>
+      <text x="600" y="160" style="fill:var(--fg)" font-size="10.5" font-weight="700">view resolution:</text>
+      <text x="600" y="178" style="fill:var(--fg-dim)" font-size="10.5">agent → preset</text>
+      <text x="600" y="196" style="fill:var(--fg-dim)" font-size="10.5">→ global</text>
+      <text x="600" y="214" style="fill:var(--fg-dim)" font-size="10.5">nearest wins</text>
+      <text x="380" y="290" text-anchor="middle" style="fill:var(--muted)" font-size="10" font-style="italic">Why the persona plugin 'can only mount in an agent scope': global mounting would collide with the same-name deployment:persona registration and fail loudly</text>
+    </svg>
+    <figcaption>Figure 6-1 · shadowing: the persona agent registers a same-name write (lenient) and a persona copy in its own scoped layer, shadowing the global registration; the global registration remains, and other agents are unaffected.</figcaption>
+  </figure>
+
+  <p>
+    This is <strong>the underlying mechanism of per-session personas</strong>. The
+    <code>dsh-persona</code> plugin registers a <code>deployment:persona</code> prompt section —
+    with the <strong>same name</strong> as the one system-prompt itself registers unconditionally.
+    Global mounting would fail on the name collision (the deployment persona already has an
+    owner), so it is designed to <strong>mount only in an agent scope</strong>: when a preset
+    composes it, the persona plugin's copy shadows the deployment copy in that agent's view. The
+    optional <code>complete: true</code> even reduces that agent's system prompt, after assembly,
+    to <strong>this one section alone</strong>. Shadowing changes the view, not the world — other
+    agents in the same process know nothing about it.
+  </p>
+
+  <p>
+    The scope chain can be longer still: a preset's standing mount is mounted in the process
+    <strong>once</strong> (under the roster service's own fiber), and each session naming it
+    <strong>parent-links</strong> its own agent scope key to the mount's key. That agent's view
+    resolution order then becomes <code>agent → preset → global</code>: tools and prompt sections
+    on the mount layer take effect for every joining agent with a single instance (plugins key
+    their own state by Session/Agent), while sibling presets' listeners stay deaf to it.
+  </p>
+
+  <div class="demo" data-demo="scopeShadow">
+    <div class="demo-title">Try it — shadowing of scoped registrations</div>
+    <p>The global layer registers the strict write tool; the persona agent registers a same-name lenient version in its own agent.ctx:</p>
+    <label><input type="radio" name="d6" value="base"> Default agent</label>
+    <label><input type="radio" name="d6" value="persona"> Persona agent (preset includes the persona plugin)</label>
+    <div class="demo-output empty">Choose the agent this session uses.</div>
+  </div>
+
+  <h2 id="sec-lineage-vs-visibility">6.7 Lineage is data, not visibility</h2>
+
+  <p>
+    One last group of easily confused concepts: a session's <strong>lineage</strong> versus its
+    runtime <strong>visibility / ownership</strong>. Chapter 4 introduced the
+    <code>SessionHeader</code> lineage fields: <code>parentSession</code> (forked/resumed from
+    whom), <code>seedLength</code> (how long the inherited prefix is),
+    <code>origin: 'subagent'</code>, and <code>delegationDepth</code> (the recursion budget,
+    persisted precisely so it survives restarts). The point:
+  </p>
+
+  <div class="box key">
+    <p style="margin:0;">
+      Lineage is <strong>data</strong>, recorded in the header, used for UI display, recursion
+      budgets, and fork navigation. It creates no runtime visibility whatsoever —
+      <strong>a parent does not automatically see its children</strong>: writing parentSession in
+      the header does not make the parent agent receive the child's events or read the child's log.
+    </p>
+  </div>
+
+  <p>
+    Runtime relationships belong to other mechanisms, deliberately independent of it:
+  </p>
+  <ul>
+    <li><strong>Runtime ownership</strong>: the <code>owner</code> field on a registry entry —
+      'through which exact parent agent's scoped context was this child agent created'
+      (queried via <code>isOwnedBy(id, owner)</code>). A fork resumed from disk has no runtime
+      parent and is still a root — durable lineage does not affect this runtime relationship, and
+      vice versa.</li>
+    <li><strong>Event visibility</strong>: the upward admission along the scope chain
+      (section 6.5). Whoever wants to observe a child attaches a listener in a suitable ancestor
+      scope (this is exactly how a preset's standing mount observes all agents beneath it); or
+      passes an explicit reference. There is no implicit 'I am the parent, so I receive
+      automatically' channel.</li>
+    <li><strong>Initiator attribution</strong>: the causal annotation along in-process async
+      chains (<code>currentInitiator()</code>); Chapter 14's subagents will show how it is used
+      for attribution.</li>
+  </ul>
+
+  <p>
+    The value of keeping the three separate shows up at the boundaries: after a restart the
+    runtime owner and the initiator are gone, leaving only the header's lineage data; across
+    processes / across the wire (Chapter 20's Typert RPC), even the <code>Agent</code> object is
+    no longer the same one — only the id and the lineage can travel. 'Data belongs to the log,
+    relationships belong to the runtime' — this line runs through all of dsh's boundary design.
+  </p>
+
+  <h2 id="sec-recap">6.8 Chapter recap</h2>
+  <ul>
+    <li><code>Agent</code> is the public interface (id/session/inbox/status/ctx + the send family + cancel/whenIdle/runMaintenance); the implementation is private to agent-loop. <code>ctx.agents</code> manages the live registry, <code>AgentHandle.dispose</code> is a capability, and the teardown order is: stop the loop → unregister → remove the session → unwind the scoped world.</li>
+    <li><code>agent/*</code> events fall into three groups: lifecycle observation (emit), interception extension points (the pre-step / request / request-error waterfalls, which must call next()), and turn-stopping (serial; objection via steer data) plus the agent/error notification. Session events are durable facts; agent events are live extension points.</li>
+    <li>create/resume go through the <code>AgentFactory</code> seam: the loop registers via setFactory, consumers depend only on ctx.agents — interface separated from driver, so the loop is replaceable wholesale.</li>
+    <li>The setup window assembles the scoped world before publication: awaited after agentCtx is minted and before the double announcement; every registration is in place before the first event and the first prompt assembly; failure rolls the whole thing back; an optional commit revalidates at the publication boundary.</li>
+    <li>scope is a library, not a service: ScopeKey is opaque object identity and the live Agent object is its own key; agent.ctx is the tagged scoped context.</li>
+    <li>shadowing: ScopedLayers' global layer + scope override layers; merge walks the parent chain farthest to nearest, nearest wins; a shadowed registration is not unregistered. The persona plugin builds per-session personas on this (scoped mounting only; global mounting fails on the name collision); the preset standing mount turns view resolution into agent → preset → global.</li>
+    <li>Lineage is data, not visibility: parentSession/delegationDepth are recorded in the header for budgets and navigation; runtime ownership (isOwnedBy), the scope chain's event admission, and initiator attribution are three independent runtime relationships — a parent does not automatically see its children.</li>
+  </ul>
+
+  <div class="box pitfalls">
+    <div class="box-title">Common pitfalls</div>
+    <ul style="margin:0;">
+      <li>A plugin importing <code>agent-loop</code> directly to get the driver. Extensions depend only on <code>agent</code> (the interface layer); when you need the initiator, use <code>ctx.agents.currentInitiator()</code>.</li>
+      <li>Returning from a waterfall listener without calling <code>next()</code>. The pre-step / request / request-error chains short-circuit on the spot and every layer below is lost.</li>
+      <li>Assuming the persona plugin can mount globally and be toggled per session. The same-name registration collides and fails loudly — it is designed to mount only in an agent scope (preset composition).</li>
+      <li>Treating parentSession in the header as a runtime parent-child relationship. Lineage is data: it survives restarts but grants neither event visibility nor teardown rights; query runtime ownership with isOwnedBy.</li>
+      <li>Driving the agent inside setup. setup only assembles and never drives; any send/followup before creation resolves is misuse.</li>
+    </ul>
+  </div>
+
+  <!-- ====================== TEST ====================== -->
+  <form class="test" data-chapter="6">
+    <h2>Chapter 6 Test</h2>
+
+    <div class="q" data-id="6-1" data-type="mcq" data-correct='["b"]'
+         data-answer="B — the agent and its session share the same SessionId; the Agent interface lives in core/agent and its implementation is private to agent-loop."
+         data-rationale="B is correct: the single shared identity underpins the registry, Typert queries, and the wire protocol. A is wrong: interface/implementation separation exists precisely so the loop is replaceable. C is wrong: status has only two observable values, idle and running. D is wrong: agents can be created from configuration (the loop's startup entries); their owner is the loop fiber and they need no handle."
+         data-review="sec-agent-interface">
+      <div class="prompt"><span class="qnum">Q1.</span> Which statement about the <code>Agent</code> interface and identity is correct?</div>
+      <label class="opt"><input type="radio" name="q-6-1" value="a"> A. Agent's implementation lives in core/agent, and plugins should instantiate it directly</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="b"> B. The agent and the session it drives share the same id; the interface lives in core/agent and the concrete implementation is private to agent-loop</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="c"> C. status has three observable values: idle, running, and disposed</label>
+      <label class="opt"><input type="radio" name="q-6-1" value="d"> D. All agents must be created through an AgentHandle</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-2" data-type="mcq" data-multiselect="true" data-correct='["b","d","e"]'
+         data-answer="B, D, E — pre-step, request, and request-error are waterfalls; their listeners must call next() to delegate."
+         data-rationale="B, D, E are correct. A is wrong: turn-stopping is serial and deliberately has no next(); objection happens through steer data. C is wrong: agent/status is emit-based observation. F is wrong: agent/created is an emit whose synchronous throw can veto publication, but it is not a waterfall."
+         data-review="sec-agent-events">
+      <div class="prompt"><span class="qnum">Q2.</span> Which of the following agent/* events are waterfalls (listeners must call <code>next()</code>)? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="a"> A. <code>agent/turn-stopping</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="b"> B. <code>agent/pre-step</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="c"> C. <code>agent/status</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="d"> D. <code>agent/request</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="e"> E. <code>agent/request-error</code></label>
+      <label class="opt"><input type="checkbox" name="q-6-2" value="f"> F. <code>agent/created</code></label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-3" data-type="mcq" data-correct='["c"]'
+         data-answer="C — the AgentFactory is registered by the driving plugin (agent-loop) via setFactory; consumers depend only on ctx.agents, and the loop can be replaced wholesale."
+         data-rationale="C is correct: interface separated from driver. A is wrong: the registry deliberately does not construct agents; with no factory it reports 'load an agent-loop plugin'. B is wrong: the ACP bridge is precisely an example of depending on ctx.agents rather than agent-loop. D is wrong: sibling presets stay deaf to its events — events flow up the chain, not across."
+         data-review="sec-factory-seam">
+      <div class="prompt"><span class="qnum">Q3.</span> What is the point of the AgentFactory seam?</div>
+      <label class="opt"><input type="radio" name="q-6-3" value="a"> A. It lets the AgentRegistry run several different loops at once</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="b"> B. It lets the ACP bridge import agent-loop's internal classes directly</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="c"> C. Interface separated from driver: consumers program against ctx.agents, and the driving implementation that registers the factory (by default agent-loop) can be replaced wholesale</label>
+      <label class="opt"><input type="radio" name="q-6-3" value="d"> D. It lets every preset register its own factory</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-4" data-type="mcq" data-correct='["a"]'
+         data-answer="A — the factory awaits setup after minting agentCtx and before inserting or announcing the session and agent; observers never see a half-configured world."
+         data-rationale="A is correct: this is the core ordering of the setup window. B is wrong: announcement happens after setup. C is wrong: the first turn comes long after setup (even session-start is later). D is wrong: setup is an assembly window, right before publication, not a runtime callback."
+         data-review="sec-setup-window">
+      <div class="prompt"><span class="qnum">Q4.</span> At what point is the setup callback awaited?</div>
+      <label class="opt"><input type="radio" name="q-6-4" value="a"> A. After agentCtx is minted, before the session/agent are inserted and announced</label>
+      <label class="opt"><input type="radio" name="q-6-4" value="b"> B. After the agent/created announcement, before the loop starts</label>
+      <label class="opt"><input type="radio" name="q-6-4" value="c"> C. When the first turn begins</label>
+      <label class="opt"><input type="radio" name="q-6-4" value="d"> D. Every time the agent receives new input</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-5" data-type="mcq" data-multiselect="true" data-correct='["a","c","d"]'
+         data-answer="A, C, D — setup only assembles and never drives, it may return a commit that revalidates at the publication boundary, and a throw means neither id is published."
+         data-rationale="A, C, D are correct. B is wrong: the right way for a preset plugin is precisely to mount its scoped registrations inside setup, not to wait for runtime. E is wrong: resume also supports setup — load persistence first, then assemble."
+         data-review="sec-setup-window">
+      <div class="prompt"><span class="qnum">Q5.</span> Which statements about the setup window contract are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="a"> A. setup only assembles and never drives; the agent can be driven only after creation resolves</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="b"> B. Preset plugins should mount dynamically at runtime and avoid setup</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="c"> C. setup may return an AgentSetupCommit whose commit() revalidates at the last moment before publication</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="d"> D. A throw from setup or from commit rolls the whole thing back: neither the session nor the agent is published</label>
+      <label class="opt"><input type="checkbox" name="q-6-5" value="e"> E. resume does not support setup; only create does</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-6" data-type="fill" data-accepted='["createScope","createscope","the createScope"]'
+         data-answer="createScope (a library function exported by the scope package; the loop calls createScope(loopCtx, this) to mint the agent's scoped context)."
+         data-rationale="dsh-scope is a library, not a service: createScope(ctx, key) returns { ctx, rawDispose, dispose }; the live Agent object serves as its own ScopeKey."
+         data-review="sec-scope-mechanism">
+      <div class="prompt"><span class="qnum">Q6.</span> Fill in the blank: agent-loop uses the scope package's <code>______</code> function to mint the agent's scoped context; the key is the agent object itself.</div>
+      <input type="text" class="fill">
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-7" data-type="mcq" data-correct='["b"]'
+         data-answer="B — the same-name registration is won by the nearest scope on the chain; the shadowed global registration is not unregistered, and other agents still resolve to it."
+         data-rationale="B is correct: merge overwrites along the parent chain from farthest to nearest. A is wrong: shadowing is not unregistration; the global registration stays. C is wrong: load order is irrelevant — the resolution rule is nearest-wins. D is wrong: the preset's standing mount is mounted once and shared via the chain, not copied per session."
+         data-review="sec-shadowing">
+      <div class="prompt"><span class="qnum">Q7.</span> What happens after a persona agent registers a same-name write tool in its own scoped layer?</div>
+      <label class="opt"><input type="radio" name="q-6-7" value="a"> A. The global write registration is unregistered and every agent switches to the lenient version</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="b"> B. That agent's view resolves to the lenient version; the global registration remains, and other agents keep using the strict version</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="c"> C. The two same-name registrations coexist, and whichever wins depends on load order</label>
+      <label class="opt"><input type="radio" name="q-6-7" value="d"> D. The preset mount copies the global registration per session and renames it</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-8" data-type="mcq" data-correct='["d"]'
+         data-answer="D — dsh-persona registers a deployment:persona section with the same name as the deployment persona; global mounting fails on the name collision, while scoped mounting shadows the deployment copy in that agent's view."
+         data-rationale="D is correct: that is exactly why it can only mount scoped. A is wrong: there is no global switch. B is wrong: unregistering the global registration is not its mechanism. C is wrong: persona lands in the prompt registry, not in events."
+         data-review="sec-shadowing">
+      <div class="prompt"><span class="qnum">Q8.</span> What is the mechanism by which the dsh-persona plugin implements per-session personas?</div>
+      <label class="opt"><input type="radio" name="q-6-8" value="a"> A. It registers deployment:persona in the global layer and toggles it per session</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="b"> B. It unregisters the global persona registration and installs its own</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="c"> C. It appends persona events to the session log</label>
+      <label class="opt"><input type="radio" name="q-6-8" value="d"> D. It registers a same-name deployment:persona section in the agent scope, shadowing the deployment copy without unregistering it</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-9" data-type="mcq" data-correct='["c"]'
+         data-answer="C — event admission passes upward along the scope parent chain: listeners in an ancestor scope receive all descendant events, never the other way around."
+         data-rationale="C is correct: one parent chain drives the pair of directions — views inherit downward along the chain, events pass upward. A reverses it. B is wrong: untagged listeners are admitted globally. D is wrong: sibling presets have no chain between them and are mutually invisible."
+         data-review="sec-scope-mechanism">
+      <div class="prompt"><span class="qnum">Q9.</span> How do events flow along the scope chain?</div>
+      <label class="opt"><input type="radio" name="q-6-9" value="a"> A. A parent scope's listeners receive child-scope events and also broadcast downward</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="b"> B. All events are visible to all listeners</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="c"> C. Events pass upward along the chain: listeners in ancestors (including the preset mount) receive descendant agents' events, never downward</label>
+      <label class="opt"><input type="radio" name="q-6-9" value="d"> D. Sibling presets can see each other's agents' events</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-10" data-type="mcq" data-correct='["b"]'
+         data-answer="B — parentSession is header data (for budgets and navigation); for a parent to observe a child it must attach a listener in an ancestor scope or pass an explicit reference — there is no implicit channel."
+         data-rationale="B is correct: lineage is data, not visibility. A is wrong: a parent does not automatically see its children. C is wrong: runtime ownership (isOwnedBy) is independent of durable lineage; a resumed fork is still a root. D is wrong: after a restart the runtime relationships vanish, leaving only header data."
+         data-review="sec-lineage-vs-visibility">
+      <div class="prompt"><span class="qnum">Q10.</span> What does the parentSession field in a subagent's session header give the parent agent?</div>
+      <label class="opt"><input type="radio" name="q-6-10" value="a"> A. Automatic subscription to all of the child session's events</label>
+      <label class="opt"><input type="radio" name="q-6-10" value="b"> B. No runtime capability at all — it is lineage data only; observation requires a listener in an ancestor scope or an explicitly passed reference</label>
+      <label class="opt"><input type="radio" name="q-6-10" value="c"> C. The result of an isOwnedBy query</label>
+      <label class="opt"><input type="radio" name="q-6-10" value="d"> D. Teardown rights that remain valid after a restart</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-11" data-type="mcq" data-multiselect="true" data-correct='["a","c"]'
+         data-answer="A, C — runtime ownership is queried via isOwnedBy and is independent of durable lineage; all three runtime relationships (ownership / event visibility / initiator) disappear after a restart, leaving only the header lineage."
+         data-rationale="A, C are correct. B is wrong: a resumed session has no runtime parent and still counts as a root — the two relationships are independent. D is wrong: the initiator is an in-process causal annotation, neither proof of liveness nor authorization."
+         data-review="sec-lineage-vs-visibility">
+      <div class="prompt"><span class="qnum">Q11.</span> Which statements about runtime relationships and durable lineage are correct? <em>Select all that apply.</em></div>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="a"> A. isOwnedBy queries the runtime creation relationship, independent of parentSession in the header</label>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="b"> B. Resuming a session that carries parentSession automatically makes it a runtime child agent</label>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="c"> C. After a process restart, the runtime owner and the initiator are both gone; only the header lineage data remains</label>
+      <label class="opt"><input type="checkbox" name="q-6-11" value="d"> D. The return value of currentInitiator() can be used for authorization decisions</label>
+      <div class="feedback"></div>
+    </div>
+
+    <div class="q" data-id="6-12" data-type="short"
+         data-key-points='["scope-aware registries keep two layers: a global layer plus per-scope override layers (ScopedLayers)","merge overwrites same-name entries along the parent chain from farthest to nearest; the nearest scope wins","a shadowed registration is not unregistered; other agents still resolve to the global version","the persona plugin registers a same-name deployment:persona section for per-session personas; global mounting fails on the name collision","the preset standing mount is mounted once and shared via the parent chain; view resolution becomes agent → preset → global"]'
+         data-answer="Key points: ScopedLayers global layer + scope layer; merge farthest-to-nearest, nearest wins; shadowing does not unregister; the persona plugin shadows the deployment persona via a same-name section (scoped mounting only); the preset mount turns view resolution into agent → preset → global via the parent chain."
+         data-rationale="Cover four of the five key points (two layers + nearest wins + no unregistering + the persona case + the preset chain)."
+         data-review="sec-shadowing">
+      <div class="prompt"><span class="qnum">Q12.</span> Explain the shadowing mechanism in your own words: how the registry layers are split, which same-name registration wins, where the shadowed registration goes, and how persona and preset each use it.</div>
+      <textarea class="short" placeholder="Write your understanding…"></textarea>
+      <div class="key-points">
+        <div class="hint">Only check a point you have actually stated — under-checking degrades the book's calibration of you; over-checking only fools yourself.</div>
+      </div>
+      <div class="feedback"></div>
+    </div>
+
+    <button type="submit" class="submit-test">Submit</button>
+    <div class="test-result"></div>
+    <button type="button" class="retake-btn" hidden>Retake</button>
+  </form>
+
+  <p style="margin-top:2rem;">Next chapter: <a href="07-agent-loop.html"><strong>Chapter 7 · The Agent Loop: Turn/Step Lifecycle</strong></a>.</p>
+
+</main>
+
+<script src="assets/book.js" defer></script>
+</body>
+</html>
